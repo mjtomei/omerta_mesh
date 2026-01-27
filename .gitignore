@@ -6,3 +6,12 @@ xcuserdata/
 DerivedData/
 .DS_Store
 ._*
+
+# Infrastructure documentation with sensitive details
+**/MANUAL_TESTING.md
+
+# Config files
+*.pem
+.env
+.env.*
+
