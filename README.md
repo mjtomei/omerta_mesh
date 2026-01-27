@@ -71,6 +71,19 @@ targets: [
 ]
 ```
 
+## Documentation
+
+- [API Reference](API.md) - Public API documentation for all modules
+
+### Plans
+
+Working documents for development are in [plans/](plans/):
+
+- NAT traversal design and implementation
+- Cryptography details
+- Migration guides
+- Code structure
+
 ## License
 
 Proprietary - All rights reserved.
