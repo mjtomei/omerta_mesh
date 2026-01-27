@@ -74,6 +74,7 @@ targets: [
 ## Documentation
 
 - [API Reference](API.md) - Public API documentation for all modules
+- [Cryptography](CRYPTOGRAPHY.md) - Encryption, key exchange, and security details
 
 ### Plans
 
