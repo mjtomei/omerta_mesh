@@ -30,6 +30,8 @@ public enum TunnelError: Error, LocalizedError, Sendable, Equatable {
     case timeout
     case sessionRejected
 
+    case sessionLimitReached
+
     public var errorDescription: String? {
         switch self {
         case .notConnected:
@@ -42,6 +44,23 @@ public enum TunnelError: Error, LocalizedError, Sendable, Equatable {
             return "Operation timed out"
         case .sessionRejected:
             return "Session rejected by remote machine"
+        case .sessionLimitReached:
+            return "Session limit reached"
         }
+    }
+}
+
+/// Configuration for TunnelManager session pool
+public struct TunnelManagerConfig: Sendable {
+    /// Maximum number of sessions per remote machine
+    public var maxSessionsPerMachine: Int = 10
+    /// Maximum total sessions across all machines
+    public var maxTotalSessions: Int = 1000
+
+    public static let `default` = TunnelManagerConfig()
+
+    public init(maxSessionsPerMachine: Int = 10, maxTotalSessions: Int = 1000) {
+        self.maxSessionsPerMachine = maxSessionsPerMachine
+        self.maxTotalSessions = maxTotalSessions
     }
 }
