@@ -51,7 +51,7 @@ var config = MeshConfig(
     encryptionKey: encryptionKey,
     port: port,
     bootstrapPeers: bootstrap.map { [$0] } ?? [],
-    allowLocalhost: !lan
+    allowLocalhost: lan
 )
 
 let mesh = MeshNetwork(config: config)
