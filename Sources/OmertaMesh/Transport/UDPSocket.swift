@@ -131,14 +131,16 @@ public actor UDPSocket {
         // Convert address if needed for socket type compatibility
         let sendAddress = try convertAddressForSocket(address)
 
-        let buffer = channel.allocator.buffer(bytes: data)
-        let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
-
         // Retry logic for transient errors (especially macOS ICMP error caching)
         let maxRetries = 3
         var lastError: Error?
 
         for attempt in 1...maxRetries {
+            // Create fresh buffer and envelope for each attempt
+            // This ensures no stale state from previous attempts
+            let buffer = channel.allocator.buffer(bytes: data)
+            let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
+
             logger.info("UDP sending \(data.count) bytes to \(sendAddress)")
             do {
                 try await channel.writeAndFlush(envelope)
@@ -155,8 +157,9 @@ public actor UDPSocket {
 
                 if isTransientError && attempt < maxRetries {
                     logger.warning("UDP send attempt \(attempt) failed (transient): \(error), retrying...")
-                    // Small delay before retry to allow error state to clear
-                    try? await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+                    // Longer delay before retry to allow error state to clear
+                    // macOS can cache ICMP errors for extended periods
+                    try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                     continue
                 }
 

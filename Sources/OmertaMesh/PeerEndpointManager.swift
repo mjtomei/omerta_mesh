@@ -174,15 +174,6 @@ public actor PeerEndpointManager {
     /// Record that we received a message from this endpoint
     /// Moves the endpoint to front of the list (highest priority)
     public func recordMessageReceived(from peerId: PeerId, machineId: MachineId, endpoint: String) {
-        // In test mode (allowAll), skip IPv6 endpoints to avoid routing issues
-        // since the socket is bound to IPv4-only
-        if validationMode == .allowAll && EndpointUtils.isIPv6(endpoint) {
-            logger.debug("Skipping IPv6 endpoint in test mode", metadata: [
-                "endpoint": "\(endpoint)"
-            ])
-            return
-        }
-
         // Validate endpoint before storing
         let validation = EndpointValidator.validate(endpoint, mode: validationMode)
         guard validation.isValid else {
