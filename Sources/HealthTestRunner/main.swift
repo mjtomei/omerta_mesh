@@ -202,6 +202,26 @@ struct NetworkSnapshot: Equatable {
 
 // MARK: - Pre-flight Cleanup (clear stale rules from failed runs)
 
+// Kill any existing HealthTestRunner processes (except ourselves)
+let myPID = ProcessInfo.processInfo.processIdentifier
+logger.info("Pre-flight cleanup: killing stale HealthTestRunner processes (my PID: \(myPID))...")
+#if os(Linux)
+let (_, staleProcs) = await shell("pgrep -f HealthTestRunner | grep -v ^\(myPID)$ || true")
+#else
+let (_, staleProcs) = await shell("pgrep -f HealthTestRunner | grep -v ^\(myPID)$ || true")
+#endif
+for pidStr in staleProcs.split(separator: "\n") {
+    let pidTrimmed = String(pidStr).trimmingCharacters(in: .whitespaces)
+    if !pidTrimmed.isEmpty, let pid = Int32(pidTrimmed) {
+        logger.info("  Killing stale process: \(pid)")
+        kill(pid, SIGKILL)
+    }
+}
+// Brief pause for ports to be released
+if !staleProcs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+    try await Task.sleep(for: .seconds(2))
+}
+
 logger.info("Pre-flight cleanup: clearing stale firewall rules...")
 #if os(Linux)
 // Remove any leftover iptables rules referencing our port
