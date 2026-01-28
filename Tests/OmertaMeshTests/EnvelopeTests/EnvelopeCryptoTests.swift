@@ -230,7 +230,7 @@ final class EnvelopeCryptoTests: XCTestCase {
 
         // Encode and decode
         let encoded = try envelope.encodeV2(networkKey: networkKey)
-        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: networkKey)
+        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: networkKey)
 
         // Verify round-trip
         XCTAssertEqual(decoded.fromPeerId, envelope.fromPeerId)
@@ -254,6 +254,6 @@ final class EnvelopeCryptoTests: XCTestCase {
         let encoded = try envelope.encodeV2(networkKey: networkKey1)
 
         // Should fail with wrong key
-        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded, networkKey: networkKey2))
+        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded.data, networkKey: networkKey2))
     }
 }

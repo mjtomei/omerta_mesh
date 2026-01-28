@@ -80,7 +80,7 @@ final class EnvelopeSecurityTests: XCTestCase {
         let encoded = try envelope.encodeV2(networkKey: key1)
 
         // Try to decode with key2 - should fail
-        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded, networkKey: key2)) { error in
+        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded.data, networkKey: key2)) { error in
             // Could fail at crypto layer or network hash check
             XCTAssertNotNil(error)
         }
@@ -99,7 +99,8 @@ final class EnvelopeSecurityTests: XCTestCase {
             payload: .data(Data("test".utf8))
         )
 
-        let encoded = try envelope.encodeV2(networkKey: testKey)
+        let sealed = try envelope.encodeV2(networkKey: testKey)
+        let encoded = sealed.data
 
         // Truncate at various points
         let truncationPoints = [5, 10, 20, encoded.count / 2, encoded.count - 1]
@@ -126,7 +127,7 @@ final class EnvelopeSecurityTests: XCTestCase {
             payload: .data(Data("tamper test".utf8))
         )
 
-        var encoded = try envelope.encodeV2(networkKey: testKey)
+        var encoded = try envelope.encodeV2(networkKey: testKey).data
 
         // Tamper with header section (after prefix and nonce)
         // Position 17 is in the header tag area
@@ -148,7 +149,7 @@ final class EnvelopeSecurityTests: XCTestCase {
             payload: .data(Data("important data".utf8))
         )
 
-        var encoded = try envelope.encodeV2(networkKey: testKey)
+        var encoded = try envelope.encodeV2(networkKey: testKey).data
 
         // Tamper with payload section (near the end, before tag)
         if encoded.count > 50 {
@@ -169,7 +170,7 @@ final class EnvelopeSecurityTests: XCTestCase {
             payload: .data(Data("tag test".utf8))
         )
 
-        var encoded = try envelope.encodeV2(networkKey: testKey)
+        var encoded = try envelope.encodeV2(networkKey: testKey).data
 
         // Tamper with authentication tag (last 16 bytes)
         if encoded.count >= 16 {
@@ -205,8 +206,8 @@ final class EnvelopeSecurityTests: XCTestCase {
 
         // Due to random nonce, same plaintext should produce different ciphertext
         // Skip magic/version comparison (first 5 bytes are same)
-        let ciphertext1 = encoded1.suffix(from: 5)
-        let ciphertext2 = encoded2.suffix(from: 5)
+        let ciphertext1 = encoded1.data.suffix(from: 5)
+        let ciphertext2 = encoded2.data.suffix(from: 5)
 
         XCTAssertNotEqual(ciphertext1, ciphertext2,
                          "Same message should produce different ciphertext due to random nonce")
@@ -264,7 +265,7 @@ final class EnvelopeSecurityTests: XCTestCase {
         )
 
         let encoded = try signedEnvelope.encodeV2(networkKey: testKey)
-        let decoded = try MeshEnvelope.decodeV2(encoded, networkKey: testKey)
+        let decoded = try MeshEnvelope.decodeV2(encoded.data, networkKey: testKey)
 
         XCTAssertGreaterThanOrEqual(decoded.hopCount, 0)
         XCTAssertLessThanOrEqual(decoded.hopCount, 255)
@@ -285,7 +286,7 @@ final class EnvelopeSecurityTests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let decoded = try MeshEnvelope.decodeV2(encoded, networkKey: testKey)
+        let decoded = try MeshEnvelope.decodeV2(encoded.data, networkKey: testKey)
 
         if case .data(let decodedData) = decoded.payload {
             XCTAssertEqual(decodedData, largeData)

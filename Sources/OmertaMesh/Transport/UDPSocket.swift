@@ -153,8 +153,24 @@ public actor UDPSocket {
         }
     }
 
-    /// Send data to a specific address
-    public func send(_ data: Data, to address: SocketAddress) async throws {
+    #if DEBUG
+    /// Capture hook for testing — called with (data, destination) before each send.
+    public static nonisolated(unsafe) var captureHook: ((Data, String) -> Void)?
+    #endif
+
+    /// Send an encrypted envelope to a specific address
+    public func send(_ envelope: SealedEnvelope, to address: SocketAddress) async throws {
+        try await sendRaw(envelope.data, to: address)
+    }
+
+    /// Send an encrypted envelope to a host:port string
+    public func send(_ envelope: SealedEnvelope, to endpoint: String) async throws {
+        let address = try parseEndpoint(endpoint)
+        try await sendRaw(envelope.data, to: address)
+    }
+
+    /// Send raw data to a specific address (internal use only, e.g., hole punch probes)
+    func sendRaw(_ data: Data, to address: SocketAddress) async throws {
         guard let channel = channel, isRunning else {
             logger.warning("UDP send failed: socket not running")
             throw UDPSocketError.notRunning
@@ -169,6 +185,10 @@ public actor UDPSocket {
 
         // Convert address if needed for socket type compatibility
         let sendAddress = try convertAddressForSocket(address)
+
+        #if DEBUG
+        UDPSocket.captureHook?(data, "\(sendAddress)")
+        #endif
 
         let buffer = channel.allocator.buffer(bytes: data)
         let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
@@ -204,10 +224,10 @@ public actor UDPSocket {
         }
     }
 
-    /// Send data to a host:port string
-    public func send(_ data: Data, to endpoint: String) async throws {
+    /// Send raw data to a host:port string (internal use only, e.g., hole punch probes)
+    func sendRaw(_ data: Data, to endpoint: String) async throws {
         let address = try parseEndpoint(endpoint)
-        try await send(data, to: address)
+        try await sendRaw(data, to: address)
     }
 
     /// Convert address to be compatible with current socket type

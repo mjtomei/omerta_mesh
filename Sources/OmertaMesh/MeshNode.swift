@@ -367,8 +367,8 @@ public actor MeshNode {
                     payload: message
                 )
 
-                let data = try JSONCoding.encoder.encode(envelope)
-                try await socket.send(data, to: endpoint)
+                let sealed = try envelope.encodeV2(networkKey: config.encryptionKey)
+                try await socket.send(sealed, to: endpoint)
             } catch {
                 logger.debug("Failed to broadcast to \(peerId): \(error)")
             }
@@ -925,10 +925,10 @@ public actor MeshNode {
 
         // Encode using v2 wire format with layered encryption
         let encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
-        logger.info("Sending \(encryptedData.count) bytes to \(endpoint)")
+        logger.info("Sending \(encryptedData.data.count) bytes to \(endpoint)")
         try await socket.send(encryptedData, to: endpoint)
 
-        logger.info("Sent \(type(of: message)) (\(encryptedData.count) bytes) to \(endpoint) [channel: \(channel.isEmpty ? "<mesh>" : channel)]")
+        logger.info("Sent \(type(of: message)) (\(encryptedData.data.count) bytes) to \(endpoint) [channel: \(channel.isEmpty ? "<mesh>" : channel)]")
     }
 
     /// Send a message and wait for a response
@@ -1306,7 +1306,7 @@ public actor MeshNode {
         // Forward the raw payload directly to the target
         // The payload is already an encrypted MeshEnvelope from the original sender
         do {
-            try await socket.send(payload, to: targetEndpoint)
+            try await socket.send(SealedEnvelope(trustedData: payload), to: targetEndpoint)
             logger.info("Relayed \(payload.count) bytes to \(targetPeerId.prefix(8))... at \(targetEndpoint)")
             try? await send(.relayForwardResult(targetPeerId: targetPeerId, success: true), to: senderEndpoint)
         } catch {
@@ -1387,7 +1387,7 @@ public actor MeshNode {
             }
 
             logger.info("Sending via relay \(relay.relayPeerId.prefix(8))... to \(targetPeerId.prefix(8))... [channel: \(channel.isEmpty ? "<mesh>" : channel)]")
-            try await send(.relayForward(targetPeerId: targetPeerId, payload: encryptedPayload), to: relayEndpoint)
+            try await send(.relayForward(targetPeerId: targetPeerId, payload: encryptedPayload.data), to: relayEndpoint)
             return // Successfully sent to relay
         }
 
@@ -2091,7 +2091,7 @@ extension MeshNode: MeshNodeServices {
         let encryptedPayload = try envelope.encodeV2(networkKey: config.encryptionKey)
 
         logger.info("Sending via relay \(relayPeerId.prefix(8))... to \(targetPeerId.prefix(8))... [channel: \(channel.isEmpty ? "<mesh>" : channel)]")
-        try await send(.relayForward(targetPeerId: targetPeerId, payload: encryptedPayload), to: relayEndpoint)
+        try await send(.relayForward(targetPeerId: targetPeerId, payload: encryptedPayload.data), to: relayEndpoint)
     }
 
     // MARK: - Channel System
