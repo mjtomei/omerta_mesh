@@ -56,8 +56,8 @@ public actor TunnelHealthMonitor {
     }
 
     // Exposed for testing
-    var _consecutiveFailures: Int { consecutiveFailures }
-    var _currentProbeInterval: Duration { currentProbeInterval }
+    public var _consecutiveFailures: Int { consecutiveFailures }
+    public var _currentProbeInterval: Duration { currentProbeInterval }
 
     // MARK: - Private
 

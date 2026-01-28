@@ -72,6 +72,11 @@ public actor TunnelManager {
         Array(sessions.keys)
     }
 
+    /// Get the health monitor for a specific machine (for test observation)
+    public func getHealthMonitor(for machineId: MachineId) -> TunnelHealthMonitor? {
+        return healthMonitors[machineId]
+    }
+
     /// Initialize the tunnel manager
     /// - Parameters:
     ///   - provider: The channel provider (e.g., MeshNetwork) to use for communication
