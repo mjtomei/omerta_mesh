@@ -9,9 +9,65 @@ Redesign the mesh network to support a true virtual LAN where:
 4. Tunnel sessions are created on-demand based on LAN address routing
 5. **Dual interface modes:** Both userspace (netstack) and kernel (TUN) from the start
 
+## Architecture
+
+Each machine runs the same stack. The NetworkInterface (netstack or TUN) is the
+local packet I/O layer — it produces and consumes raw IP packets. PacketRouter
+reads those packets, uses VirtualNetwork to decide which peer machine they
+should go to, and sends them through TunnelManager over the mesh. On the
+receiving end, the peer's PacketRouter writes the packet into that machine's
+NetworkInterface.
+
+```
+Per-Machine Stack:
+
+  App (standard sockets / netstack dial API)
+       │
+       ▼
+  ┌─────────────────────────────────────────┐
+  │  NetworkInterface                       │
+  │  (NetstackBridge or TUN — swappable)    │
+  │  ├── readPacket()   (outbound from app) │
+  │  └── writePacket()  (inbound to app)    │
+  └──────────────┬──────────────────────────┘
+                 │ raw IP packets
+                 ▼
+  ┌─────────────────────────────────────────┐
+  │  PacketRouter                           │
+  │  ├── Reads packets from interface       │
+  │  ├── Routes via VirtualNetwork          │
+  │  │   .local → deliver back to interface │
+  │  │   .peer  → send via TunnelSession    │
+  │  │   .gateway → send to gateway machine │
+  │  └── Writes inbound packets to iface    │
+  └──────────────┬──────────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────────┐
+  │  TunnelManager → TunnelSessions         │
+  │  └── Mesh channel transport             │
+  └─────────────────────────────────────────┘
+```
+
+Two machines communicating:
+```
+Machine A                                    Machine B
+┌────────────────┐                          ┌────────────────┐
+│ App            │                          │ App            │
+│   ↕            │                          │   ↕            │
+│ NetworkIface   │                          │ NetworkIface   │
+│ (netstack/TUN) │                          │ (netstack/TUN) │
+│   ↕            │                          │   ↕            │
+│ PacketRouter   │                          │ PacketRouter   │
+│   ↕            │                          │   ↕            │
+│ TunnelSession ═══════ mesh channel ═══════│ TunnelSession  │
+└────────────────┘                          └────────────────┘
+```
+
 ## Interface Modes
 
-The system supports two interface modes, enabling different use cases:
+The NetworkInterface is swappable. The rest of the stack (PacketRouter,
+VirtualNetwork, TunnelManager) is identical regardless of which mode is used.
 
 ### Kernel Mode (TUN Interface) - Requires Root
 ```
@@ -21,13 +77,10 @@ The system supports two interface modes, enabling different use cases:
 │  ├── Standard socket APIs work        │
 │  ├── sshd, nginx, etc bind normally   │
 │  └── ifconfig/ip addr visible         │
-└───────────────────────────────────────┘
-           │
-           ▼
-┌───────────────────────────────────────┐
-│  omertad (TUN packet handler)         │
-│  └── Routes packets through mesh      │
-└───────────────────────────────────────┘
+└───────────────┬───────────────────────┘
+                │ raw IP packets
+                ▼
+         PacketRouter → mesh
 ```
 
 **Use cases:**
@@ -40,13 +93,16 @@ The system supports two interface modes, enabling different use cases:
 ┌───────────────────────────────────────┐
 │  Application (OmertaSSH, etc)         │
 │  └── Uses netstack dial APIs          │
-└───────────────────────────────────────┘
-           │
-           ▼
+└───────────────┬───────────────────────┘
+                │ raw IP packets
+                ▼
 ┌───────────────────────────────────────┐
 │  NetstackBridge (gVisor TCP/IP)       │
-│  └── Routes packets through mesh      │
-└───────────────────────────────────────┘
+│  └── Userspace TCP/IP stack           │
+└───────────────┬───────────────────────┘
+                │ raw IP packets
+                ▼
+         PacketRouter → mesh
 ```
 
 **Use cases:**
@@ -1266,35 +1322,40 @@ public actor MockNetworkInterface: NetworkInterface {
 // NetstackInterface.swift
 public actor NetstackInterface: NetworkInterface {
     public let localIP: String
-    private let netstack: NetstackBridge
+    private let bridge: any NetstackBridgeProtocol
     private var outboundStream: AsyncStream<Data>!
     private var outboundContinuation: AsyncStream<Data>.Continuation!
+    private var isRunning = false
 
-    public init(localIP: String) throws {
+    /// Initialize with a netstack bridge (dependency injection for testability)
+    public init(localIP: String, bridge: any NetstackBridgeProtocol) {
         self.localIP = localIP
-        let config = NetstackBridge.Config(gatewayIP: localIP, mtu: 1400)
-        self.netstack = try NetstackBridge(config: config)
+        self.bridge = bridge
 
         let (stream, continuation) = AsyncStream<Data>.makeStream()
         self.outboundStream = stream
         self.outboundContinuation = continuation
-
-        // Wire netstack outbound packets to our stream
-        netstack.setReturnCallback { [weak self] packet in
-            self?.outboundContinuation.yield(packet)
-        }
     }
 
     public func start() async throws {
-        try netstack.start()
+        guard !isRunning else { throw InterfaceError.alreadyStarted }
+        let continuation = self.outboundContinuation!
+        await bridge.setReturnCallback { packet in
+            continuation.yield(packet)
+        }
+        try await bridge.start()
+        isRunning = true
     }
 
     public func stop() async {
-        netstack.stop()
+        guard isRunning else { return }
+        isRunning = false
+        await bridge.stop()
         outboundContinuation.finish()
     }
 
     public func readPacket() async throws -> Data {
+        guard isRunning else { throw InterfaceError.notStarted }
         for await packet in outboundStream {
             return packet
         }
@@ -1302,11 +1363,13 @@ public actor NetstackInterface: NetworkInterface {
     }
 
     public func writePacket(_ packet: Data) async throws {
-        try netstack.injectPacket(packet)
+        guard isRunning else { throw InterfaceError.notStarted }
+        try await bridge.injectPacket(packet)
     }
 
     public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection? {
-        try netstack.dialTCP(host: host, port: port)
+        guard isRunning else { throw InterfaceError.notStarted }
+        return try await bridge.dialTCP(host: host, port: port)
     }
 }
 ```
@@ -1463,45 +1526,72 @@ public actor PacketRouter {
     }
 
     private func routeOutbound(_ packet: Data) async {
-        guard let destIP = extractDestinationIP(packet) else { return }
+        guard let destIP = extractDestinationIP(from: packet) else { return }
 
         let decision = await virtualNetwork.route(destinationIP: destIP)
 
         switch decision {
         case .local:
-            // Deliver locally
             try? await localInterface.writePacket(packet)
 
         case .peer(let machineId):
-            // Send via tunnel
-            if let session = await tunnelManager.getExistingSession(for: machineId) {
+            // Send via tunnel — get or create session on "packet" channel
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: "packet")
+            if let session = await tunnelManager.getExistingSession(key: key) {
                 try? await session.send(packet)
+            } else {
+                let session = try? await tunnelManager.getSession(machineId: machineId, channel: "packet")
+                if let session {
+                    await setupInboundRouting(for: session)
+                    try? await session.send(packet)
+                }
             }
 
         case .gateway:
-            // Forward to gateway service (we are a peer) or internet (we are gateway)
-            if let gateway = gatewayService {
-                await gateway.forwardToInternet(packet, from: await virtualNetwork.localMachineId)
-            } else if let gatewayMachineId = await virtualNetwork.gatewayMachineId,
-                      let session = await tunnelManager.getExistingSession(for: gatewayMachineId) {
-                try? await session.send(packet)
+            // If we ARE the gateway, forward locally
+            if let gatewayService {
+                guard let sourceIP = extractSourceIP(from: packet),
+                      let machineId = await virtualNetwork.lookupMachine(ip: sourceIP) else { return }
+                await gatewayService.forwardToInternet(packet, from: machineId)
+            } else if let gatewayMachineId = await virtualNetwork.getGatewayMachineId() {
+                // Send to gateway via tunnel
+                let key = TunnelSessionKey(remoteMachineId: gatewayMachineId, channel: "packet")
+                if let session = await tunnelManager.getExistingSession(key: key) {
+                    try? await session.send(packet)
+                } else {
+                    let session = try? await tunnelManager.getSession(machineId: gatewayMachineId, channel: "packet")
+                    if let session {
+                        await setupInboundRouting(for: session)
+                        try? await session.send(packet)
+                    }
+                }
             }
 
-        case .drop(let reason):
-            // Log and discard
+        case .drop:
             break
         }
     }
 
-    private func handleNewSession(_ session: TunnelSession) async {
-        let machineId = session.remoteMachineId
+    /// Set up inbound routing using callback pattern (not AsyncSequence)
+    private func setupInboundRouting(for session: TunnelSession) async {
+        await session.onReceive { [weak self] packet in
+            guard let self else { return }
+            await self.handleInboundPacket(packet, from: await session.remoteMachineId)
+        }
+    }
 
-        // Start inbound routing for this session
-        inboundTasks[machineId] = Task {
-            for await packet in session.receive() {
-                try? await localInterface.writePacket(packet)
+    private func handleInboundPacket(_ packet: Data, from machineId: MachineId) async {
+        // If we are the gateway and this is internet-bound, forward it
+        if let gatewayService {
+            if let destIP = extractDestinationIP(from: packet) {
+                let decision = await virtualNetwork.route(destinationIP: destIP)
+                if case .gateway = decision {
+                    await gatewayService.forwardToInternet(packet, from: machineId)
+                    return
+                }
             }
         }
+        try? await localInterface.writePacket(packet)
     }
 }
 ```
@@ -1642,15 +1732,17 @@ swift test --filter PacketRouterMultiNodeTests
 
 ### Phase 7: GatewayService
 
-**Goal:** Create GatewayService with its own NetstackBridge for internet forwarding.
+**Goal:** Create GatewayService for internet forwarding, supporting both netstack and TUN bridge modes.
 
 #### Architecture Context
 
-GatewayService runs on the gateway machine (consumer). It receives packets from peers that are destined for the internet, injects them into its own netstack for real TCP/UDP handling, and routes responses back.
+GatewayService runs on the gateway machine (consumer). It receives packets from peers that are destined for the internet and forwards them out to the real network. Two modes are supported:
+
+**Mode 1: Netstack (userspace)** — GatewayService injects packets into its own NetstackBridge, which makes real TCP/UDP connections and returns responses. Requires NAT tracking to route responses back to the originating peer.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  GatewayService (on gateway machine)                             │
+│  GatewayService — Netstack Mode                                  │
 │                                                                  │
 │  ┌─────────────┐    ┌────────────────┐    ┌────────────────┐    │
 │  │ Peer packet │───→│ NAT Table      │───→│ NetstackBridge │    │
@@ -1667,6 +1759,27 @@ GatewayService runs on the gateway machine (consumer). It receives packets from 
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+**Mode 2: TUN bridge (kernel)** — The gateway has a TUN interface (`omerta0`) and bridges it to a real NIC (e.g., `eth0`) using standard Linux IP forwarding and iptables NAT. No userspace netstack needed on the gateway side — the kernel handles TCP/IP and NAT natively. Packets from peers arrive via tunnel, get written to `omerta0`, and the kernel forwards them out `eth0`.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  GatewayService — TUN Bridge Mode                                │
+│                                                                  │
+│  Peer packet ───→ omerta0 (TUN) ───→ kernel IP forwarding       │
+│                                          │                       │
+│                                          ▼                       │
+│                                     iptables MASQUERADE          │
+│                                          │                       │
+│                                          ▼                       │
+│                                     eth0 → [Internet]            │
+│                                          │                       │
+│  Peer ←─── omerta0 ←─── kernel ←────────┘                       │
+└──────────────────────────────────────────────────────────────────┘
+
+Setup: sysctl net.ipv4.ip_forward=1
+       iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o eth0 -j MASQUERADE
+```
+
 #### Module: OmertaNetwork
 
 **Files to create:**
@@ -1675,55 +1788,75 @@ GatewayService runs on the gateway machine (consumer). It receives packets from 
 #### API
 
 ```swift
-public actor GatewayService {
-    private let internetNetstack: NetstackBridge
-    private var natTable: [NATKey: MachineId] = [:]
-    private var returnHandler: ((Data, MachineId) async -> Void)?
+public enum IPProtocol: Equatable, Hashable, Sendable {
+    case tcp, udp, other(UInt8)
+}
 
-    public struct NATKey: Hashable {
-        let srcIP: String
-        let srcPort: UInt16
-        let dstIP: String
-        let dstPort: UInt16
-        let proto: IPProtocol
+/// NAT key using UInt32 IPs for efficient packet parsing
+public struct NATKey: Hashable, Sendable {
+    public let srcIP: UInt32
+    public let srcPort: UInt16
+    public let dstIP: UInt32
+    public let dstPort: UInt16
+    public let proto: IPProtocol
+
+    public func reversed() -> NATKey {
+        NATKey(srcIP: dstIP, srcPort: dstPort, dstIP: srcIP, dstPort: srcPort, proto: proto)
     }
+}
 
-    public init() throws {
-        let config = NetstackBridge.Config(gatewayIP: "10.200.0.1", mtu: 1500)
-        self.internetNetstack = try NetstackBridge(config: config)
+public struct NATEntry: Sendable {
+    public let machineId: MachineId
+    public let createdAt: Date
+}
 
-        internetNetstack.setReturnCallback { [weak self] packet in
-            Task { await self?.handleInternetResponse(packet) }
-        }
+/// Forwards internet-bound packets from peers via a NetstackBridge.
+/// Takes the bridge via init for testability (can use stub or real netstack).
+public actor GatewayService {
+    private let bridge: any NetstackBridgeProtocol
+    private let natTimeout: TimeInterval
+    private var natTable: [NATKey: NATEntry] = [:]
+    private var returnHandler: (@Sendable (Data, MachineId) async -> Void)?
+    private var running = false
+
+    public init(bridge: any NetstackBridgeProtocol, natTimeout: TimeInterval = 120) {
+        self.bridge = bridge
+        self.natTimeout = natTimeout
     }
 
     public func start() async throws {
-        try internetNetstack.start()
+        running = true
+        await bridge.setReturnCallback { [weak self] packet in
+            guard let self else { return }
+            Task { await self.handleReturnPacket(packet) }
+        }
+        try await bridge.start()
     }
 
-    public func setReturnHandler(_ handler: @escaping (Data, MachineId) async -> Void) {
-        returnHandler = handler
+    public func stop() async {
+        running = false
+        await bridge.stop()
+    }
+
+    public func setReturnHandler(_ handler: @escaping @Sendable (Data, MachineId) async -> Void) {
+        self.returnHandler = handler
     }
 
     /// Forward packet from peer to internet
-    public func forwardToInternet(_ packet: Data, from sourceMachineId: MachineId) async {
-        guard let natKey = extractNATKey(packet) else { return }
+    public func forwardToInternet(_ packet: Data, from machineId: MachineId) async {
+        guard running else { return }
+        guard let key = Self.extractNATKey(from: packet) else { return }
 
-        // Record NAT mapping
-        natTable[natKey] = sourceMachineId
-
-        // Inject into netstack for real TCP/UDP handling
-        try? internetNetstack.injectPacket(packet)
+        natTable[key] = NATEntry(machineId: machineId, createdAt: Date())
+        try? await bridge.injectPacket(packet)
     }
 
-    /// Handle response from internet
-    private func handleInternetResponse(_ packet: Data) async {
-        guard let returnKey = extractReturnNATKey(packet),
-              let destMachineId = natTable[returnKey] else {
-            return  // Unknown return, drop
-        }
-
-        await returnHandler?(packet, destMachineId)
+    /// Handle response from internet — reverse NAT lookup to find originating peer
+    private func handleReturnPacket(_ packet: Data) async {
+        guard let key = Self.extractNATKey(from: packet) else { return }
+        let reverseKey = key.reversed()
+        guard let entry = natTable[reverseKey] else { return }
+        await returnHandler?(packet, entry.machineId)
     }
 }
 ```
@@ -1960,34 +2093,125 @@ ssh -p 2222 localhost
 
 ### Phase 9: TUN Interface (Linux)
 
-**Goal:** Implement real TUN interface for Linux.
+**Goal:** Implement real TUN interface for Linux, usable both as a mesh node's
+local interface and as a gateway's internet bridge.
 
 #### Architecture Context
 
-TUN creates a real network interface in the kernel. Apps use standard sockets, kernel routes packets to/from the TUN device, omertad reads/writes packets.
+TUN creates a real network interface in the kernel. Apps use standard sockets,
+kernel routes packets to/from the TUN device, omertad reads/writes packets.
+
+A single `TUNInterface` implementation serves **two roles**:
+
+1. **Node mode** — local interface for mesh apps (replaces NetstackInterface).
+   PacketRouter reads outbound packets from TUN, routes them through the mesh,
+   and writes inbound packets back to TUN for delivery to apps.
+
+2. **Bridge mode** — internet exit for the gateway (replaces NetstackBridge).
+   GatewayService writes internet-bound packets into TUN, the kernel routes
+   them to the real internet via normal routing + NAT, and responses come back
+   through TUN to GatewayService.
+
+This is possible because `NetworkInterface` and `NetstackBridgeProtocol` do the
+same thing with different API shapes:
+
+| NetworkInterface          | NetstackBridgeProtocol   | TUN fd operation |
+|---------------------------|--------------------------|------------------|
+| `readPacket()`            | `setReturnCallback()`    | `read(fd)`       |
+| `writePacket(packet)`     | `injectPacket(packet)`   | `write(fd)`      |
+| `dialTCP()` → nil         | `dialTCP()` → nil        | kernel handles   |
+
+To bridge this, a `TUNBridgeAdapter` wraps a `TUNInterface` and conforms to
+`NetstackBridgeProtocol` by mapping `injectPacket` → `writePacket` and forwarding
+packets from the `DispatchSource` read callback to the return callback.
+
+#### Event-Driven I/O
+
+Rather than blocking `read()` calls or polling read loops, `TUNInterface` uses
+`DispatchSource.makeReadSource(fileDescriptor:)` to get notified when the fd is
+readable. This avoids tying up Swift cooperative thread pool threads.
+
+Internally, `TUNInterface` is callback-driven:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Linux Kernel                                                    │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  omerta0 interface (10.0.0.x/16)                         │   │
-│  │  - Created via /dev/net/tun                              │   │
-│  │  - Configured with ip addr, ip link                      │   │
-│  └────────────────────────┬─────────────────────────────────┘   │
-│                           │ read/write                           │
-│  ┌────────────────────────▼─────────────────────────────────┐   │
-│  │  TUNInterface (userspace)                                │   │
-│  │  - Opens /dev/net/tun with IFF_TUN | IFF_NO_PI           │   │
-│  │  - Reads outbound packets (apps → mesh)                  │   │
-│  │  - Writes inbound packets (mesh → apps)                  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
+TUN fd → DispatchSource fires → read() → onPacket callback
+```
+
+Both API shapes are thin wrappers over this single event source:
+
+- **`readPacket()` (pull, for NetworkInterface):** The `DispatchSource` callback
+  yields packets into an `AsyncStream`. `readPacket()` awaits the next element.
+  No threads blocked — `AsyncStream.Continuation.yield` is non-blocking.
+
+- **`setReturnCallback()` (push, for TUNBridgeAdapter):** The `DispatchSource`
+  callback invokes the return callback directly. No adapter read loop needed.
+
+```swift
+// Internal to TUNInterface:
+private var onPacket: ((Data) -> Void)?          // set by bridge adapter
+private var streamContinuation: AsyncStream<Data>.Continuation?  // for readPacket
+
+private func setupDispatchSource() {
+    // Set fd non-blocking
+    fcntl(fd, F_SETFL, O_NONBLOCK)
+
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
+    source.setEventHandler { [weak self] in
+        guard let self else { return }
+        var buf = [UInt8](repeating: 0, count: 1500)
+        let n = read(self.fd, &buf, buf.count)
+        guard n > 0 else { return }
+        let packet = Data(buf[..<n])
+
+        if let onPacket = self.onPacket {
+            onPacket(packet)           // push path (bridge mode)
+        } else {
+            self.streamContinuation?.yield(packet)  // pull path (node mode)
+        }
+    }
+    source.resume()
+    self.readSource = source
+}
+```
+
+This means `TUNBridgeAdapter` doesn't need its own read loop — it just sets the
+`onPacket` callback on the underlying `TUNInterface`, and packets flow directly
+from the `DispatchSource` to `GatewayService` with zero intermediate buffering.
+
+```
+Node mode (local-facing):                  Bridge mode (internet-facing):
+
+ ┌─────────────────────────┐                ┌─────────────────────────┐
+ │  Apps (sockets)          │                │  Peer packets from mesh  │
+ └───────────┬──────────────┘                └───────────┬──────────────┘
+             │                                           │
+ ┌───────────▼──────────────┐                ┌───────────▼──────────────┐
+ │  omerta0 TUN device       │                │  GatewayService          │
+ │  10.0.0.x/16             │                │  (NAT tracking)          │
+ └───────────┬──────────────┘                └───────────┬──────────────┘
+             │ read/write                                │ injectPacket/callback
+ ┌───────────▼──────────────┐                ┌───────────▼──────────────┐
+ │  TUNInterface             │                │  TUNBridgeAdapter        │
+ │  (NetworkInterface)       │                │  (NetstackBridgeProtocol)│
+ └───────────┬──────────────┘                └───────────┬──────────────┘
+             │                                           │ writePacket/readPacket
+ ┌───────────▼──────────────┐                ┌───────────▼──────────────┐
+ │  PacketRouter             │                │  omerta-gw0 TUN device   │
+ │  → mesh tunnel            │                │  + kernel ip_forward     │
+ └──────────────────────────┘                │  + iptables MASQUERADE   │
+                                             └──────────────────────────┘
+                                                         │
+                                              ┌──────────▼──────────────┐
+                                              │  Real internet           │
+                                              └─────────────────────────┘
 ```
 
 #### Module: OmertaNetwork
 
 **Files to create:**
 - `Sources/OmertaNetwork/TUNInterface.swift`
+- `Sources/OmertaNetwork/TUNBridgeAdapter.swift`
+- `Sources/OmertaNetwork/KernelNetworking.swift`
 - `Sources/OmertaNetwork/BuildCapabilities.swift`
 
 #### API
@@ -1995,24 +2219,33 @@ TUN creates a real network interface in the kernel. Apps use standard sockets, k
 ```swift
 // TUNInterface.swift
 #if os(Linux)
+import Glibc
+
 public actor TUNInterface: NetworkInterface {
     public let localIP: String
     private let name: String
     private var fd: Int32 = -1
 
-    public init(name: String, ip: String) throws {
+    // Event-driven read via DispatchSource
+    private var readSource: DispatchSourceRead?
+    private let readQueue = DispatchQueue(label: "omerta.tun.read")
+
+    // Push path: direct callback for bridge mode
+    private var onPacket: (@Sendable (Data) -> Void)?
+
+    // Pull path: AsyncStream for readPacket() in node mode
+    private var packetStream: AsyncStream<Data>?
+    private var streamContinuation: AsyncStream<Data>.Continuation?
+
+    public init(name: String, ip: String) {
         self.name = name
         self.localIP = ip
     }
 
     public func start() async throws {
-        // Open /dev/net/tun
         fd = open("/dev/net/tun", O_RDWR)
-        guard fd >= 0 else {
-            throw TUNError.openFailed(errno)
-        }
+        guard fd >= 0 else { throw TUNError.openFailed(errno) }
 
-        // Configure interface
         var ifr = ifreq()
         withUnsafeMutableBytes(of: &ifr.ifr_name) { ptr in
             _ = name.utf8CString.withUnsafeBufferPointer { src in
@@ -2026,54 +2259,183 @@ public actor TUNInterface: NetworkInterface {
             throw TUNError.ioctlFailed(errno)
         }
 
-        // Configure IP
         try configureIP()
+
+        // Set non-blocking and start DispatchSource
+        fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        // Set up the AsyncStream for pull-based readPacket()
+        let (stream, continuation) = AsyncStream<Data>.makeStream()
+        self.packetStream = stream
+        self.streamContinuation = continuation
+
+        let tunFd = fd
+        let onPkt = onPacket
+        let cont = continuation
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: tunFd, queue: readQueue)
+        source.setEventHandler {
+            var buf = [UInt8](repeating: 0, count: 1500)
+            while true {
+                let n = read(tunFd, &buf, buf.count)
+                guard n > 0 else { break }
+                let packet = Data(buf[..<n])
+                if let onPkt {
+                    onPkt(packet)         // push path (bridge mode)
+                } else {
+                    cont.yield(packet)    // pull path (node mode)
+                }
+            }
+        }
+        source.resume()
+        self.readSource = source
     }
 
     public func stop() async {
+        readSource?.cancel()
+        readSource = nil
+        streamContinuation?.finish()
+        streamContinuation = nil
         if fd >= 0 {
             close(fd)
             fd = -1
         }
-        // Remove interface
         _ = try? Process.run("/sbin/ip", arguments: ["link", "delete", name])
     }
 
     public func readPacket() async throws -> Data {
-        var buffer = [UInt8](repeating: 0, count: 1500)
-        let n = read(fd, &buffer, buffer.count)
-        guard n > 0 else {
-            throw TUNError.readFailed(errno)
+        guard let stream = packetStream else { throw InterfaceError.notStarted }
+        for await packet in stream {
+            return packet
         }
-        return Data(buffer[..<n])
+        throw InterfaceError.closed
     }
 
     public func writePacket(_ packet: Data) async throws {
+        guard fd >= 0 else { throw InterfaceError.notStarted }
         try packet.withUnsafeBytes { ptr in
             let n = write(fd, ptr.baseAddress!, packet.count)
-            guard n == packet.count else {
-                throw TUNError.writeFailed(errno)
-            }
+            guard n == packet.count else { throw TUNError.writeFailed(errno) }
         }
     }
 
     public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection? {
-        nil  // TUN mode uses kernel TCP
+        nil  // TUN mode uses kernel TCP — apps dial directly via sockets
+    }
+
+    /// Set a direct packet callback for bridge mode. When set, packets go to
+    /// this callback instead of the AsyncStream. Must be called before start().
+    public func setPacketCallback(_ callback: @escaping @Sendable (Data) -> Void) {
+        onPacket = callback
     }
 
     private func configureIP() throws {
-        // ip addr add 10.0.0.x/16 dev omerta0
         _ = try Process.run("/sbin/ip", arguments: [
             "addr", "add", "\(localIP)/16", "dev", name
         ])
-        // ip link set omerta0 up
         _ = try Process.run("/sbin/ip", arguments: [
             "link", "set", name, "up"
         ])
     }
 }
 #endif
+```
 
+```swift
+// TUNBridgeAdapter.swift
+// Wraps a TUNInterface to conform to NetstackBridgeProtocol so GatewayService
+// can use a TUN device as its internet exit instead of a gVisor netstack.
+// No read loop needed — packets flow directly from the TUNInterface's
+// DispatchSource to GatewayService via the onPacket callback.
+#if os(Linux)
+public actor TUNBridgeAdapter: NetstackBridgeProtocol {
+    private let tun: TUNInterface
+
+    public init(tun: TUNInterface) {
+        self.tun = tun
+    }
+
+    public func start() async throws {
+        try await tun.start()
+    }
+
+    public func stop() async {
+        await tun.stop()
+    }
+
+    public func injectPacket(_ packet: Data) async throws {
+        try await tun.writePacket(packet)
+    }
+
+    public func setReturnCallback(_ callback: @escaping @Sendable (Data) -> Void) async {
+        // Wire the TUNInterface's DispatchSource directly to the callback.
+        // Packets arriving on the TUN fd fire the DispatchSource, which
+        // invokes this callback with zero intermediate buffering.
+        await tun.setPacketCallback(callback)
+    }
+
+    public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection {
+        throw InterfaceError.notSupported  // kernel handles TCP
+    }
+}
+#endif
+```
+
+```swift
+// KernelNetworking.swift
+// Configures kernel IP forwarding and NAT masquerade for gateway bridge mode.
+#if os(Linux)
+public enum KernelNetworking {
+    /// Enable kernel IP forwarding
+    public static func enableForwarding() throws {
+        try "1".write(toFile: "/proc/sys/net/ipv4/ip_forward",
+                       atomically: true, encoding: .utf8)
+    }
+
+    /// Set up iptables MASQUERADE for a TUN interface so packets exiting
+    /// through the kernel get source-NATted to the host's real IP.
+    /// - Parameters:
+    ///   - tunName: The TUN device name (e.g. "omerta-gw0")
+    ///   - outInterface: The internet-facing interface (e.g. "eth0")
+    public static func enableMasquerade(tunName: String, outInterface: String) throws {
+        _ = try Process.run("/sbin/iptables", arguments: [
+            "-t", "nat", "-A", "POSTROUTING",
+            "-s", "10.0.0.0/16", "-o", outInterface,
+            "-j", "MASQUERADE"
+        ])
+        _ = try Process.run("/sbin/iptables", arguments: [
+            "-A", "FORWARD", "-i", tunName, "-o", outInterface,
+            "-j", "ACCEPT"
+        ])
+        _ = try Process.run("/sbin/iptables", arguments: [
+            "-A", "FORWARD", "-i", outInterface, "-o", tunName,
+            "-m", "state", "--state", "RELATED,ESTABLISHED",
+            "-j", "ACCEPT"
+        ])
+    }
+
+    /// Clean up iptables rules
+    public static func disableMasquerade(tunName: String, outInterface: String) throws {
+        _ = try? Process.run("/sbin/iptables", arguments: [
+            "-t", "nat", "-D", "POSTROUTING",
+            "-s", "10.0.0.0/16", "-o", outInterface,
+            "-j", "MASQUERADE"
+        ])
+        _ = try? Process.run("/sbin/iptables", arguments: [
+            "-D", "FORWARD", "-i", tunName, "-o", outInterface,
+            "-j", "ACCEPT"
+        ])
+        _ = try? Process.run("/sbin/iptables", arguments: [
+            "-D", "FORWARD", "-i", outInterface, "-o", tunName,
+            "-m", "state", "--state", "RELATED,ESTABLISHED",
+            "-j", "ACCEPT"
+        ])
+    }
+}
+#endif
+```
+
+```swift
 // BuildCapabilities.swift
 public enum BuildCapabilities {
     #if OMERTA_APPSTORE_BUILD
@@ -2088,26 +2450,434 @@ public enum BuildCapabilities {
 }
 ```
 
+#### Gateway Setup Example (Bridge Mode)
+
+```swift
+// Gateway node using TUN for internet access:
+let meshTun = TUNInterface(name: "omerta0", ip: "10.0.0.1")
+let bridgeTun = TUNInterface(name: "omerta-gw0", ip: "10.200.0.1")
+let bridgeAdapter = TUNBridgeAdapter(tun: bridgeTun)
+
+try KernelNetworking.enableForwarding()
+try KernelNetworking.enableMasquerade(tunName: "omerta-gw0", outInterface: "eth0")
+
+let gatewayService = GatewayService(bridge: bridgeAdapter)
+let router = PacketRouter(
+    localInterface: meshTun,
+    virtualNetwork: vnet,
+    tunnelManager: tunnelManager,
+    gatewayService: gatewayService
+)
+```
+
 #### Unit Tests (Requires Root)
 
 ```swift
 // TUNInterfaceTests.swift
 #if os(Linux)
+
+// --- Basic lifecycle ---
+
 func testTUNCreation() async throws {
     guard ProcessInfo.processInfo.effectiveUserID == 0 else {
         throw XCTSkip("Requires root")
     }
 
-    let tun = try TUNInterface(name: "omerta-test0", ip: "10.99.0.1")
+    let tun = TUNInterface(name: "omerta-test0", ip: "10.99.0.1")
     try await tun.start()
     defer { Task { await tun.stop() } }
 
-    // Verify interface exists
+    // Verify interface exists and has correct IP
     let result = try Process.run("/sbin/ip", arguments: ["addr", "show", "omerta-test0"])
     XCTAssertTrue(result.output.contains("10.99.0.1"))
+    XCTAssertTrue(result.output.contains("UP"))
 }
+
+func testTUNStartStop() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    let tun = TUNInterface(name: "omerta-lifecycle0", ip: "10.99.2.1")
+    try await tun.start()
+    await tun.stop()
+
+    // Interface should be gone
+    let result = try Process.run("/sbin/ip", arguments: ["link", "show", "omerta-lifecycle0"])
+    XCTAssertFalse(result.exitCode == 0)
+}
+
+func testTUNDoubleStartThrows() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    let tun = TUNInterface(name: "omerta-dbl0", ip: "10.99.3.1")
+    try await tun.start()
+    defer { Task { await tun.stop() } }
+
+    do {
+        try await tun.start()
+        XCTFail("Second start should throw")
+    } catch {
+        // expected
+    }
+}
+
+// --- Packet I/O ---
+
+func testTUNWriteAndReadLoopback() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    // Create two TUN interfaces in the same subnet and send a packet between them.
+    // This verifies writePacket and readPacket (via DispatchSource) both work.
+    let tun1 = TUNInterface(name: "omerta-io1", ip: "10.99.10.1")
+    let tun2 = TUNInterface(name: "omerta-io2", ip: "10.99.10.2")
+    try await tun1.start()
+    try await tun2.start()
+    defer {
+        Task { await tun1.stop(); await tun2.stop() }
+    }
+
+    // Add route so tun1 knows to send to tun2
+    _ = try Process.run("/sbin/ip", arguments: [
+        "route", "add", "10.99.10.2/32", "dev", "omerta-io1"
+    ])
+
+    // Send a UDP packet from tun1 → 10.99.10.2
+    // Use ping from shell to generate traffic
+    let pingTask = Task {
+        _ = try? Process.run("/bin/ping", arguments: [
+            "-c", "1", "-W", "2", "-I", "omerta-io1", "10.99.10.2"
+        ])
+    }
+
+    // tun2 should receive the ICMP packet via DispatchSource → readPacket
+    let packet = try await withTimeout(seconds: 3) {
+        try await tun2.readPacket()
+    }
+    XCTAssertGreaterThan(packet.count, 20)  // at least an IP header
+
+    pingTask.cancel()
+}
+
+// --- DispatchSource (event-driven) ---
+
+func testTUNDispatchSourceNotBlocking() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    // Verify that readPacket doesn't block the actor when no data available.
+    // Start TUN, schedule a read, verify the actor is still responsive.
+    let tun = TUNInterface(name: "omerta-nb0", ip: "10.99.4.1")
+    try await tun.start()
+    defer { Task { await tun.stop() } }
+
+    // This should not block — the DispatchSource only fires when data arrives
+    let readTask = Task {
+        try await tun.readPacket()
+    }
+
+    // The actor should still respond while readTask is waiting
+    let ip = await tun.localIP
+    XCTAssertEqual(ip, "10.99.4.1")
+
+    readTask.cancel()
+}
+
+func testTUNCallbackMode() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    // Verify the push-path (onPacket callback) works
+    let tun = TUNInterface(name: "omerta-cb0", ip: "10.99.5.1")
+
+    let expectation = XCTestExpectation(description: "packet received via callback")
+    var callbackPacket: Data?
+    await tun.setPacketCallback { packet in
+        callbackPacket = packet
+        expectation.fulfill()
+    }
+
+    try await tun.start()
+    defer { Task { await tun.stop() } }
+
+    // Generate traffic to the interface (ping ourselves)
+    _ = try? Process.run("/bin/ping", arguments: ["-c", "1", "-W", "1", "10.99.5.1"])
+
+    await fulfillment(of: [expectation], timeout: 3)
+    XCTAssertNotNil(callbackPacket)
+}
+
+// --- TUNBridgeAdapter ---
+
+func testTUNBridgeAdapterConforms() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    let tun = TUNInterface(name: "omerta-bridge0", ip: "10.99.6.1")
+    let bridge = TUNBridgeAdapter(tun: tun)
+    try await bridge.start()
+    defer { Task { await bridge.stop() } }
+
+    // Verify return callback is wired through
+    let expectation = XCTestExpectation(description: "return callback fired")
+    await bridge.setReturnCallback { packet in
+        expectation.fulfill()
+    }
+
+    // Generate traffic to the TUN (ping ourselves)
+    _ = try? Process.run("/bin/ping", arguments: ["-c", "1", "-W", "1", "10.99.6.1"])
+
+    await fulfillment(of: [expectation], timeout: 3)
+}
+
+func testTUNBridgeInjectPacket() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    let tun = TUNInterface(name: "omerta-binj0", ip: "10.99.7.1")
+    let bridge = TUNBridgeAdapter(tun: tun)
+    try await bridge.start()
+    defer { Task { await bridge.stop() } }
+
+    // Build a minimal ICMP echo to ourselves — the kernel should process it
+    // and send a reply back through the TUN
+    let icmpPacket = buildICMPEchoPacket(src: "10.99.7.2", dst: "10.99.7.1")
+
+    let expectation = XCTestExpectation(description: "ICMP reply via callback")
+    await bridge.setReturnCallback { packet in
+        // Should receive an ICMP echo reply
+        if packet.count >= 20 && packet[9] == 1 { // ICMP protocol
+            expectation.fulfill()
+        }
+    }
+
+    try await bridge.injectPacket(icmpPacket)
+    await fulfillment(of: [expectation], timeout: 3)
+}
+
+func testTUNBridgeDialTCPThrows() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    let tun = TUNInterface(name: "omerta-bdial0", ip: "10.99.8.1")
+    let bridge = TUNBridgeAdapter(tun: tun)
+    try await bridge.start()
+    defer { Task { await bridge.stop() } }
+
+    do {
+        _ = try await bridge.dialTCP(host: "1.2.3.4", port: 80)
+        XCTFail("dialTCP should throw notSupported")
+    } catch InterfaceError.notSupported {
+        // expected
+    }
+}
+
+// --- KernelNetworking ---
+
+func testKernelForwardingToggle() async throws {
+    guard ProcessInfo.processInfo.effectiveUserID == 0 else {
+        throw XCTSkip("Requires root")
+    }
+
+    // Save original value
+    let original = try String(contentsOfFile: "/proc/sys/net/ipv4/ip_forward").trimmingCharacters(in: .whitespacesAndNewlines)
+    defer {
+        try? original.write(toFile: "/proc/sys/net/ipv4/ip_forward",
+                            atomically: true, encoding: .utf8)
+    }
+
+    try KernelNetworking.enableForwarding()
+    let value = try String(contentsOfFile: "/proc/sys/net/ipv4/ip_forward").trimmingCharacters(in: .whitespacesAndNewlines)
+    XCTAssertEqual(value, "1")
+}
+
 #endif
 ```
+
+#### Demo: TUN-Based SOCKS5 Gateway
+
+A variant of `DemoSOCKSGateway` that uses real TUN interfaces instead of the
+in-process gVisor netstack. Requires Linux and root.
+
+**File:** `Sources/DemoTUNGateway/main.swift`
+**Script:** `demo-tun-gateway.sh`
+
+```
+Traffic flow with TUN:
+
+  curl -x socks5h://127.0.0.1:1080 http://example.com
+    │
+    ▼
+  SOCKSProxy (port 1080)
+    │  dialTCP → nil (TUN mode doesn't support dialTCP)
+    │  ... wait, SOCKS needs dialTCP for netstack mode.
+    │
+    │  In TUN mode, SOCKS isn't needed! Apps use standard sockets
+    │  and the kernel routes through the TUN device. So the TUN demo
+    │  uses a different entry point:
+    │
+    ▼
+  Standard curl/ping/ssh (any app)
+    │
+    ▼
+  Kernel routes via omerta0 (10.0.0.100/16)
+    │  read() from TUN fd
+    ▼
+  TUNInterface (peer, node mode)
+    │  DispatchSource fires → readPacket()
+    ▼
+  PacketRouter
+    │  VirtualNetwork.route("93.184.216.34") → .gateway
+    ▼
+  TunnelManager → mock relay → gateway TunnelManager
+    │
+    ▼
+  PacketRouter (gateway)
+    │  gatewayService.forwardToInternet()
+    ▼
+  GatewayService
+    │  NAT tracking, injectPacket()
+    ▼
+  TUNBridgeAdapter → TUNInterface (gateway, bridge mode)
+    │  writePacket() → write to TUN fd
+    ▼
+  Kernel (ip_forward + MASQUERADE)
+    │  routes to real internet
+    ▼
+  Real internet → response back through full chain
+```
+
+```swift
+// Sources/DemoTUNGateway/main.swift (sketch)
+// Requires: Linux, root, two TUN devices
+
+// 1. Peer node — TUN as local interface
+let peerTun = TUNInterface(name: "omerta0", ip: "10.0.0.100")
+
+// 2. Gateway node — TUN as internet bridge
+let gwTun = TUNInterface(name: "omerta-gw0", ip: "10.200.0.1")
+let gwBridge = TUNBridgeAdapter(tun: gwTun)
+let gatewayService = GatewayService(bridge: gwBridge)
+
+// 3. Kernel networking for gateway bridge
+try KernelNetworking.enableForwarding()
+try KernelNetworking.enableMasquerade(tunName: "omerta-gw0", outInterface: "eth0")
+
+// 4. Virtual networks (same as netstack demo)
+let peerVNet = VirtualNetwork(localMachineId: "peer")
+await peerVNet.setLocalAddress("10.0.0.100")
+await peerVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
+
+let gwVNet = VirtualNetwork(localMachineId: "gw")
+await gwVNet.setLocalAddress("10.0.0.1")
+await gwVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
+await gwVNet.registerAddress(ip: "10.0.0.100", machineId: "peer")
+
+// 5. Mock channel providers + relay (same as netstack demo)
+let peerProvider = E2EChannelProvider(machineId: "peer")
+let gwProvider = E2EChannelProvider(machineId: "gw")
+let relay = E2ERelay()
+await relay.register(machineId: "peer", provider: peerProvider)
+await relay.register(machineId: "gw", provider: gwProvider)
+
+// 6. Tunnel managers + packet routers
+let peerTunnelManager = TunnelManager(provider: peerProvider)
+let gwTunnelManager = TunnelManager(provider: gwProvider)
+
+let peerRouter = PacketRouter(
+    localInterface: peerTun,
+    virtualNetwork: peerVNet,
+    tunnelManager: peerTunnelManager
+)
+
+let gwRouter = PacketRouter(
+    localInterface: TUNInterface(name: "omerta-gw-mesh0", ip: "10.0.0.1"),
+    virtualNetwork: gwVNet,
+    tunnelManager: gwTunnelManager,
+    gatewayService: gatewayService
+)
+
+// 7. Start everything, add routes
+// ...
+
+// 8. Add route so the host sends internet traffic through omerta0
+// sudo ip route add default via 10.0.0.1 dev omerta0 metric 100
+
+// Now standard tools work:
+//   ping 8.8.8.8         → through mesh → gateway → internet
+//   curl http://example.com  → through mesh → gateway → internet
+//   ssh user@10.0.0.1    → through mesh → gateway node
+```
+
+```bash
+#!/usr/bin/env bash
+# demo-tun-gateway.sh
+#
+# Demo: TUN-based SOCKS5 Gateway
+#
+# Unlike the netstack demo (demo-socks-gateway.sh) which uses a SOCKS proxy
+# and userspace gVisor stacks, this demo uses real Linux TUN interfaces.
+# Standard networking tools (curl, ping, ssh) work without any proxy config
+# because the kernel routes traffic through the TUN device.
+#
+# Requires: Linux, root privileges
+#
+# What it creates:
+#   omerta0      — peer TUN device (10.0.0.100/16), local app traffic
+#   omerta-gw0   — gateway TUN device (10.200.0.1), internet bridge
+#   iptables     — MASQUERADE rule for gateway internet access
+#   ip_forward   — enabled for kernel packet forwarding
+#
+# Traffic flow:
+#   any app → kernel → omerta0 → PacketRouter → mesh relay →
+#   gateway PacketRouter → GatewayService → omerta-gw0 → kernel →
+#   real internet → response back through full chain
+#
+# Test with (in another terminal):
+#   ping 8.8.8.8
+#   curl http://example.com
+#   # These use standard sockets — no SOCKS proxy needed!
+#
+# Press Ctrl+C to stop. Cleanup removes TUN devices and iptables rules.
+
+set -e
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: must run as root (need TUN device access)"
+    echo "Usage: sudo ./demo-tun-gateway.sh"
+    exit 1
+fi
+
+echo "Building DemoTUNGateway..."
+swift build --target DemoTUNGateway
+
+echo ""
+echo "Starting TUN gateway demo (requires root)..."
+swift run DemoTUNGateway
+```
+
+#### Comparison: Netstack Demo vs TUN Demo
+
+| Aspect             | DemoSOCKSGateway (netstack)     | DemoTUNGateway (TUN)            |
+|--------------------|----------------------------------|---------------------------------|
+| Platform           | Any (Linux, macOS)              | Linux only                      |
+| Root required      | No                              | Yes                             |
+| App entry point    | SOCKS5 proxy (port 1080)        | Standard sockets (any app)      |
+| TCP/IP stack       | gVisor userspace (peer+gateway) | Kernel (peer), kernel (gateway) |
+| DNS resolution     | Through gVisor UDP → gateway    | Through kernel → TUN → gateway  |
+| Internet bridge    | NetstackBridge (gVisor)         | TUNBridgeAdapter (kernel+NAT)   |
+| `curl` usage       | `curl -x socks5h://...`        | `curl` (no proxy needed)        |
+| `ping` works       | No (SOCKS is TCP only)          | Yes                             |
+| `ssh` works        | No (need OmertaSSH)            | Yes (standard ssh)              |
 
 #### Manual Tests
 
@@ -2116,20 +2886,113 @@ func testTUNCreation() async throws {
 sudo swift test --filter TUNInterfaceTests
 
 # Verify interface creation
-sudo swift run omertad start --vpn --test-mode &
+sudo swift run DemoTUNGateway &
 ip addr show omerta0
+ip addr show omerta-gw0
 ping -c 1 10.0.0.1  # Should respond
+
+# Verify bridge mode (gateway)
+cat /proc/sys/net/ipv4/ip_forward  # Should be 1
+sudo iptables -t nat -L  # Should show MASQUERADE rule
+
+# Test internet access through TUN
+curl http://example.com
+ping -c 3 8.8.8.8
 ```
 
-**Deliverable:** TUN interface works on Linux with root.
+**Deliverable:** TUN interface works on Linux with root, both as a mesh node
+local interface and as a gateway internet bridge via TUNBridgeAdapter. Two demo
+binaries demonstrate both modes: netstack (cross-platform, SOCKS proxy) and TUN
+(Linux-only, standard sockets).
 
 ---
 
 ### Phase 10: Two-Machine Test (Userspace)
 
-**Goal:** Test packet routing between two physical machines using userspace networking.
+**Goal:** Build the `omertad` daemon binary that wires the real `MeshNetwork` (ChannelProvider) to the virtual network stack, then test between two physical machines.
 
-**No new code** - integration testing of existing components.
+#### New Code
+
+**`Sources/omertad/main.swift`** — The real daemon entry point (~200 lines)
+
+Wires together all components built in Phases 1–9:
+
+```swift
+// Pseudocode structure:
+@main struct OmertaDaemon {
+    static func main() async throws {
+        let args = parseArgs()  // --port, --gateway, --bootstrap, --interface tun|userspace
+
+        // 1. Identity
+        let identity = try loadOrCreateIdentity()
+
+        // 2. Real mesh network (the ChannelProvider)
+        let mesh = MeshNetwork(identity: identity, config: .init(listenPort: args.port))
+        if let bootstrap = args.bootstrap {
+            try await mesh.bootstrap(to: bootstrap)
+        }
+
+        // 3. Virtual network (address allocation)
+        let virtualNetwork = VirtualNetwork()
+
+        // 4. DHCP
+        if args.gateway {
+            let dhcpServer = DHCPServer(virtualNetwork: virtualNetwork)
+            // register on virtual network
+        } else {
+            let dhcpClient = DHCPClient(virtualNetwork: virtualNetwork)
+        }
+
+        // 5. Tunnel manager (wraps MeshNetwork as ChannelProvider)
+        let tunnelManager = TunnelManager(channelProvider: mesh)
+
+        // 6. Local interface (TUN or userspace netstack)
+        let localInterface: NetworkInterface
+        if args.interface == .tun {
+            localInterface = try TUNInterface(name: "omerta0")
+        } else {
+            let bridge = try NetstackBridge(config: .init(gatewayIP: myIP))
+            localInterface = NetstackInterface(bridge: bridge)
+        }
+
+        // 7. Gateway service (only on gateway node)
+        let gatewayService: GatewayService? = args.gateway
+            ? GatewayService(bridge: try NetstackBridge(config: .init(gatewayIP: "10.200.0.1")))
+            : nil
+
+        // 8. Packet router (ties it all together)
+        let router = PacketRouter(
+            localInterface: localInterface,
+            virtualNetwork: virtualNetwork,
+            tunnelManager: tunnelManager,
+            gatewayService: gatewayService
+        )
+
+        try await router.start()
+        // await shutdown signal
+    }
+}
+```
+
+**Key design decisions:**
+- Single binary, flag-driven mode (`--gateway` vs peer)
+- `--interface tun|userspace` selects TUNInterface or NetstackInterface
+- Identity persisted to `~/.omerta/identity.json`
+- `--bootstrap peerID@host:port` for initial mesh join
+
+**Dependencies:** `OmertaNetwork`, `OmertaTunnel`, `OmertaMesh`, `ArgumentParser`
+
+**Package.swift addition:**
+```swift
+.executableTarget(
+    name: "omertad",
+    dependencies: [
+        "OmertaNetwork", "OmertaTunnel", "OmertaMesh",
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "Logging", package: "swift-log"),
+    ]
+),
+```
 
 #### Manual Tests
 
@@ -2561,7 +3424,7 @@ sudo ./build/debug/omertad start --port 18002 --gateway --vpn
 | 6. PacketRouter      | ✓          | ✓ (multi-node)    | swift test                |
 | 7. GatewayService    | ✓          | ✓ (mock)          | swift test                |
 | 8. Proxy & Port Fwd  | ✓          | ✓ (mock)          | swift test                |
-| 9. TUN Interface     | ✓ (root)   | ✓ (root)          | sudo swift test           |
+| 9. TUN Interface     | ✓ (root)   | ✓ (root+demo)     | sudo swift test + demo    |
 | 10. Two-Machine      | -          | -                 | local + arch-home         |
 | 11. Three-Machine    | -          | -                 | local + arch-home + mac   |
 | 12. TUN Mode         | -          | -                 | Linux with TUN            |
@@ -2575,6 +3438,16 @@ sudo ./build/debug/omertad start --port 18002 --gateway --vpn
 ## Quick Reference: Test Commands
 
 ```bash
+# Phase 1-8: Unit tests (no root)
+swift test
+
+# Phase 9: TUN tests (root required)
+sudo swift test --filter TUNInterfaceTests
+
+# Phase 9: Demos
+swift run DemoSOCKSGateway                    # netstack demo (any platform)
+sudo swift run DemoTUNGateway                 # TUN demo (Linux, root)
+
 # Phase 1-9: Unit tests
 swift test --filter TunnelSessionTests
 swift test --filter TunnelManagerTests
