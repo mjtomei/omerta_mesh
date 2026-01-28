@@ -18,6 +18,13 @@ public actor MeshNetwork: ChannelProvider {
         identity.peerId
     }
 
+    /// Our machine ID (identifies this physical machine)
+    public var machineId: MachineId {
+        get async {
+            await meshNode?.machineId ?? ""
+        }
+    }
+
     /// Configuration
     public let config: MeshConfig
 

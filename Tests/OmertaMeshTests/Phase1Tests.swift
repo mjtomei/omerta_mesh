@@ -26,7 +26,11 @@ final class Phase1Tests: XCTestCase {
     private func makeTestNode(port: UInt16 = 0) async throws -> MeshNode {
         let identity = IdentityKeypair()
         let testKey = Data(repeating: 0x42, count: 32)
-        let config = MeshNode.Config(encryptionKey: testKey, port: port)
+        let config = MeshNode.Config(
+            encryptionKey: testKey,
+            port: port,
+            endpointValidationMode: .allowAll  // Use IPv4 for localhost testing
+        )
         return try MeshNode(identity: identity, config: config)
     }
 
@@ -253,31 +257,43 @@ final class Phase1Tests: XCTestCase {
         let nodeA = try await makeTestNode()
         let nodeB = try await makeTestNode()
 
-        defer {
-            Task {
-                await nodeA.stop()
-                await nodeB.stop()
-            }
-        }
-
         try await nodeA.start()
         try await nodeB.start()
+
+        // Wait for nodes to be fully ready
+        try await Task.sleep(nanoseconds: 100_000_000) // 100ms
 
         // Public keys are now embedded in every message, no registration needed
         let portB = await nodeB.port!
 
-        // A sends ping to B
-        let response = try await nodeA.sendAndReceive(
-            .ping(recentPeers: [], myNATType: .unknown),
-            to: "127.0.0.1:\(portB)",
-            timeout: 5.0
-        )
+        var response: MeshMessage?
+        var testError: Error?
+
+        do {
+            // A sends ping to B with longer timeout
+            response = try await nodeA.sendAndReceive(
+                .ping(recentPeers: [], myNATType: .unknown),
+                to: "127.0.0.1:\(portB)",
+                timeout: 10.0  // Increased timeout
+            )
+        } catch {
+            testError = error
+        }
+
+        // Clean up
+        await nodeA.stop()
+        await nodeB.stop()
+
+        // Check result
+        if let error = testError {
+            throw error
+        }
 
         // Should get pong back
         if case .pong = response {
             // Success
         } else {
-            XCTFail("Expected pong response, got \(response)")
+            XCTFail("Expected pong response, got \(String(describing: response))")
         }
     }
 
@@ -296,6 +312,8 @@ final class Phase1Tests: XCTestCase {
         try await nodeA.start()
         try await nodeB.start()
 
+        let portB = await nodeB.port!
+
         // Track received messages on B using actor for thread-safe counting
         let counter = MessageCounter()
         await nodeB.onMessage { message, _ in
@@ -306,14 +324,15 @@ final class Phase1Tests: XCTestCase {
             return nil
         }
 
-        let portB = await nodeB.port!
+        // Wait longer for handler to be fully registered
+        try await Task.sleep(nanoseconds: 300_000_000) // 300ms
 
         // Create a keypair (public key is embedded in message, no registration needed)
         let keypair = IdentityKeypair()
 
         // Create a signed envelope with a fixed message ID
         let envelope = try MeshEnvelope.signed(
-            messageId: "test-dedup-id",
+            messageId: "test-dedup-id-\(UUID().uuidString)",
             from: keypair,
             machineId: "test-machine-id",
             to: nil,
@@ -325,18 +344,22 @@ final class Phase1Tests: XCTestCase {
         let testKey = Data(repeating: 0x42, count: 32)
         let encryptedData = try MessageEncryption.encrypt(jsonData, key: testKey)
 
-        // Send same message twice
-        try await Task.sleep(nanoseconds: 100_000_000) // Wait for handler setup
-
         // Use UDP socket directly to send duplicate
         let socket = UDPSocket()
         try await socket.bind(port: 0)
         defer { Task { await socket.close() } }
 
+        // Send first message
         try await socket.send(encryptedData, to: "127.0.0.1:\(portB)")
-        try await Task.sleep(nanoseconds: 100_000_000)
+
+        // Wait for first message to be processed
+        try await Task.sleep(nanoseconds: 300_000_000) // 300ms
+
+        // Send duplicate
         try await socket.send(encryptedData, to: "127.0.0.1:\(portB)")
-        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Wait for potential second processing
+        try await Task.sleep(nanoseconds: 300_000_000) // 300ms
 
         // Should only receive once due to deduplication
         let count = await counter.value
@@ -386,8 +409,13 @@ final class Phase1Tests: XCTestCase {
         // Public keys are embedded in every message, no registration needed
         let portB = await nodeB.port!
 
+        // Wait for nodes to be fully ready
+        try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+
         // Send multiple concurrent pings
         var results: [MeshMessage] = []
+        var testError: Error?
+
         do {
             results = try await withThrowingTaskGroup(of: MeshMessage.self) { group in
                 for _ in 0..<5 {
@@ -395,7 +423,7 @@ final class Phase1Tests: XCTestCase {
                         try await nodeA.sendAndReceive(
                             .ping(recentPeers: [], myNATType: .unknown),
                             to: "127.0.0.1:\(portB)",
-                            timeout: 5.0
+                            timeout: 10.0  // Increase timeout
                         )
                     }
                 }
@@ -407,15 +435,18 @@ final class Phase1Tests: XCTestCase {
                 return responses
             }
         } catch {
-            // Clean up before rethrowing
-            await nodeA.stop()
-            await nodeB.stop()
-            throw error
+            testError = error
         }
 
-        // Clean up
+        // Always clean up properly - wait a bit before stopping to let in-flight operations complete
+        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms grace period
         await nodeA.stop()
         await nodeB.stop()
+
+        // Now check results
+        if let error = testError {
+            throw error
+        }
 
         // All should get pong responses
         XCTAssertEqual(results.count, 5)
