@@ -430,6 +430,78 @@ final class MultiEndpointTests: XCTestCase {
         XCTAssertEqual(endpointsC, ["3.3.3.3:5000"])
     }
 
+    // MARK: - Network Isolation Tests
+
+    func testEndpointManagerNetworkIsolation() async throws {
+        // Test that endpoints stored for one network don't appear in another network
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let storagePathA = tempDir.appendingPathComponent("network_a_endpoints.json")
+        let storagePathB = tempDir.appendingPathComponent("network_b_endpoints.json")
+
+        // Create two managers for different networks
+        let managerA = PeerEndpointManager(networkId: "network-a", validationMode: .strict, storagePath: storagePathA)
+        let managerB = PeerEndpointManager(networkId: "network-b", validationMode: .strict, storagePath: storagePathB)
+
+        // Record endpoints in network A
+        await managerA.recordMessageReceived(from: "peer1", machineId: "machineX", endpoint: "1.1.1.1:5000")
+        await managerA.recordMessageReceived(from: "peer1", machineId: "machineY", endpoint: "2.2.2.2:5000")
+        await managerA.recordMessageReceived(from: "peer2", machineId: "machineZ", endpoint: "3.3.3.3:5000")
+        try await managerA.save()
+
+        // Record only one machine for peer1 in network B
+        await managerB.recordMessageReceived(from: "peer1", machineId: "machineX", endpoint: "1.1.1.1:5000")
+        try await managerB.save()
+
+        // Verify network A has all machines
+        let endpointsA_peer1 = await managerA.getAllEndpoints(peerId: "peer1")
+        let endpointsA_peer2 = await managerA.getAllEndpoints(peerId: "peer2")
+        XCTAssertEqual(endpointsA_peer1.count, 2, "Network A should have 2 endpoints for peer1")
+        XCTAssertEqual(endpointsA_peer2.count, 1, "Network A should have 1 endpoint for peer2")
+
+        // Verify network B only has machineX for peer1
+        let endpointsB_peer1 = await managerB.getAllEndpoints(peerId: "peer1")
+        let endpointsB_peer2 = await managerB.getAllEndpoints(peerId: "peer2")
+        XCTAssertEqual(endpointsB_peer1.count, 1, "Network B should have 1 endpoint for peer1")
+        XCTAssertEqual(endpointsB_peer1.first, "1.1.1.1:5000", "Network B should only have machineX")
+        XCTAssertEqual(endpointsB_peer2.count, 0, "Network B should have no endpoints for peer2")
+
+        // Reload and verify isolation persists
+        let managerA2 = PeerEndpointManager(networkId: "network-a", validationMode: .strict, storagePath: storagePathA)
+        let managerB2 = PeerEndpointManager(networkId: "network-b", validationMode: .strict, storagePath: storagePathB)
+        try await managerA2.load()
+        try await managerB2.load()
+
+        let reloadedA = await managerA2.getAllEndpoints(peerId: "peer1")
+        let reloadedB = await managerB2.getAllEndpoints(peerId: "peer1")
+        XCTAssertEqual(reloadedA.count, 2, "Network A should still have 2 endpoints after reload")
+        XCTAssertEqual(reloadedB.count, 1, "Network B should still have 1 endpoint after reload")
+    }
+
+    func testEndpointManagerRejectsWrongNetworkData() async throws {
+        // Test that loading data from a different network is rejected
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let storagePath = tempDir.appendingPathComponent("endpoints.json")
+
+        // Create manager for network A and save some data
+        let managerA = PeerEndpointManager(networkId: "network-a", validationMode: .strict, storagePath: storagePath)
+        await managerA.recordMessageReceived(from: "peer1", machineId: "machine1", endpoint: "1.1.1.1:5000")
+        try await managerA.save()
+
+        // Try to load the same file with a different networkId
+        let managerB = PeerEndpointManager(networkId: "network-b", validationMode: .strict, storagePath: storagePath)
+        try await managerB.load()
+
+        // Manager B should have empty data because networkId doesn't match
+        let endpoints = await managerB.getAllEndpoints(peerId: "peer1")
+        XCTAssertEqual(endpoints.count, 0, "Manager with different networkId should not load data from another network")
+    }
+
     // MARK: - Helper Methods
 
     private func makeTestNode(port: UInt16 = 0) async throws -> MeshNode {
