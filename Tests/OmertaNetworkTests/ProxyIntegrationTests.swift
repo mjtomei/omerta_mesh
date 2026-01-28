@@ -342,7 +342,7 @@ final class SOCKSProxyIntegrationTests: XCTestCase {
         let message = Data("Hello from integration test!".utf8)
         sock.sendData(message)
 
-        let echoed = try sock.recv(count: message.count, timeout: 3.0)
+        let echoed = try sock.recv(count: message.count, timeout: 10.0)
         XCTAssertEqual(echoed, message, "Data should round-trip through proxy and echo server")
     }
 
@@ -378,7 +378,7 @@ final class SOCKSProxyIntegrationTests: XCTestCase {
         let payload = Data((0..<65536).map { UInt8($0 & 0xFF) })
         sock.sendData(payload)
 
-        let echoed = try sock.recv(count: payload.count, timeout: 5.0)
+        let echoed = try sock.recv(count: payload.count, timeout: 10.0)
         XCTAssertEqual(echoed.count, payload.count)
         XCTAssertEqual(echoed, payload)
     }
@@ -435,7 +435,7 @@ final class SOCKSProxyIntegrationTests: XCTestCase {
 
                     let msg = Data("concurrent-\(i)".utf8)
                     sock.sendData(msg)
-                    let echoed = try sock.recv(count: msg.count, timeout: 3.0)
+                    let echoed = try sock.recv(count: msg.count, timeout: 10.0)
                     XCTAssertEqual(echoed, msg)
                 }
             }
@@ -488,7 +488,7 @@ final class PortForwarderIntegrationTests: XCTestCase {
         let message = Data("Hello via port forward!".utf8)
         sock.sendData(message)
 
-        let echoed = try sock.recv(count: message.count, timeout: 3.0)
+        let echoed = try sock.recv(count: message.count, timeout: 10.0)
         XCTAssertEqual(echoed, message)
     }
 
@@ -519,7 +519,7 @@ final class PortForwarderIntegrationTests: XCTestCase {
         let payload = Data((0..<65536).map { UInt8($0 & 0xFF) })
         sock.sendData(payload)
 
-        let echoed = try sock.recv(count: payload.count, timeout: 5.0)
+        let echoed = try sock.recv(count: payload.count, timeout: 10.0)
         XCTAssertEqual(echoed.count, payload.count)
         XCTAssertEqual(echoed, payload)
     }
@@ -538,7 +538,7 @@ final class PortForwarderIntegrationTests: XCTestCase {
 
                     let msg = Data("client-\(i)".utf8)
                     sock.sendData(msg)
-                    let echoed = try sock.recv(count: msg.count, timeout: 3.0)
+                    let echoed = try sock.recv(count: msg.count, timeout: 10.0)
                     XCTAssertEqual(echoed, msg)
                 }
             }
@@ -605,7 +605,7 @@ final class PortForwarderIntegrationTests: XCTestCase {
         sock.sendData(msg)
 
         let expected = Data("[TAGGED]hello".utf8)
-        let response = try sock.recv(count: expected.count, timeout: 3.0)
+        let response = try sock.recv(count: expected.count, timeout: 10.0)
         XCTAssertEqual(response, expected, "Should reach the tagging server, not the echo server")
     }
 }

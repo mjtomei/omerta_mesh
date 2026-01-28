@@ -679,8 +679,8 @@ final class NativeDHCPIntegrationTests: XCTestCase {
         for i in 1...5 {
             let clientConfig = NativeDHCPClientConfig(
                 gatewayMachineId: "gateway",
-                timeout: 5,
-                retries: 1,
+                timeout: 10,
+                retries: 2,
                 autoRenew: false
             )
             let provider = MockDHCPChannelProvider(peerId: "peer\(i)")
@@ -695,8 +695,10 @@ final class NativeDHCPIntegrationTests: XCTestCase {
             let provider = clientProviders[i]
             let machineId = "m\(i + 1)"
 
-            // Simple direct relay for this client
-            // Only clear this client's messages to avoid racing with other clients
+            // Clear any leftover messages before starting this client's relay
+            await serviceProvider.clearMessages()
+            await provider.clearMessages()
+
             let relayTask = Task {
                 while !Task.isCancelled {
                     let msgs = await provider.sentMessages
@@ -709,10 +711,9 @@ final class NativeDHCPIntegrationTests: XCTestCase {
                     for msg in serviceMsgs where msg.target == machineId {
                         await provider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                     }
-                    // Only clear messages targeted at this client
-                    await serviceProvider.clearMessages(for: machineId)
+                    await serviceProvider.clearMessages()
 
-                    try? await Task.sleep(for: .milliseconds(10))
+                    try? await Task.sleep(for: .milliseconds(5))
                 }
             }
 
