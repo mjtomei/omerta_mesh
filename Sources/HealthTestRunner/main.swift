@@ -200,6 +200,46 @@ struct NetworkSnapshot: Equatable {
     }
 }
 
+// MARK: - Pre-flight Cleanup (clear stale rules from failed runs)
+
+logger.info("Pre-flight cleanup: clearing stale firewall rules...")
+#if os(Linux)
+// Remove any leftover iptables rules referencing our port
+let (_, existingRules) = await shell("iptables-save 2>/dev/null | grep '\\-\\-dport \(port)' | grep -v '^#' || true")
+for rule in existingRules.split(separator: "\n") {
+    let ruleTrimmed = String(rule).trimmingCharacters(in: .whitespaces)
+    if !ruleTrimmed.isEmpty {
+        // Convert -A to -D for deletion
+        let deleteRule = ruleTrimmed.replacingOccurrences(of: "-A ", with: "-D ")
+        logger.info("  Removing stale rule: \(deleteRule)")
+        let _ = await shell("iptables \(deleteRule)")
+    }
+}
+// Remove any leftover temp IPs on 192.168.12.0/24
+let (_, existingTempIPs) = await shell("ip -4 addr show | grep 'inet 192.168.12' | grep -v '\(remoteHost)' | awk '{print $2, $NF}' || true")
+for line in existingTempIPs.split(separator: "\n") {
+    let parts = String(line).trimmingCharacters(in: .whitespaces).split(separator: " ")
+    if parts.count == 2 {
+        let addr = String(parts[0])
+        let iface = String(parts[1])
+        // Don't remove the machine's own primary address
+        let (_, primaryIP) = await shell("hostname -I | awk '{print $1}'")
+        if !addr.hasPrefix(primaryIP.trimmingCharacters(in: .whitespaces)) {
+            logger.info("  Removing stale IP: \(addr) dev \(iface)")
+            let _ = await shell("ip addr del \(addr) dev \(iface)")
+        }
+    }
+}
+#else
+// macOS: disable pfctl if it has rules mentioning our port
+let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
+if pfRules.contains("port = \(port)") || pfRules.contains("port \(port)") {
+    logger.info("  Disabling stale pfctl rules")
+    let _ = await shell("pfctl -d 2>/dev/null")
+}
+#endif
+logger.info("Pre-flight cleanup done.")
+
 // MARK: - Mesh Setup
 
 let keyString = "health-test-shared-key-2026-0128"
