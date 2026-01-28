@@ -4,7 +4,7 @@
 // Run: cd Sources/OmertaTunnel/Netstack && make
 
 import XCTest
-@testable import OmertaTunnel
+@testable import OmertaNetwork
 
 final class NetstackBridgeTests: XCTestCase {
 

@@ -34,16 +34,12 @@ let package = Package(
         .systemLibrary(name: "CNetstack", path: "Sources/CNetstack"),
         .target(
             name: "OmertaTunnel",
-            dependencies: ["OmertaMesh", "CNetstack", .product(name: "Logging", package: "swift-log")],
-            exclude: ["Netstack"],
-            linkerSettings: [
-                .linkedLibrary("netstack", .when(platforms: [.macOS, .linux])),
-                .unsafeFlags(["-L\(packageDir)/Sources/CNetstack"], .when(platforms: [.macOS, .linux])),
-            ]
+            dependencies: ["OmertaMesh", .product(name: "Logging", package: "swift-log")],
+            exclude: ["Netstack"]
         ),
         .target(
             name: "OmertaSSH",
-            dependencies: ["OmertaTunnel", .product(name: "Logging", package: "swift-log")]
+            dependencies: ["OmertaTunnel", "OmertaNetwork", .product(name: "Logging", package: "swift-log")]
         ),
         .executableTarget(
             name: "OmertaMeshCLI",
@@ -72,9 +68,13 @@ let package = Package(
         ]),
         .target(
             name: "OmertaNetwork",
-            dependencies: ["OmertaMesh", "OmertaTunnel"]
+            dependencies: ["OmertaMesh", "OmertaTunnel", "CNetstack", .product(name: "Logging", package: "swift-log")],
+            linkerSettings: [
+                .linkedLibrary("netstack", .when(platforms: [.macOS, .linux])),
+                .unsafeFlags(["-L\(packageDir)/Sources/CNetstack"], .when(platforms: [.macOS, .linux])),
+            ]
         ),
-        .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaMesh"]),
+        .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaNetwork", "OmertaMesh"]),
         .testTarget(name: "OmertaNetworkTests", dependencies: ["OmertaNetwork", "OmertaMesh"]),
     ]
 )
