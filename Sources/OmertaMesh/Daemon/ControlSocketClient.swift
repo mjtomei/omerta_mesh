@@ -184,9 +184,11 @@ public actor ControlSocketClient {
             totalReceived += received
         }
 
-        let length = Data(lengthBuffer).withUnsafeBytes { ptr in
-            ptr.load(as: UInt32.self).bigEndian
-        }
+        // Construct UInt32 from bytes manually to avoid alignment issues on Linux
+        let length = UInt32(lengthBuffer[0]) << 24 |
+                     UInt32(lengthBuffer[1]) << 16 |
+                     UInt32(lengthBuffer[2]) << 8 |
+                     UInt32(lengthBuffer[3])
 
         guard length <= IPCMessage.maxMessageSize else {
             disconnect()
