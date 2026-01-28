@@ -258,10 +258,11 @@ final class DaemonProtocolTests: XCTestCase {
         let encoded = try IPCMessage.encode(message)
 
         // First 4 bytes should be the length in big-endian
-        let lengthBytes = encoded.prefix(4)
-        let length = lengthBytes.withUnsafeBytes { ptr in
-            UInt32(bigEndian: ptr.load(as: UInt32.self))
-        }
+        // Construct UInt32 from bytes manually to avoid alignment issues on Linux
+        let length = UInt32(encoded[0]) << 24 |
+                     UInt32(encoded[1]) << 16 |
+                     UInt32(encoded[2]) << 8 |
+                     UInt32(encoded[3])
 
         // The remaining data should be the JSON payload
         XCTAssertEqual(Int(length), encoded.count - 4)
