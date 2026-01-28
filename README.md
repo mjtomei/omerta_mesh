@@ -85,6 +85,35 @@ Working documents for development are in [plans/](plans/):
 - Migration guides
 - Code structure
 
+## Development Status
+
+See [plans/notes.txt](../plans/notes.txt) for the latest human-managed TODO list.
+
+### Accomplished
+
+- [x] End-to-end encrypted messaging using ChaCha20-Poly1305
+- [x] X25519 key exchange and Ed25519 signatures
+- [x] NAT traversal with automatic type detection
+- [x] Relay support for peers behind symmetric NAT
+- [x] Gossip-based peer discovery
+- [x] TCP/UDP tunneling via gVisor netstack
+- [x] Cross-platform support (macOS 13+, Linux)
+- [x] Separated into standalone library with clean API
+
+### TODO
+
+- [ ] Fix IPv6 NAT detection and add contact request message for NAT hole punching
+- [ ] Test relay functionality with artificial constraints on peer nodes
+- [ ] Handle diverse cases where inbound traffic isn't allowed (IPv4 and IPv6)
+- [ ] Add reasonable rate limiting to UDP socket wrapper
+- [ ] Implement mosh-clone SSH client for use with mesh tunnel
+- [ ] Implement VPN functionality using Tunnel utility for internet connections
+- [ ] Multi-radio support and connection prioritization
+- [ ] Traffic shaping and bandwidth splitting
+- [ ] Padding to reduce traffic analysis data leakage
+- [ ] Kernel/DPU/FPGA accelerated mesh nodes
+- [ ] WireGuard connection migration
+
 ## Third-Party Dependencies
 
 OmertaMesh uses the following notable third-party libraries:
