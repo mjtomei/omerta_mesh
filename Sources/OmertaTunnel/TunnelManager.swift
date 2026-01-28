@@ -96,7 +96,7 @@ public actor TunnelManager {
             await self?.handleHandshake(from: machineId, data: data)
         }
 
-        // Register health probe handler — respond to probes and notify monitor
+        // Register health probe handler — receiving a probe means remote is alive
         try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
             await self?.notifyPacketReceived(from: machineId)
         }

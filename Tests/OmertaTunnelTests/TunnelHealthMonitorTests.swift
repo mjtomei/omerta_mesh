@@ -36,7 +36,11 @@ final class TunnelHealthMonitorTests: XCTestCase {
         var probeCount = 0
         await monitor.startMonitoring(
             machineId: "test-machine",
-            sendProbe: { _ in probeCount += 1 },
+            sendProbe: { _ in
+                probeCount += 1
+                // Simulate remote responding: call onPacketReceived after each probe
+                await monitor.onPacketReceived()
+            },
             onFailure: { _ in }
         )
 
@@ -79,6 +83,8 @@ final class TunnelHealthMonitorTests: XCTestCase {
     }
 
     func testSingleFailureNoCallback() async throws {
+        // One missed probe cycle should not trigger failure (threshold=3).
+        // After one idle cycle with no response, simulate remote coming back.
         let monitor = TunnelHealthMonitor(
             minProbeInterval: .milliseconds(50),
             maxProbeInterval: .seconds(1),
@@ -92,10 +98,10 @@ final class TunnelHealthMonitorTests: XCTestCase {
             machineId: "test-machine",
             sendProbe: { _ in
                 probeCount += 1
-                if probeCount == 1 {
-                    throw NSError(domain: "test", code: 1)
+                if probeCount >= 2 {
+                    // Remote responds after first missed probe
+                    await monitor.onPacketReceived()
                 }
-                // Subsequent probes succeed
             },
             onFailure: { _ in failureCalled = true }
         )
@@ -107,6 +113,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
     }
 
     func testConsecutiveFailuresCallback() async throws {
+        // No onPacketReceived ever called — remote is dead
         let monitor = TunnelHealthMonitor(
             minProbeInterval: .milliseconds(50),
             maxProbeInterval: .seconds(1),
@@ -119,7 +126,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
         await monitor.startMonitoring(
             machineId: "test-machine",
             sendProbe: { _ in
-                throw NSError(domain: "test", code: 1)
+                // Probe sends but remote never responds (no onPacketReceived)
             },
             onFailure: { machineId in
                 failureCalled = true
@@ -136,6 +143,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
     }
 
     func testFailureResetOnSuccess() async throws {
+        // Miss 2 probes, then remote responds every other probe — never reaches 3 consecutive
         let monitor = TunnelHealthMonitor(
             minProbeInterval: .milliseconds(50),
             maxProbeInterval: .seconds(1),
@@ -149,19 +157,126 @@ final class TunnelHealthMonitorTests: XCTestCase {
             machineId: "test-machine",
             sendProbe: { _ in
                 probeCount += 1
-                // Fail first 2, then succeed, then fail 2 more
-                if probeCount <= 2 || (probeCount >= 4 && probeCount <= 5) {
-                    throw NSError(domain: "test", code: 1)
+                // Respond on every 3rd probe (after 2 misses), resetting the counter each time
+                if probeCount % 3 == 0 {
+                    await monitor.onPacketReceived()
                 }
             },
             onFailure: { _ in failureCalled = true }
         )
 
-        // Enough time for ~6 probes
         try await Task.sleep(for: .milliseconds(600))
         await monitor.stopMonitoring()
 
-        // Failures: 2, then success resets, then 2 more — never reaches 3 consecutive
+        // Pattern: miss, miss, respond, miss, miss, respond — never 3 consecutive
         XCTAssertFalse(failureCalled, "Success between failures should reset counter")
+    }
+
+    func testFailureDetectedWhenSendSucceedsButNoIncoming() async throws {
+        // Probe sends succeed (UDP doesn't error) but remote never sends anything back.
+        // This is the key scenario: one-way packet loss or remote is down.
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            failureThreshold: 3
+        )
+
+        var failureCalled = false
+        var probeCount = 0
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in
+                probeCount += 1
+                // Send succeeds — but no onPacketReceived ever called
+            },
+            onFailure: { _ in failureCalled = true }
+        )
+
+        try await Task.sleep(for: .milliseconds(500))
+        await monitor.stopMonitoring()
+
+        XCTAssertTrue(failureCalled, "Should detect failure when sends succeed but no packets received")
+        XCTAssertGreaterThanOrEqual(probeCount, 3, "Should have sent at least 3 probes")
+    }
+
+    func testIncomingTrafficWithoutProbingPreventsFailure() async throws {
+        // Remote sends us packets (probes/data) so onPacketReceived fires,
+        // even though we never explicitly probe. Should stay healthy.
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            failureThreshold: 3
+        )
+
+        var failureCalled = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in },
+            onFailure: { _ in failureCalled = true }
+        )
+
+        // Simulate remote sending us packets every 30ms (faster than probe interval)
+        for _ in 0..<15 {
+            try await Task.sleep(for: .milliseconds(30))
+            await monitor.onPacketReceived()
+        }
+
+        await monitor.stopMonitoring()
+
+        XCTAssertFalse(failureCalled, "Regular incoming traffic should prevent failure")
+        let failures = await monitor._consecutiveFailures
+        XCTAssertEqual(failures, 0)
+    }
+
+    func testThresholdOfOne() async throws {
+        // With threshold=1, a single missed interval should trigger failure
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            failureThreshold: 1
+        )
+
+        var failureCalled = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in },
+            onFailure: { _ in failureCalled = true }
+        )
+
+        try await Task.sleep(for: .milliseconds(200))
+        await monitor.stopMonitoring()
+
+        XCTAssertTrue(failureCalled, "Threshold of 1 should trigger on first missed interval")
+    }
+
+    func testPacketDuringProbeSendRescuesFailure() async throws {
+        // Probe fires because we're idle, but during the send a packet arrives
+        // (e.g., the remote's own probe reaches us). Should not count as failure.
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            failureThreshold: 3
+        )
+
+        var failureCalled = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in
+                // Every probe send is accompanied by an incoming packet
+                await monitor.onPacketReceived()
+            },
+            onFailure: { _ in failureCalled = true }
+        )
+
+        try await Task.sleep(for: .milliseconds(500))
+        await monitor.stopMonitoring()
+
+        XCTAssertFalse(failureCalled, "Packet arriving during probe send should prevent failure")
+        let failures = await monitor._consecutiveFailures
+        XCTAssertEqual(failures, 0, "No failures should accumulate when packets arrive with probes")
     }
 }

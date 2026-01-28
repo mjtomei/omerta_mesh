@@ -3,6 +3,12 @@
 // Per-machine health monitor (not per-session). Multiple sessions to the same
 // machine share health state. Probes only when idle, backs off on success,
 // and calls onFailure after consecutive probe failures exceed threshold.
+//
+// Liveness is determined by whether we've received any packet (probes, data,
+// etc.) from the remote machine recently. Both sides run monitors and send
+// probes, so a healthy remote will always be sending us packets. If we
+// haven't heard anything after sending a probe and waiting an interval,
+// that's a failure.
 
 import Foundation
 import OmertaMesh
@@ -73,23 +79,28 @@ public actor TunnelHealthMonitor {
 
             let elapsed = ContinuousClock.now - lastPacketTime
             if elapsed < interval {
-                // Traffic received recently — no probe needed, back off
+                // Traffic received recently — remote is alive, back off
+                consecutiveFailures = 0
                 currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
                 continue
             }
 
-            // Idle — send probe
-            do {
-                try await sendProbe(machineId)
-                // Probe succeeded
+            // Haven't heard from remote — send probe so it knows we're here
+            let timeBeforeProbe = lastPacketTime
+            try? await sendProbe(machineId)
+
+            // If a packet arrived during or right after the probe send, remote is alive
+            if lastPacketTime > timeBeforeProbe {
                 consecutiveFailures = 0
                 currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
-            } catch {
-                consecutiveFailures += 1
-                if consecutiveFailures >= failureThreshold {
-                    await onFailure(machineId)
-                    break
-                }
+                continue
+            }
+
+            // Still no incoming traffic — count as failure
+            consecutiveFailures += 1
+            if consecutiveFailures >= failureThreshold {
+                await onFailure(machineId)
+                break
             }
         }
     }
