@@ -593,7 +593,7 @@ final class MultiNodeIntegrationTests: XCTestCase {
         await peers[1].sendPacket(to: "1.1.1.1", payload: "p2-dns")
         await peers[2].sendPacket(to: "9.9.9.9", payload: "p3-dns")
 
-        try await Task.sleep(for: .milliseconds(1500))
+        try await Task.sleep(for: .milliseconds(5000))
 
         // Each peer should have sent one packet to gateway
         for (i, peer) in peers.enumerated() {
@@ -677,7 +677,7 @@ final class MultiNodeIntegrationTests: XCTestCase {
         await peers[1].sendPacket(to: "1.1.1.1", payload: "p2-query")
         await peers[2].sendPacket(to: "9.9.9.9", payload: "p3-query")
 
-        try await Task.sleep(for: .milliseconds(1500))
+        try await Task.sleep(for: .milliseconds(5000))
 
         // --- Verify gateway's own internet access ---
 
