@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Disable sandbox for CLI tools -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!-- Network client access -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Network server access (for UDP control server) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- Virtualization framework access (for running VMs) -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
