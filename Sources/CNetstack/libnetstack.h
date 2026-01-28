@@ -116,7 +116,7 @@ extern void NetstackStop(uint64_t handle);
 
 // NetstackInjectPacket injects a raw IP packet into the stack.
 // Returns 0 on success, -1 on error.
-extern int NetstackInjectPacket(uint64_t handle, uint8_t* data, size_t len);
+extern int NetstackInjectPacket(uint64_t handle, const uint8_t* data, size_t len);
 
 // NetstackGetStats returns statistics about the stack.
 // Writes to the provided pointers.
@@ -132,7 +132,7 @@ extern int NetstackConnRead(uint64_t connHandle, uint8_t* buf, size_t maxLen);
 
 // NetstackConnWrite writes data to a TCP connection.
 // Returns number of bytes written, -1 on error.
-extern int NetstackConnWrite(uint64_t connHandle, uint8_t* buf, size_t len);
+extern int NetstackConnWrite(uint64_t connHandle, const uint8_t* buf, size_t len);
 
 // NetstackConnClose closes a TCP connection.
 extern void NetstackConnClose(uint64_t connHandle);

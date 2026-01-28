@@ -86,6 +86,15 @@ public actor DataSocketServer {
             serverChannel = channel
             state = .running
 
+            // Set socket permissions: owner + omerta group (0o660), fallback to owner-only (0o600)
+            var attrs: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
+            if let group = getgrnam("omerta") {
+                let groupId = group.pointee.gr_gid
+                attrs[.groupOwnerAccountID] = NSNumber(value: groupId)
+                attrs[.posixPermissions] = 0o660
+            }
+            try? FileManager.default.setAttributes(attrs, ofItemAtPath: socketPath)
+
             logger.info("Data socket server started", metadata: ["path": "\(socketPath)"])
 
         } catch {
@@ -341,10 +350,14 @@ private final class TunnelPacketDecoder: ByteToMessageDecoder {
                 return .needMoreData
             }
 
-            let uuid = uuidBytes.withUnsafeBufferPointer { ptr -> UUID in
-                ptr.baseAddress!.withMemoryRebound(to: uuid_t.self, capacity: 1) { uuidPtr in
+            let uuid = uuidBytes.withUnsafeBufferPointer { ptr -> UUID? in
+                guard let base = ptr.baseAddress else { return nil }
+                return base.withMemoryRebound(to: uuid_t.self, capacity: 1) { uuidPtr in
                     UUID(uuid: uuidPtr.pointee)
                 }
+            }
+            guard let uuid else {
+                throw IPCError.invalidMessage("Invalid tunnel UUID in frame header")
             }
 
             // Read length (2 bytes, big-endian)
