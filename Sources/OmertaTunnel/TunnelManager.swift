@@ -38,8 +38,17 @@ public actor TunnelManager {
     /// Session pool keyed by (machineId, channel)
     private var sessions: [TunnelSessionKey: TunnelSession] = [:]
 
+    /// Per-machine health monitors
+    private var healthMonitors: [MachineId: TunnelHealthMonitor] = [:]
+
+    /// Network endpoint change detector
+    private let endpointChangeDetector = EndpointChangeDetector()
+
     /// Whether the manager is running
     private var isRunning: Bool = false
+
+    /// Task consuming endpoint change events
+    private var endpointChangeTask: Task<Void, Never>?
 
     /// Callback when remote machine initiates a session
     private var sessionRequestHandler: ((MachineId) async -> Bool)?
@@ -49,6 +58,9 @@ public actor TunnelManager {
 
     /// Channel for session handshake
     private let handshakeChannel = "tunnel-handshake"
+
+    /// Channel for health probes (separate from handshake to avoid creating sessions)
+    private let healthProbeChannel = "tunnel-health-probe"
 
     /// Number of active sessions in the pool
     public var sessionCount: Int {
@@ -79,7 +91,23 @@ public actor TunnelManager {
             await self?.handleHandshake(from: machineId, data: data)
         }
 
+        // Register health probe handler — respond to probes and notify monitor
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
+            await self?.notifyPacketReceived(from: machineId)
+        }
+
         isRunning = true
+
+        // Start endpoint change detection
+        await endpointChangeDetector.start()
+        endpointChangeTask = Task { [weak self] in
+            guard let self else { return }
+            let changes = await self.endpointChangeDetector.changes
+            for await _ in changes {
+                await self.reprobeAllMachines()
+            }
+        }
+
         logger.info("Tunnel manager started")
     }
 
@@ -87,7 +115,17 @@ public actor TunnelManager {
     public func stop() async {
         guard isRunning else { return }
 
+        endpointChangeTask?.cancel()
+        endpointChangeTask = nil
+        await endpointChangeDetector.stop()
+
+        for (_, monitor) in healthMonitors {
+            await monitor.stopMonitoring()
+        }
+        healthMonitors.removeAll()
+
         await provider.offChannel(handshakeChannel)
+        await provider.offChannel(healthProbeChannel)
 
         for (_, session) in sessions {
             await session.close()
@@ -153,6 +191,27 @@ public actor TunnelManager {
         await newSession.activate()
         sessions[key] = newSession
 
+        // Start health monitor for this machine if first session
+        if healthMonitors[machineId] == nil {
+            let monitor = TunnelHealthMonitor(
+                minProbeInterval: config.healthProbeMinInterval,
+                maxProbeInterval: config.healthProbeMaxInterval,
+                failureThreshold: config.healthFailureThreshold
+            )
+            healthMonitors[machineId] = monitor
+            await monitor.startMonitoring(
+                machineId: machineId,
+                sendProbe: { [weak self] id in
+                    guard let self else { return }
+                    try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                },
+                onFailure: { [weak self] id in
+                    guard let self else { return }
+                    await self.handleHealthFailure(machineId: id)
+                }
+            )
+        }
+
         logger.info("Session created", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
         return newSession
     }
@@ -188,6 +247,10 @@ public actor TunnelManager {
         for key in keysToClose {
             await closeSession(key: key)
         }
+
+        if let monitor = healthMonitors.removeValue(forKey: machineId) {
+            await monitor.stopMonitoring()
+        }
     }
 
     /// Close the default "data" channel session (backward compatibility)
@@ -200,6 +263,24 @@ public actor TunnelManager {
     }
 
     // MARK: - Private
+
+    /// Notify health monitor that a packet was received from a machine
+    public func notifyPacketReceived(from machineId: MachineId) async {
+        if let monitor = healthMonitors[machineId] {
+            await monitor.onPacketReceived()
+        }
+    }
+
+    private func handleHealthFailure(machineId: MachineId) async {
+        logger.warning("Health check failed for machine", metadata: ["machine": "\(machineId)"])
+        await closeAllSessions(to: machineId)
+    }
+
+    private func reprobeAllMachines() async {
+        for (_, monitor) in healthMonitors {
+            await monitor.onPacketReceived()
+        }
+    }
 
     private func checkSessionLimits(forMachine machineId: MachineId) throws {
         // Check total limit
