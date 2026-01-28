@@ -561,7 +561,7 @@ final class TunnelSessionTests: XCTestCase {
 
         // Check that channel handler was registered
         let channels = await provider.getRegisteredChannels()
-        XCTAssertTrue(channels.contains("tunnel:data"))
+        XCTAssertTrue(channels.contains("tunnel-data"))
     }
 
     func testSendRequiresActiveState() async throws {
@@ -598,7 +598,7 @@ final class TunnelSessionTests: XCTestCase {
         let messages = await provider.getSentMessages()
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].to, "machine-1")
-        XCTAssertEqual(messages[0].channel, "tunnel:data")
+        XCTAssertEqual(messages[0].channel, "tunnel-data")
         XCTAssertEqual(messages[0].data, Data([1, 2, 3]))
     }
 
@@ -621,7 +621,7 @@ final class TunnelSessionTests: XCTestCase {
 
         // Channel handler should be deregistered
         let channels = await provider.getRegisteredChannels()
-        XCTAssertFalse(channels.contains("tunnel:data"))
+        XCTAssertFalse(channels.contains("tunnel-data"))
     }
 
     func testReceiveCallback() async throws {
@@ -642,7 +642,7 @@ final class TunnelSessionTests: XCTestCase {
         // Simulate incoming message
         await provider.simulateMessage(
             from: "machine-1",
-            on: "tunnel:data",
+            on: "tunnel-data",
             data: Data([1, 2, 3, 4])
         )
 
@@ -667,7 +667,7 @@ final class TunnelSessionTests: XCTestCase {
         // Simulate message from wrong machine - should be ignored
         await provider.simulateMessage(
             from: "wrong-machine",
-            on: "tunnel:data",
+            on: "tunnel-data",
             data: Data([9, 9, 9])
         )
 
@@ -676,7 +676,7 @@ final class TunnelSessionTests: XCTestCase {
         // Simulate message from correct machine
         await provider.simulateMessage(
             from: "machine-1",
-            on: "tunnel:data",
+            on: "tunnel-data",
             data: Data([1, 2, 3])
         )
 
@@ -743,8 +743,8 @@ final class TunnelSessionTests: XCTestCase {
 
         // Different channels should register different handlers
         let channels = await provider.getRegisteredChannels()
-        XCTAssertTrue(channels.contains("tunnel:control"))
-        XCTAssertTrue(channels.contains("tunnel:data"))
+        XCTAssertTrue(channels.contains("tunnel-control"))
+        XCTAssertTrue(channels.contains("tunnel-data"))
 
         // Keys should be different
         let controlKey = await controlSession.key

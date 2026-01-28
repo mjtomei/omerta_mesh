@@ -29,7 +29,7 @@ public actor TunnelSession {
 
     // Wire channel name for mesh transport
     private var wireChannel: String {
-        "tunnel:\(channel)"
+        "tunnel-\(channel)"
     }
 
     /// Session statistics
