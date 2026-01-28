@@ -39,7 +39,7 @@ public final class NetstackTCPConnection: @unchecked Sendable {
     private var handle: UInt64
     private let lock = NSLock()
     private var isClosed = false
-    private let logger = Logger(label: "io.omerta.tunnel.netstack.tcp")
+    private let logger = Logger(label: "io.omerta.network.netstack.tcp")
 
     init(handle: UInt64) {
         self.handle = handle
@@ -136,8 +136,36 @@ public final class NetstackTCPConnection: @unchecked Sendable {
     }
 }
 
+/// Wrapper that adapts `NetstackTCPConnection` to the `TCPConnection` protocol.
+public final class NetstackTCPConnectionWrapper: TCPConnection, @unchecked Sendable {
+    private let conn: NetstackTCPConnection
+    public let remoteHost: String
+    public let remotePort: UInt16
+
+    init(conn: NetstackTCPConnection, host: String, port: UInt16) {
+        self.conn = conn
+        self.remoteHost = host
+        self.remotePort = port
+    }
+
+    public func read() async throws -> Data {
+        guard let data = try conn.read() else {
+            throw NetstackError.notStarted
+        }
+        return data
+    }
+
+    public func write(_ data: Data) async throws {
+        try conn.write(data)
+    }
+
+    public func close() async {
+        conn.close()
+    }
+}
+
 /// Swift wrapper for the Go netstack userspace TCP/IP stack
-public final class NetstackBridge: @unchecked Sendable {
+public final class NetstackBridge: NetstackBridgeProtocol, @unchecked Sendable {
     /// Handle to the Go netstack instance
     private var handle: UInt64 = 0
 
@@ -145,13 +173,13 @@ public final class NetstackBridge: @unchecked Sendable {
     private var isRunning: Bool = false
 
     /// Callback for returned packets
-    private var returnCallback: ((Data) -> Void)?
+    private var returnCallback: (@Sendable (Data) -> Void)?
 
     /// Lock for thread safety
     private let lock = NSLock()
 
     /// Logger
-    private let logger = Logger(label: "io.omerta.tunnel.netstack")
+    private let logger = Logger(label: "io.omerta.network.netstack")
 
     /// Configuration for the netstack
     public struct Config {
@@ -188,7 +216,7 @@ public final class NetstackBridge: @unchecked Sendable {
     }
 
     /// Set the callback for returned packets (responses from internet)
-    public func setReturnCallback(_ callback: @escaping (Data) -> Void) {
+    public func setReturnCallback(_ callback: @escaping @Sendable (Data) -> Void) {
         lock.lock()
         returnCallback = callback
         lock.unlock()
@@ -311,6 +339,15 @@ public final class NetstackBridge: @unchecked Sendable {
         lock.unlock()
 
         callback?(data)
+    }
+
+    // MARK: - NetstackBridgeProtocol conformance
+
+    /// Satisfies the protocol's `dialTCP(host:port:) async throws -> TCPConnection` requirement
+    /// by wrapping the sync `NetstackTCPConnection` in an adapter.
+    public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection {
+        let conn = try dialTCP(host: host, port: port) as NetstackTCPConnection
+        return NetstackTCPConnectionWrapper(conn: conn, host: host, port: port)
     }
 }
 

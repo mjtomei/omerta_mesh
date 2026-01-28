@@ -27,6 +27,7 @@ public actor PacketRouter {
     private let localInterface: any NetworkInterface
     private let virtualNetwork: VirtualNetwork
     private let tunnelManager: TunnelManager
+    private let gatewayService: GatewayService?
     private let logger: Logger
 
     private var outboundTask: Task<Void, Never>?
@@ -50,14 +51,17 @@ public actor PacketRouter {
     ///   - localInterface: The network interface for local packet I/O
     ///   - virtualNetwork: The virtual network for routing decisions
     ///   - tunnelManager: The tunnel manager for peer sessions
+    ///   - gatewayService: If non-nil, this node acts as the gateway and forwards internet-bound packets locally
     public init(
         localInterface: any NetworkInterface,
         virtualNetwork: VirtualNetwork,
-        tunnelManager: TunnelManager
+        tunnelManager: TunnelManager,
+        gatewayService: GatewayService? = nil
     ) {
         self.localInterface = localInterface
         self.virtualNetwork = virtualNetwork
         self.tunnelManager = tunnelManager
+        self.gatewayService = gatewayService
         self.logger = Logger(label: "io.omerta.network.router")
     }
 
@@ -75,6 +79,19 @@ public actor PacketRouter {
         // Register for new tunnel sessions to set up inbound routing
         await tunnelManager.setSessionEstablishedHandler { [weak self] session in
             await self?.setupInboundRouting(for: session)
+        }
+
+        // Wire gateway service return handler to route response packets back to peers
+        if let gatewayService {
+            let localMachineId = await virtualNetwork.getLocalMachineId()
+            await gatewayService.setReturnHandler { [weak self] packet, machineId in
+                guard let self else { return }
+                if machineId == localMachineId {
+                    await self.deliverLocalReturn(packet)
+                } else {
+                    await self.sendToPeer(packet, machineId: machineId, destIP: "gateway-return")
+                }
+            }
         }
 
         isRunning = true
@@ -178,6 +195,20 @@ public actor PacketRouter {
     }
 
     private func sendToGateway(_ packet: Data, destIP: String) async {
+        // If we ARE the gateway, forward locally through our GatewayService
+        if let gatewayService {
+            guard let sourceIP = extractSourceIP(from: packet),
+                  let machineId = await virtualNetwork.lookupMachine(ip: sourceIP) else {
+                logger.trace("Could not resolve source machine for gateway-local forward")
+                stats.packetsDropped += 1
+                return
+            }
+            await gatewayService.forwardToInternet(packet, from: machineId)
+            stats.packetsToGateway += 1
+            logger.trace("Forwarded to local gateway", metadata: ["dest": "\(destIP)"])
+            return
+        }
+
         guard let gatewayMachineId = await virtualNetwork.getGatewayMachineId() else {
             logger.trace("No gateway configured, dropping packet to \(destIP)")
             stats.packetsDropped += 1
@@ -225,7 +256,36 @@ public actor PacketRouter {
         logger.trace("Set up inbound routing", metadata: ["machine": "\(machineId.prefix(8))..."])
     }
 
+    private func deliverLocalReturn(_ packet: Data) async {
+        do {
+            try await localInterface.writePacket(packet)
+            stats.packetsFromPeers += 1
+            logger.trace("Delivered gateway-local return", metadata: ["size": "\(packet.count)"])
+        } catch {
+            logger.trace("Failed to deliver gateway-local return: \(error)")
+            stats.packetsDropped += 1
+        }
+    }
+
     private func handleInboundPacket(_ packet: Data, from machineId: MachineId) async {
+        // If we are the gateway and this packet is internet-bound, forward it
+        // through the GatewayService rather than delivering locally.
+        if let gatewayService {
+            if let destIP = extractDestinationIP(from: packet) {
+                let decision = await virtualNetwork.route(destinationIP: destIP)
+                if case .gateway = decision {
+                    await gatewayService.forwardToInternet(packet, from: machineId)
+                    stats.packetsFromPeers += 1
+                    stats.packetsToGateway += 1
+                    logger.trace("Gateway-forwarded inbound packet to internet", metadata: [
+                        "from": "\(machineId.prefix(8))...",
+                        "dest": "\(destIP)"
+                    ])
+                    return
+                }
+            }
+        }
+
         do {
             try await localInterface.writePacket(packet)
             stats.packetsFromPeers += 1

@@ -24,7 +24,7 @@ public struct NetstackBridgeConfig: Sendable {
 
 /// Protocol for netstack bridge implementations
 /// This allows plugging in different userspace TCP/IP stacks
-public protocol NetstackBridge: Sendable {
+public protocol NetstackBridgeProtocol: Sendable {
     /// Start the network stack
     func start() async throws
 
@@ -44,7 +44,7 @@ public protocol NetstackBridge: Sendable {
 /// Userspace network interface using a netstack bridge
 public actor NetstackInterface: NetworkInterface {
     public let localIP: String
-    private let bridge: any NetstackBridge
+    private let bridge: any NetstackBridgeProtocol
     private var outboundStream: AsyncStream<Data>!
     private var outboundContinuation: AsyncStream<Data>.Continuation!
     private var isRunning = false
@@ -53,7 +53,7 @@ public actor NetstackInterface: NetworkInterface {
     /// - Parameters:
     ///   - localIP: The local IP address for this interface
     ///   - bridge: The netstack bridge implementation
-    public init(localIP: String, bridge: any NetstackBridge) {
+    public init(localIP: String, bridge: any NetstackBridgeProtocol) {
         self.localIP = localIP
         self.bridge = bridge
 
@@ -114,7 +114,7 @@ public actor NetstackInterface: NetworkInterface {
 
 /// A stub netstack bridge for testing without a real implementation
 /// This can be replaced with a real gVisor/lwIP bridge later
-public actor StubNetstackBridge: NetstackBridge {
+public actor StubNetstackBridge: NetstackBridgeProtocol {
     private var returnCallback: (@Sendable (Data) -> Void)?
     private var injectedPackets: [Data] = []
     private var isRunning = false
