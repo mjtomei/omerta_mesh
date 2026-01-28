@@ -65,6 +65,9 @@ struct Start: AsyncParsableCommand {
     @Option(name: .long, help: "Configuration file path")
     var config: String?
 
+    @Flag(name: .long, help: "LAN mode - bind to IPv4 for cross-machine LAN testing")
+    var lan: Bool = false
+
     mutating func run() async throws {
         // Configure logging
         let level = parseLogLevel(logLevel)
@@ -101,6 +104,9 @@ struct Start: AsyncParsableCommand {
         if let identityPath = identity {
             daemonConfig.identityPath = identityPath
         }
+        if lan {
+            daemonConfig.lanMode = true
+        }
 
         // Check if already running
         let controlPath = DaemonSocketPaths.meshDaemonControl(networkId: networkId)
@@ -113,6 +119,7 @@ struct Start: AsyncParsableCommand {
         print("Starting omerta-meshd for network: \(networkId)")
         print("  Port: \(daemonConfig.port == 0 ? "auto" : String(daemonConfig.port))")
         print("  Relay: \(daemonConfig.canRelay)")
+        print("  LAN mode: \(daemonConfig.lanMode)")
         print("  Foreground: \(foreground)")
         if !daemonConfig.bootstrapPeers.isEmpty {
             print("  Bootstrap peers: \(daemonConfig.bootstrapPeers.count)")

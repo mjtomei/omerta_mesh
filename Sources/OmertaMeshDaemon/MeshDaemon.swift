@@ -92,7 +92,8 @@ public actor MeshDaemon {
                 canCoordinateHolePunch: config.canCoordinateHolePunch,
                 bootstrapPeers: fixedBootstrapPeers,
                 enableEventLogging: config.enableEventLogging,
-                eventLogDir: config.eventLogDir
+                eventLogDir: config.eventLogDir,
+                allowLocalhost: config.lanMode
             )
 
             // Create mesh network

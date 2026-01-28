@@ -42,6 +42,9 @@ public struct MeshDaemonConfig: Codable, Sendable {
     /// PID file path
     public var pidFile: String?
 
+    /// LAN mode - bind to IPv4 (0.0.0.0) instead of specific IPv6 for cross-machine LAN testing
+    public var lanMode: Bool
+
     /// Default configuration
     public static var `default`: MeshDaemonConfig {
         MeshDaemonConfig(
@@ -55,7 +58,8 @@ public struct MeshDaemonConfig: Codable, Sendable {
             eventLogDir: nil,
             identityPath: nil,
             foreground: true,
-            pidFile: nil
+            pidFile: nil,
+            lanMode: false
         )
     }
 
@@ -70,7 +74,8 @@ public struct MeshDaemonConfig: Codable, Sendable {
         eventLogDir: String? = nil,
         identityPath: String? = nil,
         foreground: Bool = true,
-        pidFile: String? = nil
+        pidFile: String? = nil,
+        lanMode: Bool = false
     ) {
         self.networkId = networkId
         self.port = port
@@ -83,6 +88,7 @@ public struct MeshDaemonConfig: Codable, Sendable {
         self.identityPath = identityPath
         self.foreground = foreground
         self.pidFile = pidFile
+        self.lanMode = lanMode
     }
 }
 
