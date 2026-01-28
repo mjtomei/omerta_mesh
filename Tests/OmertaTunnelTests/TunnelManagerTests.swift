@@ -54,9 +54,9 @@ final class TunnelManagerTests: XCTestCase {
         let provider = MockChannelProvider()
         let manager = TunnelManager(provider: provider)
 
-        // Manager should not be started yet
-        let session = await manager.currentSession()
-        XCTAssertNil(session)
+        // Manager should have no sessions
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 0)
     }
 
     func testManagerStartStop() async throws {
@@ -114,7 +114,7 @@ final class TunnelManagerTests: XCTestCase {
         try await manager.start()
         await manager.stop()
 
-        // Handler is set but not called yet (would need to simulate incoming handshake)
+        // Handler is set but not called yet
         XCTAssertFalse(requestReceived)
     }
 
@@ -129,7 +129,7 @@ final class TunnelManagerTests: XCTestCase {
 
         await provider.clearSentMessages()
 
-        // Close the session
+        // Close all sessions
         await manager.closeSession()
 
         // Verify close handshake was sent
@@ -137,9 +137,192 @@ final class TunnelManagerTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].channel, "tunnel-handshake")
 
-        // Session should be nil
-        let currentSession = await manager.currentSession()
-        XCTAssertNil(currentSession)
+        // Session count should be 0
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 0)
+
+        await manager.stop()
+    }
+
+    // MARK: - Session Pool Tests
+
+    func testGetOrCreateSession() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // First call creates
+        let session1 = try await manager.getSession(machineId: "machine-1", channel: "data")
+        let count1 = await manager.sessionCount
+        XCTAssertEqual(count1, 1)
+
+        // Second call returns same session
+        let session2 = try await manager.getSession(machineId: "machine-1", channel: "data")
+        let count2 = await manager.sessionCount
+        XCTAssertEqual(count2, 1)
+
+        // Same object
+        let id1 = await session1.remoteMachineId
+        let id2 = await session2.remoteMachineId
+        XCTAssertEqual(id1, id2)
+
+        await manager.stop()
+    }
+
+    func testDifferentChannelsDifferentSessions() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let dataSession = try await manager.getSession(machineId: "machine-1", channel: "data")
+        let controlSession = try await manager.getSession(machineId: "machine-1", channel: "control")
+
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 2)
+
+        let dataCh = await dataSession.channel
+        let controlCh = await controlSession.channel
+        XCTAssertEqual(dataCh, "data")
+        XCTAssertEqual(controlCh, "control")
+
+        await manager.stop()
+    }
+
+    func testCloseAllSessionsToMachine() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create sessions to two machines
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-1", channel: "control")
+        _ = try await manager.getSession(machineId: "machine-2", channel: "data")
+
+        let countBefore = await manager.sessionCount
+        XCTAssertEqual(countBefore, 3)
+
+        // Close all sessions to machine-1
+        await manager.closeAllSessions(to: "machine-1")
+
+        let countAfter = await manager.sessionCount
+        XCTAssertEqual(countAfter, 1)
+
+        // machine-2 session should still exist
+        let key = TunnelSessionKey(remoteMachineId: "machine-2", channel: "data")
+        let remaining = await manager.getExistingSession(key: key)
+        XCTAssertNotNil(remaining)
+
+        await manager.stop()
+    }
+
+    func testSessionEstablishedCallback() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+
+        var establishedSession: TunnelSession?
+        await manager.setSessionEstablishedHandler { session in
+            establishedSession = session
+        }
+
+        try await manager.start()
+
+        // Simulate incoming session request
+        let handshake = SessionHandshake(type: .request, channel: "data")
+        let data = try JSONEncoder().encode(handshake)
+        await provider.simulateMessage(from: "remote-initiator", on: "tunnel-handshake", data: data)
+
+        XCTAssertNotNil(establishedSession)
+        let remoteMachineId = await establishedSession?.remoteMachineId
+        XCTAssertEqual(remoteMachineId, "remote-initiator")
+
+        await manager.stop()
+    }
+
+    func testCloseSpecificSession() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-1", channel: "control")
+
+        let countBefore = await manager.sessionCount
+        XCTAssertEqual(countBefore, 2)
+
+        // Close only the data session
+        let dataKey = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        await manager.closeSession(key: dataKey)
+
+        let countAfter = await manager.sessionCount
+        XCTAssertEqual(countAfter, 1)
+
+        // Control session should still exist
+        let controlKey = TunnelSessionKey(remoteMachineId: "machine-1", channel: "control")
+        let remaining = await manager.getExistingSession(key: controlKey)
+        XCTAssertNotNil(remaining)
+
+        await manager.stop()
+    }
+
+    func testSessionCount() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let count0 = await manager.sessionCount
+        XCTAssertEqual(count0, 0)
+
+        _ = try await manager.getSession(machineId: "m1", channel: "data")
+        let count1 = await manager.sessionCount
+        XCTAssertEqual(count1, 1)
+
+        _ = try await manager.getSession(machineId: "m2", channel: "data")
+        let count2 = await manager.sessionCount
+        XCTAssertEqual(count2, 2)
+
+        await manager.closeAllSessions(to: "m1")
+        let count3 = await manager.sessionCount
+        XCTAssertEqual(count3, 1)
+
+        await manager.stop()
+        let count4 = await manager.sessionCount
+        XCTAssertEqual(count4, 0)
+    }
+
+    func testSessionLimitPerMachine() async throws {
+        let config = TunnelManagerConfig(maxSessionsPerMachine: 2, maxTotalSessions: 100)
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider, config: config)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "m1", channel: "ch1")
+        _ = try await manager.getSession(machineId: "m1", channel: "ch2")
+
+        do {
+            _ = try await manager.getSession(machineId: "m1", channel: "ch3")
+            XCTFail("Expected sessionLimitReached error")
+        } catch {
+            XCTAssertEqual(error as? TunnelError, .sessionLimitReached)
+        }
+
+        await manager.stop()
+    }
+
+    func testSessionLimitTotal() async throws {
+        let config = TunnelManagerConfig(maxSessionsPerMachine: 10, maxTotalSessions: 2)
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider, config: config)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "m1", channel: "data")
+        _ = try await manager.getSession(machineId: "m2", channel: "data")
+
+        do {
+            _ = try await manager.getSession(machineId: "m3", channel: "data")
+            XCTFail("Expected sessionLimitReached error")
+        } catch {
+            XCTAssertEqual(error as? TunnelError, .sessionLimitReached)
+        }
 
         await manager.stop()
     }
@@ -167,7 +350,7 @@ final class TunnelManagerTests: XCTestCase {
         try await manager.start()
 
         // Simulate incoming session request
-        let handshake = SessionHandshake(type: .request)
+        let handshake = SessionHandshake(type: .request, channel: "data")
         let data = try JSONEncoder().encode(handshake)
         await provider.simulateMessage(from: "remote-initiator", on: "tunnel-handshake", data: data)
 
@@ -205,13 +388,13 @@ final class TunnelManagerTests: XCTestCase {
         try await manager.start()
 
         // Simulate incoming session request
-        let handshake = SessionHandshake(type: .request)
+        let handshake = SessionHandshake(type: .request, channel: "data")
         let data = try JSONEncoder().encode(handshake)
         await provider.simulateMessage(from: "unwanted-machine", on: "tunnel-handshake", data: data)
 
         // No session should be created
-        let currentSession = await manager.currentSession()
-        XCTAssertNil(currentSession)
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 0)
 
         // Reject should have been sent
         let messages = await provider.getSentMessages()
@@ -233,13 +416,13 @@ final class TunnelManagerTests: XCTestCase {
         XCTAssertNotNil(session)
 
         // Simulate remote closing the session
-        let closeHandshake = SessionHandshake(type: .close)
+        let closeHandshake = SessionHandshake(type: .close, channel: "data")
         let data = try JSONEncoder().encode(closeHandshake)
         await provider.simulateMessage(from: "remote-machine", on: "tunnel-handshake", data: data)
 
-        // Session should be nil now
-        let currentSession = await manager.currentSession()
-        XCTAssertNil(currentSession)
+        // Session count should be 0
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 0)
 
         // Original session should be disconnected
         let state = await session.state
@@ -255,13 +438,13 @@ final class TunnelManagerTests: XCTestCase {
         // No handler set - should accept by default
         try await manager.start()
 
-        let handshake = SessionHandshake(type: .request)
+        let handshake = SessionHandshake(type: .request, channel: "data")
         let data = try JSONEncoder().encode(handshake)
         await provider.simulateMessage(from: "any-machine", on: "tunnel-handshake", data: data)
 
         // Session should be created
-        let currentSession = await manager.currentSession()
-        XCTAssertNotNil(currentSession)
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 1)
 
         await manager.stop()
     }
@@ -279,36 +462,6 @@ final class TunnelManagerTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? TunnelError, .notConnected)
         }
-    }
-
-    func testNewSessionClosesExisting() async throws {
-        let provider = MockChannelProvider()
-        let manager = TunnelManager(provider: provider)
-
-        try await manager.start()
-
-        // Create first session
-        let session1 = try await manager.createSession(withMachine: "machine-1")
-        let state1Before = await session1.state
-        XCTAssertEqual(state1Before, .active)
-
-        // Create second session
-        let session2 = try await manager.createSession(withMachine: "machine-2")
-
-        // First session should be disconnected
-        let state1After = await session1.state
-        XCTAssertEqual(state1After, .disconnected)
-
-        // Second session should be active
-        let state2 = await session2.state
-        XCTAssertEqual(state2, .active)
-
-        // Current session should be the second one
-        let current = await manager.currentSession()
-        let currentMachine = await current?.remoteMachineId
-        XCTAssertEqual(currentMachine, "machine-2")
-
-        await manager.stop()
     }
 
     func testDoubleStartIsIdempotent() async throws {
@@ -334,6 +487,22 @@ final class TunnelManagerTests: XCTestCase {
 
         let channels = await provider.getRegisteredChannels()
         XCTAssertFalse(channels.contains("tunnel-handshake"))
+    }
+
+    func testHandshakeIncludesChannel() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "machine-1", channel: "control")
+
+        let messages = await provider.getSentMessages()
+        XCTAssertEqual(messages.count, 1)
+
+        let handshake = try JSONDecoder().decode(SessionHandshake.self, from: messages[0].data)
+        XCTAssertEqual(handshake.channel, "control")
+
+        await manager.stop()
     }
 }
 
@@ -620,5 +789,18 @@ final class TunnelConfigTests: XCTestCase {
         XCTAssertNotNil(TunnelError.machineNotFound("machine").errorDescription)
         XCTAssertNotNil(TunnelError.timeout.errorDescription)
         XCTAssertNotNil(TunnelError.sessionRejected.errorDescription)
+        XCTAssertNotNil(TunnelError.sessionLimitReached.errorDescription)
+    }
+
+    func testTunnelManagerConfigDefaults() {
+        let config = TunnelManagerConfig.default
+        XCTAssertEqual(config.maxSessionsPerMachine, 10)
+        XCTAssertEqual(config.maxTotalSessions, 1000)
+    }
+
+    func testTunnelManagerConfigCustom() {
+        let config = TunnelManagerConfig(maxSessionsPerMachine: 5, maxTotalSessions: 50)
+        XCTAssertEqual(config.maxSessionsPerMachine, 5)
+        XCTAssertEqual(config.maxTotalSessions, 50)
     }
 }

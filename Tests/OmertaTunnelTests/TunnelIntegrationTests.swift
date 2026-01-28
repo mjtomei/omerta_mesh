@@ -122,8 +122,8 @@ final class TunnelIntegrationTests: XCTestCase {
         await fulfillment(of: [sessionEstablished], timeout: 5.0)
 
         // Verify mesh2 has a session
-        let session2 = await tunnel2.currentSession()
-        XCTAssertNotNil(session2)
+        let count2 = await tunnel2.sessionCount
+        XCTAssertEqual(count2, 1)
     }
 
     /// Test message exchange between two peers over mesh
@@ -369,8 +369,8 @@ final class TunnelIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 300_000_000)
 
         // Verify both have sessions
-        let currentSession1 = await tunnel1.currentSession()
-        XCTAssertNotNil(currentSession1)
+        let count1 = await tunnel1.sessionCount
+        XCTAssertEqual(count1, 1)
         XCTAssertNotNil(session2)
 
         // Close from mesh1
@@ -380,8 +380,8 @@ final class TunnelIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 300_000_000)
 
         // mesh2 should have no session now
-        let currentSession2 = await tunnel2.currentSession()
-        XCTAssertNil(currentSession2)
+        let count2After = await tunnel2.sessionCount
+        XCTAssertEqual(count2After, 0)
 
         // The session object should be disconnected
         if let s2 = session2 {
