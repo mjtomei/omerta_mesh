@@ -396,9 +396,11 @@ public struct IPCMessage: Sendable {
     /// Read the length prefix from frame header
     public static func readLength(from data: Data) -> UInt32? {
         guard data.count >= 4 else { return nil }
-        return data.withUnsafeBytes { ptr in
-            ptr.load(as: UInt32.self).bigEndian
-        }
+        // Construct UInt32 from bytes manually to avoid alignment issues on Linux
+        return UInt32(data[data.startIndex]) << 24 |
+               UInt32(data[data.startIndex + 1]) << 16 |
+               UInt32(data[data.startIndex + 2]) << 8 |
+               UInt32(data[data.startIndex + 3])
     }
 }
 
