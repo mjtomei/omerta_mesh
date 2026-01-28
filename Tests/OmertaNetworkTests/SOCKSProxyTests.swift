@@ -4,6 +4,12 @@ import NIOCore
 import NIOPosix
 @testable import OmertaNetwork
 
+#if canImport(Glibc)
+private let SOCK_STREAM_VALUE = Int32(SOCK_STREAM.rawValue)
+#else
+private let SOCK_STREAM_VALUE = SOCK_STREAM
+#endif
+
 final class SOCKSProxyTests: XCTestCase {
 
     private var mockInterface: MockNetworkInterface!
@@ -38,7 +44,7 @@ final class SOCKSProxyTests: XCTestCase {
 
     private func connectSocket() async throws -> SocketHelper {
         let port = await proxy.actualPort
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let fd = socket(AF_INET, SOCK_STREAM_VALUE, 0)
         XCTAssertGreaterThan(fd, 0)
 
         var addr = sockaddr_in()

@@ -10,6 +10,12 @@ import NIOCore
 import NIOPosix
 @testable import OmertaNetwork
 
+#if canImport(Glibc)
+private let SOCK_STREAM_VALUE = Int32(SOCK_STREAM.rawValue)
+#else
+private let SOCK_STREAM_VALUE = SOCK_STREAM
+#endif
+
 // MARK: - Loopback TCP Infrastructure
 
 /// A real TCP connection backed by a POSIX socket.
@@ -77,7 +83,7 @@ private actor LoopbackBridge: NetstackBridgeProtocol {
     func setReturnCallback(_ callback: @escaping @Sendable (Data) -> Void) async {}
 
     func dialTCP(host: String, port: UInt16) async throws -> TCPConnection {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let fd = socket(AF_INET, SOCK_STREAM_VALUE, 0)
         guard fd >= 0 else { throw InterfaceError.dialFailed("socket: \(errno)") }
 
         var addr = sockaddr_in()
@@ -215,7 +221,7 @@ private class TestSocket {
     let fd: Int32
 
     init(connectingTo port: UInt16) throws {
-        fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        fd = socket(AF_INET, SOCK_STREAM_VALUE, 0)
         guard fd >= 0 else { throw InterfaceError.dialFailed("socket: \(errno)") }
 
         var addr = sockaddr_in()
