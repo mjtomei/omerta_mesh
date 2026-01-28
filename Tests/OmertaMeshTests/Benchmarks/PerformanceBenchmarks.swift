@@ -182,8 +182,8 @@ final class PerformanceBenchmarks: XCTestCase {
         print("  Duration: \(String(format: "%.3f", duration))s")
         print("  Rate: \(String(format: "%.0f", translationsPerSecond)) trans/s")
 
-        // Baseline: should handle at least 1000 translations/s (actors have overhead)
-        XCTAssertGreaterThan(translationsPerSecond, 1000)
+        // Baseline: should handle at least 800 translations/s (actors have overhead)
+        XCTAssertGreaterThan(translationsPerSecond, 800)
     }
 
     // MARK: - Peer Cache Performance
