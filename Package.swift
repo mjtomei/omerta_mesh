@@ -84,6 +84,14 @@ let package = Package(
             ],
             plugins: ["BuildNetstack"]
         ),
+        .executableTarget(
+            name: "HealthTestRunner",
+            dependencies: [
+                "OmertaMesh",
+                "OmertaTunnel",
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
         .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaNetwork", "OmertaMesh"]),
         .testTarget(name: "OmertaNetworkTests", dependencies: [
             "OmertaNetwork", "OmertaMesh",
