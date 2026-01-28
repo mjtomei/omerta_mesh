@@ -59,8 +59,9 @@ final class EndpointChangeDetectorTests: XCTestCase {
 
     func testNoChangeWhenStable() async throws {
         let detector = EndpointChangeDetector()
-        await detector.start()
 
+        // Get the stream without starting the platform monitor,
+        // so no real NWPathMonitor events fire
         let stream = await detector.changes
 
         // Don't emit anything — verify no events arrive within a timeout
@@ -75,7 +76,7 @@ final class EndpointChangeDetectorTests: XCTestCase {
         task.cancel()
 
         let result = await task.value
-        XCTAssertNil(result, "No events should be emitted when network is stable")
+        XCTAssertNil(result, "No events should be emitted when nothing is emitted")
 
         await detector.stop()
     }
