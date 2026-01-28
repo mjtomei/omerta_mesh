@@ -358,7 +358,7 @@ swift test
 
 ### Phase 2: TunnelManager Session Pool
 
-**Goal:** Rework TunnelManager to maintain a pool of sessions keyed by (machineId, channel).
+**Goal:** Rework TunnelManager to maintain a pool of sessions keyed by (machineId, channel), with active endpoint management for connection reliability.
 
 #### Architecture Context
 
@@ -366,16 +366,32 @@ swift test
 
 **New:** TunnelManager maintains multiple sessions keyed by TunnelSessionKey. Sessions are created on-demand when packets need to be sent. Multiple channels to the same machine are supported.
 
+**Connection management:** The base MeshNetwork already provides hole-punching, relay fallback, and reconnection — but it does so *reactively*, only refreshing connections when they're actually used. This is efficient for background traffic but means connections may go stale between uses, causing latency spikes when traffic resumes.
+
+TunnelManager adds *proactive* connection management for latency-sensitive applications (SSH, real-time communication):
+- **Active health monitoring** — Periodic probes even when idle, so connection problems are detected immediately
+- **Preemptive reconnection** — Re-establishes connections before they're needed, not when a send fails
+- **Latency tracking** — Continuous RTT measurement for connection quality visibility
+- **Faster failover** — Switches to relay sooner when direct path degrades
+
+The underlying mechanisms (hole-punch, relay, etc.) are the same as MeshNetwork. The difference is timing: TunnelManager doesn't wait for traffic to discover a problem.
+
+This responsibility is per-machine, not per-session. Multiple sessions to the same machine share a single actively-managed endpoint.
+
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │  TunnelManager                                                    │
 │  ├── sessions: [TunnelSessionKey: TunnelSession]                  │
-│  ├── getSession(peerId:machineId:channel:)                        │
+│  │   └── Keyed by (machineId, channel)                            │
+│  ├── (internal) endpoints, health monitors                        │
+│  │   └── Proactive connection management (probes even when idle)  │
+│  ├── getSession(machineId:channel:)                               │
 │  ├── closeSession(key:)                                           │
 │  └── onSessionEstablished(handler:)                               │
 └───────────────────────────────────────────────────────────────────┘
 
-Session lookup: (machineId, channel) → TunnelSession
+Public:   (machineId, channel) → TunnelSession
+Internal: machineId → endpoint state, health probes
 ```
 
 #### Module: OmertaTunnel
@@ -391,8 +407,10 @@ Session lookup: (machineId, channel) → TunnelSession
 ```swift
 public actor TunnelManager {
     private var sessions: [TunnelSessionKey: TunnelSession] = [:]
+    private var endpoints: [MachineId: TunnelEndpoint] = [:]  // Per-machine connection state
     private let provider: any ChannelProvider
     private let config: TunnelManagerConfig
+    private var healthMonitors: [MachineId: Task<Void, Never>] = [:]
 
     /// Callback when a new session is established (incoming or outgoing)
     private var sessionEstablishedHandler: ((TunnelSession) async -> Void)?
@@ -402,7 +420,9 @@ public actor TunnelManager {
         self.config = config
     }
 
-    /// Get or create a session to a specific machine on a specific channel
+    /// Get or create a session to a specific machine on a specific channel.
+    /// If no endpoint exists for this machine, triggers endpoint negotiation
+    /// (hole-punch, relay fallback) before returning the session.
     public func getSession(
         machineId: MachineId,
         channel: String
@@ -411,6 +431,11 @@ public actor TunnelManager {
 
         if let existing = sessions[key] {
             return existing
+        }
+
+        // Ensure we have a managed endpoint to this machine
+        if endpoints[machineId] == nil {
+            try await negotiateEndpoint(for: machineId)
         }
 
         let session = TunnelSession(
@@ -423,6 +448,23 @@ public actor TunnelManager {
 
         await sessionEstablishedHandler?(session)
         return session
+    }
+
+    /// Internal: negotiate endpoint (hole-punch, relay fallback)
+    private func negotiateEndpoint(for machineId: MachineId) async throws {
+        endpoints[machineId] = TunnelEndpoint(
+            machineId: machineId,
+            connectionType: .connecting,
+            latencyMs: nil,
+            lastProbeTime: nil
+        )
+
+        // 1. Attempt UDP hole-punch via mesh signaling
+        // 2. If fails after timeout, request relay from RelayCoordinator
+        // 3. Update endpoint with result
+        // 4. Start health monitor for this machine
+
+        // (Implementation details in TunnelEndpointNegotiator)
     }
 
     /// Get existing session by key (does not create)
@@ -481,8 +523,32 @@ public struct TunnelManagerConfig: Sendable {
     public var maxSessionsPerMachine: Int = 10
     public var maxTotalSessions: Int = 1000
 
+    // Proactive health monitoring — the key difference from base MeshNetwork.
+    // These probes run even when no traffic is flowing, so connection
+    // problems are detected before they impact user-facing latency.
+    public var probeIntervalMs: Int = 5000      // How often to probe idle connections
+    public var probeTimeoutMs: Int = 2000       // When to consider a probe failed
+    public var relayFallbackThreshold: Int = 3  // Failed probes before switching to relay
+
     public static let `default` = TunnelManagerConfig()
 }
+
+// MARK: - Endpoint Management (Internal)
+//
+// TunnelManager actively manages the connection to each remote machine.
+// Multiple sessions to the same machine share a single managed endpoint.
+// This is all internal — users who need fine-grained endpoint control
+// should use the MeshNetwork API directly.
+//
+// Internal state:
+// - endpoints: [MachineId: EndpointState]
+// - healthMonitors: [MachineId: Task] — continuous probes
+//
+// Internal behavior:
+// - getSession() triggers endpoint negotiation if needed
+// - Health probes run continuously, even when idle
+// - Auto-failover to relay after probeFailureThreshold failures
+// - Auto-reconnect on network changes
 ```
 
 #### Unit Tests
