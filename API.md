@@ -12,6 +12,7 @@ OmertaMesh is a peer-to-peer mesh networking library that handles NAT traversal,
 6. [Best Practices](#best-practices)
 7. [Error Handling](#error-handling)
 8. [Examples](#examples)
+9. [Tunnel Sessions (OmertaTunnel)](#tunnel-sessions-omertatunnel)
 
 ---
 
@@ -958,6 +959,213 @@ actor ChatApp {
 | `networkInfoClient()` | Get NetworkInfo client |
 | `messageClient()` | Get Message client (with persistence) |
 
+### TunnelManager (OmertaTunnel)
+
+| Method | Description |
+|--------|-------------|
+| `start()` | Start the tunnel manager |
+| `stop()` | Stop and close all sessions |
+| `getSession(for:channel:)` | Get or create a session (handles connection automatically) |
+| `getExistingSession(for:channel:)` | Get session without creating |
+| `closeSession(for:channel:)` | Close a specific session |
+| `activeSessions()` | List all active sessions |
+| `setSessionEstablishedHandler(_:)` | Handler for incoming sessions |
+
+Health monitoring is internal. Connection establishment (hole-punch, relay) is handled by `MeshNetwork`. For fine-grained control, use `MeshNetwork` directly.
+
+### TunnelSession (OmertaTunnel)
+
+| Property/Method | Description |
+|-----------------|-------------|
+| `remoteMachineId` | The remote machine ID |
+| `channel` | The channel name |
+| `state` | Current session state |
+| `stats` | Connection statistics |
+| `send(_:)` | Send data to remote |
+| `onReceive(_:)` | Set receive callback |
+| `close()` | Close the session |
+
+---
+
+## Tunnel Sessions (OmertaTunnel)
+
+For latency-sensitive applications like SSH or real-time communication, OmertaTunnel provides **proactively-managed connections** on top of the base mesh.
+
+### Reactive vs Proactive Connection Management
+
+**Separation of concerns:**
+- `MeshNetwork` handles the mechanics: hole-punching, relay coordination, encryption
+- `TunnelManager` triggers and monitors: sends probes to force establishment, tracks health
+
+The base `MeshNetwork` establishes connections **reactively** when user traffic flows. This is efficient for background operations, but the first message may have high latency while connection is established.
+
+`TunnelManager` is **proactive**:
+
+| Aspect | MeshNetwork (Reactive) | TunnelManager (Proactive) |
+|--------|------------------------|---------------------------|
+| Connection establishment | When first user data sent | Immediately on getSession() |
+| Problem detection | When a send fails | Before sends fail (health probes) |
+| Latency visibility | Per-message | Continuous RTT tracking |
+| Monitoring | None when idle | Continuous probes |
+| Best for | Background/bulk traffic | User-facing, latency-sensitive |
+
+The underlying mechanisms (hole-punch, relay) are identical. The difference is **timing**: TunnelManager sends probes immediately to trigger establishment, then continues monitoring.
+
+### Basic Usage
+
+```swift
+import OmertaTunnel
+
+// Create tunnel manager on top of mesh
+let tunnelManager = TunnelManager(provider: mesh)
+try await tunnelManager.start()
+
+// Get or create a session to a remote machine
+// This immediately sends probes to establish connection (doesn't wait for user traffic)
+let session = try await tunnelManager.getSession(
+    for: remoteMachineId,
+    channel: "ssh"  // Logical channel name
+)
+
+// Send data
+try await session.send(packetData)
+
+// Receive data (callback-based)
+session.onReceive { data in
+    // Handle incoming packet
+}
+
+// Check session state
+print("State: \(await session.state)")
+print("Latency: \(await session.stats.latencyMs ?? 0)ms")
+
+// Close when done
+await tunnelManager.closeSession(for: remoteMachineId, channel: "ssh")
+await tunnelManager.stop()
+```
+
+### Session Addressing
+
+Sessions are identified by `(MachineId, channel)`:
+
+- **MachineId**: The remote machine (a peer may have multiple machines)
+- **channel**: A logical name for the session purpose (e.g., "ssh", "packets", "control")
+
+Multiple sessions to the same machine on different channels are supported. All sessions to the same machine share health monitoring state.
+
+```swift
+// Multiple channels to the same machine
+let sshSession = try await tunnelManager.getSession(for: machineId, channel: "ssh")
+let fileSession = try await tunnelManager.getSession(for: machineId, channel: "files")
+
+// Both share the same health monitoring (one set of probes per machine)
+```
+
+### TunnelSession API
+
+```swift
+public actor TunnelSession {
+    /// Session identifier
+    public let key: TunnelSessionKey  // (remoteMachineId, channel)
+    public var remoteMachineId: MachineId { key.remoteMachineId }
+    public var channel: String { key.channel }
+
+    /// Current state
+    public var state: TunnelState { get }
+
+    /// Connection statistics
+    public var stats: Stats { get }
+
+    public struct Stats {
+        public var packetsSent: UInt64
+        public var packetsReceived: UInt64
+        public var bytesSent: UInt64
+        public var bytesReceived: UInt64
+        public var lastActivity: Date
+    }
+
+    /// Send data to the remote machine
+    func send(_ data: Data) async throws
+
+    /// Set handler for incoming data
+    func onReceive(_ handler: @escaping (Data) async -> Void)
+
+    /// Close the session
+    func close() async
+}
+
+public enum TunnelState: Sendable, Equatable {
+    case connecting
+    case active
+    case disconnected
+    case failed(String)
+}
+```
+
+### TunnelManager API
+
+```swift
+public actor TunnelManager {
+    init(provider: any ChannelProvider, config: TunnelManagerConfig = .default)
+
+    func start() async throws
+    func stop() async
+
+    /// Get or create a session. Connection is established automatically.
+    func getSession(for machineId: MachineId, channel: String = "default") async throws -> TunnelSession
+
+    /// Get existing session without creating
+    func getExistingSession(for machineId: MachineId, channel: String = "default") -> TunnelSession?
+
+    /// Close a session
+    func closeSession(for machineId: MachineId, channel: String = "default") async
+
+    /// All active sessions
+    func activeSessions() -> [TunnelSession]
+
+    /// Handler for incoming sessions
+    func setSessionEstablishedHandler(_ handler: @escaping (TunnelSession) async -> Void)
+}
+```
+
+TunnelManager proactively establishes connections by sending probes immediately (triggering the mesh's hole-punch/relay mechanisms), then continues monitoring health. The mesh handles the actual connection mechanics. For fine-grained control, use `MeshNetwork` directly.
+
+### Configuration
+
+```swift
+public struct TunnelManagerConfig: Sendable {
+    public var idleTimeout: TimeInterval = 300  // Close idle sessions after 5 min
+    public var maxSessionsPerMachine: Int = 10
+    public var maxTotalSessions: Int = 1000
+
+    // Proactive connection establishment
+    public var initialProbeAttempts: Int = 5    // Attempts to establish connection
+    public var initialProbeRetryMs: Int = 500   // Delay between initial attempts
+
+    // Ongoing health monitoring
+    public var probeIntervalMs: Int = 5000      // Probe every 5 seconds
+    public var probeTimeoutMs: Int = 2000       // Probe timeout
+    public var failureThreshold: Int = 3        // Request endpoint change after 3 failures
+}
+
+var config = TunnelManagerConfig()
+config.probeIntervalMs = 1000  // More aggressive monitoring for SSH
+let tunnelManager = TunnelManager(provider: mesh, config: config)
+```
+
+### When to Use Tunnels vs Raw Mesh
+
+| Use Case | Recommendation |
+|----------|----------------|
+| SSH, interactive shell | TunnelSession |
+| Real-time collaboration | TunnelSession |
+| Video/audio streaming | TunnelSession |
+| File sync (background) | Raw mesh (`sendOnChannel`) |
+| Gossip/discovery | Raw mesh |
+| Infrequent notifications | Raw mesh |
+
+Rule of thumb: if the user is waiting for a response, use TunnelSession.
+
 ---
 
 ## See Also
@@ -965,3 +1173,5 @@ actor ChatApp {
 - [MIGRATION.md](MIGRATION.md) - Migration guide from legacy API
 - [MeshError.swift](MeshError.swift) - Error type definitions
 - [ChannelProvider.swift](ChannelProvider.swift) - Protocol definitions
+- [VIRTUAL_NETWORK_REWORK.md](plans/VIRTUAL_NETWORK_REWORK.md) - Virtual network architecture
+- [INGRESS_NAT_TRAVERSAL.md](plans/INGRESS_NAT_TRAVERSAL.md) - VM networking architecture
