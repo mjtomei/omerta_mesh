@@ -57,10 +57,24 @@ public struct TunnelManagerConfig: Sendable {
     /// Maximum total sessions across all machines
     public var maxTotalSessions: Int = 1000
 
+    // Health monitoring
+    public var healthProbeMinInterval: Duration = .milliseconds(500)
+    public var healthProbeMaxInterval: Duration = .seconds(15)
+    public var healthFailureThreshold: Int = 3
+
     public static let `default` = TunnelManagerConfig()
 
-    public init(maxSessionsPerMachine: Int = 10, maxTotalSessions: Int = 1000) {
+    public init(
+        maxSessionsPerMachine: Int = 10,
+        maxTotalSessions: Int = 1000,
+        healthProbeMinInterval: Duration = .milliseconds(500),
+        healthProbeMaxInterval: Duration = .seconds(15),
+        healthFailureThreshold: Int = 3
+    ) {
         self.maxSessionsPerMachine = maxSessionsPerMachine
         self.maxTotalSessions = maxTotalSessions
+        self.healthProbeMinInterval = healthProbeMinInterval
+        self.healthProbeMaxInterval = healthProbeMaxInterval
+        self.healthFailureThreshold = healthFailureThreshold
     }
 }

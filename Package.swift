@@ -31,6 +31,10 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
+        .plugin(
+            name: "BuildNetstack",
+            capability: .buildTool()
+        ),
         .systemLibrary(name: "CNetstack", path: "Sources/CNetstack"),
         .target(
             name: "OmertaTunnel",
@@ -77,7 +81,8 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("netstack", .when(platforms: [.macOS, .linux])),
                 .unsafeFlags(["-L\(packageDir)/Sources/CNetstack"], .when(platforms: [.macOS, .linux])),
-            ]
+            ],
+            plugins: ["BuildNetstack"]
         ),
         .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaNetwork", "OmertaMesh"]),
         .testTarget(name: "OmertaNetworkTests", dependencies: [
