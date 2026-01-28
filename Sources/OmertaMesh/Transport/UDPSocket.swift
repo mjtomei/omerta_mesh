@@ -120,6 +120,8 @@ public actor UDPSocket {
     // MARK: - Sending
 
     /// Send data to a specific address
+    /// Retries on transient errors like "host unreachable" which can occur on macOS
+    /// due to stale ICMP error caching
     public func send(_ data: Data, to address: SocketAddress) async throws {
         guard let channel = channel, isRunning else {
             logger.warning("UDP send failed: socket not running")
@@ -132,12 +134,39 @@ public actor UDPSocket {
         let buffer = channel.allocator.buffer(bytes: data)
         let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
 
-        logger.info("UDP sending \(data.count) bytes to \(sendAddress)")
-        do {
-            try await channel.writeAndFlush(envelope)
-            logger.info("UDP sent \(data.count) bytes to \(sendAddress)")
-        } catch {
-            logger.error("UDP send failed to \(sendAddress): \(error)")
+        // Retry logic for transient errors (especially macOS ICMP error caching)
+        let maxRetries = 3
+        var lastError: Error?
+
+        for attempt in 1...maxRetries {
+            logger.info("UDP sending \(data.count) bytes to \(sendAddress)")
+            do {
+                try await channel.writeAndFlush(envelope)
+                logger.info("UDP sent \(data.count) bytes to \(sendAddress)")
+                return  // Success
+            } catch {
+                lastError = error
+                let errorString = "\(error)"
+
+                // Check if this is a transient error worth retrying
+                // "host unreachable" and "network unreachable" are often stale ICMP errors on macOS
+                let isTransientError = errorString.lowercased().contains("unreachable") ||
+                                       errorString.lowercased().contains("connection refused")
+
+                if isTransientError && attempt < maxRetries {
+                    logger.warning("UDP send attempt \(attempt) failed (transient): \(error), retrying...")
+                    // Small delay before retry to allow error state to clear
+                    try? await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+                    continue
+                }
+
+                logger.error("UDP send failed to \(sendAddress): \(error)")
+                throw UDPSocketError.sendFailed(destination: "\(sendAddress)", byteCount: data.count, underlying: error)
+            }
+        }
+
+        // Should not reach here, but just in case
+        if let error = lastError {
             throw UDPSocketError.sendFailed(destination: "\(sendAddress)", byteCount: data.count, underlying: error)
         }
     }
