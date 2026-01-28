@@ -180,15 +180,21 @@ public actor UDPSocket {
         } catch {
             let errorString = "\(error)"
 
+            // Check SO_ERROR after send failure to see if there's additional queued error info
+            let postSendError = await checkAndClearSocketError()
+            if postSendError != 0 {
+                logger.warning("Additional SO_ERROR after send: errno=\(postSendError) (\(errnoDescription(postSendError)))")
+            }
+
             // Check if this is a known transient/spurious error
-            // On macOS, stale ICMP errors can be reported on UDP sends even when the
-            // network is fine. Log details and continue - let higher-level timeouts
-            // handle actual failures.
+            // On macOS, the kernel can reject sends with "host unreachable" if it has
+            // negative routing cache entries. Log details and continue - let higher-level
+            // timeouts handle actual failures.
             let isSpuriousError = errorString.lowercased().contains("unreachable") ||
                                   errorString.lowercased().contains("connection refused")
 
             if isSpuriousError {
-                logger.warning("UDP send reported error (may be stale ICMP): \(error)")
+                logger.warning("UDP send reported error: \(error) - destination may be in negative routing cache")
                 // Don't throw - let higher-level timeout mechanisms handle actual failures
                 return
             }
