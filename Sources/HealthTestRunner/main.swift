@@ -438,6 +438,7 @@ if !isNodeA {
 
         logger.info("Node B: received command '\(cmd.phase)'")
 
+        do {
         switch cmd.phase {
         case "phase1-start":
             // Create session and send 10 messages
@@ -518,6 +519,10 @@ if !isNodeA {
             logger.info("Node B: unknown command '\(cmd.phase)', acking")
             await sendControl("\(cmd.phase)-ack")
         }
+        } catch {
+            logger.error("Node B: error handling '\(cmd.phase)': \(error)")
+            await sendControl("\(cmd.phase)-error", detail: "\(error)")
+        }
 
         if cmd.phase == "done" { break }
     }
@@ -556,16 +561,22 @@ var session1: TunnelSession? = nil
 var monitor: TunnelHealthMonitor? = nil
 
 do {
+    // Create our session first, set up receive handler
+    let initialSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
+    await initialSession.onReceive { data in
+        await messageCounter.increment()
+    }
+
     // Tell Node B to start phase 1 — both sides create sessions
     await sendControl("phase1-start")
 
-    // Create our session, then wait for handshake to settle
-    let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
-    try await Task.sleep(for: .seconds(2))
+    // Wait for handshake to settle (Node B also calls getSession which may replace ours)
+    try await Task.sleep(for: .seconds(3))
 
     // Re-fetch session (handshake may have replaced the original)
     let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
     session1 = s
+    // Set handler on re-fetched session too in case it's a different object
     await s.onReceive { data in
         await messageCounter.increment()
     }
@@ -703,9 +714,12 @@ do {
     await messageCounter.reset()
     await sendControl("phase5-start")
 
-    // Create session, wait for handshake to settle, re-fetch
-    let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
-    try await Task.sleep(for: .seconds(2))
+    // Create session, set handler, wait for handshake to settle, re-fetch
+    let initialSession5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
+    await initialSession5.onReceive { data in
+        await messageCounter.increment()
+    }
+    try await Task.sleep(for: .seconds(3))
     let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
     await session5.onReceive { data in
         await messageCounter.increment()
