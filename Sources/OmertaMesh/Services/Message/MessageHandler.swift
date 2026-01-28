@@ -93,10 +93,8 @@ public actor MessageHandler {
 
         do {
             let receiptData = try JSONCoding.encoder.encode(receipt)
-            // Use a standard receipt channel - the sender knows their own peerId for the channel name
-            // but we send to their machine directly
-            let myPeerId = await provider.peerId
-            let receiptChannel = MessageChannels.receipt(for: myPeerId)
+            // Use sender's machineId for the receipt channel so they know where to listen
+            let receiptChannel = MessageChannels.receipt(for: machineId)
             try await provider.sendOnChannel(receiptData, toMachine: machineId, channel: receiptChannel)
             logger.debug("Sent receipt for \(message.messageId) to machine \(machineId.prefix(8))...")
         } catch {

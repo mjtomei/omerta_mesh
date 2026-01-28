@@ -92,10 +92,10 @@ public actor HealthHandler {
         }
 
         // Send response directly to the requesting machine
+        // Use requester's machineId for the response channel so they know where to listen
         do {
             let responseData = try JSONCoding.encoder.encode(response)
-            let myPeerId = await provider.peerId
-            let responseChannel = HealthChannels.response(for: myPeerId)
+            let responseChannel = HealthChannels.response(for: machineId)
             try await provider.sendOnChannel(responseData, toMachine: machineId, channel: responseChannel)
             logger.debug("Sent health response to machine \(machineId.prefix(8))... on \(responseChannel)")
         } catch {
