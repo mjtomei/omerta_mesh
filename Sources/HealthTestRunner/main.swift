@@ -474,7 +474,7 @@ if !isNodeA {
             await sendControl("phase5-done", detail: "\(await messageCounter.count)")
 
         case "phase6-block":
-            // Node B blocks incoming UDP from Node A locally
+            // Node B blocks incoming UDP from Node A locally, auto-unblocks after 15s
             let blockPort = cmd.detail ?? "\(port)"
             #if os(macOS)
             let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
@@ -485,17 +485,17 @@ if !isNodeA {
             logger.info("Node B iptables block: exit=\(exitCode) \(out)")
             #endif
             await sendControl("phase6-ack")
-
-        case "phase6-unblock":
-            #if os(macOS)
-            let (exitCode, out) = await shell("pfctl -d")
-            logger.info("Node B pfctl unblock: exit=\(exitCode) \(out)")
-            #else
-            let blockPort = cmd.detail ?? "\(port)"
-            let (exitCode, out) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
-            logger.info("Node B iptables unblock: exit=\(exitCode) \(out)")
-            #endif
-            await sendControl("phase6-unblock-ack")
+            // Auto-unblock after 15s (can't receive unblock command while blocked)
+            Task {
+                try? await Task.sleep(for: .seconds(15))
+                #if os(macOS)
+                let (ec, o) = await shell("pfctl -d")
+                logger.info("Node B pfctl auto-unblock: exit=\(ec) \(o)")
+                #else
+                let (ec, o) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
+                logger.info("Node B iptables auto-unblock: exit=\(ec) \(o)")
+                #endif
+            }
 
         case "phase6-check":
             // Report session count
@@ -597,6 +597,7 @@ do {
            detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
 
     monitor = await manager.getHealthMonitor(for: remoteMachineId)
+    logger.info("Health monitor for \(remoteMachineId): \(monitor != nil ? "found" : "NOT found")")
 } catch {
     record("Phase 1: Baseline Traffic", passed: false, detail: "Error: \(error)")
 }
@@ -755,9 +756,8 @@ do {
     let unblockLinux = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockLinux) }
-    await cleanup.register { await sendControl("phase6-unblock"); _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10)) }
 
-    // Tell Node B to block, then block locally
+    // Tell Node B to block with auto-unblock after 15s, then block locally
     await sendControl("phase6-block", detail: "\(port)")
     _ = await waitForAck("phase6-ack", timeout: .seconds(10))
     let (_, _) = await shell(blockLinux)
@@ -775,17 +775,18 @@ do {
         }
     }
 
-    // Unblock both
+    // Unblock Linux side immediately
     let (_, _) = await shell(unblockLinux)
-    await sendControl("phase6-unblock")
-    _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10))
-    logger.info("Bidirectional block removed")
+    logger.info("Linux iptables unblocked")
 
-    try await Task.sleep(for: .seconds(3))
+    // Node B auto-unblocks after 15s from when it blocked.
+    // Wait for Node B to self-unblock and mesh to reconnect.
+    logger.info("Waiting for Node B auto-unblock and mesh reconnect...")
+    try await Task.sleep(for: .seconds(10))
 
-    // Check Node B's state
+    // Now try to reach Node B via control channel
     await sendControl("phase6-check")
-    let phase6BMsg = await controlMailbox.receive(timeout: .seconds(15))
+    let phase6BMsg = await controlMailbox.receive(timeout: .seconds(30))
     let bSessionCount = phase6BMsg.flatMap { Int($0.detail ?? "") } ?? -1
 
     record("Phase 6: Bidirectional Block", passed: phase6Pass,
