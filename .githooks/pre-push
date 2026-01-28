@@ -1,0 +1,48 @@
+#!/bin/bash
+# Git pre-push hook - checks for large files and license compliance before push
+# Setup: git config core.hooksPath .githooks
+
+set -e
+
+MAX_SIZE_KB=1024  # 1MB
+
+# Get the remote and URL being pushed to
+remote="$1"
+url="$2"
+
+# Read the refs being pushed
+while read local_ref local_sha remote_ref remote_sha; do
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        # Deleting a ref, nothing to check
+        continue
+    fi
+
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # New branch, check all files in the branch
+        FILES=$(git ls-tree -r --name-only "$local_sha")
+    else
+        # Existing branch, check changed files
+        FILES=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || git ls-tree -r --name-only "$local_sha")
+    fi
+
+    # Check for large files
+    FOUND_LARGE=0
+    for file in $FILES; do
+        # Get file size from the commit being pushed
+        SIZE=$(git cat-file -s "$local_sha:$file" 2>/dev/null || echo 0)
+        SIZE_KB=$((SIZE / 1024))
+
+        if [ "$SIZE_KB" -gt "$MAX_SIZE_KB" ]; then
+            echo "ERROR: Large file: $file (${SIZE_KB}KB > ${MAX_SIZE_KB}KB)"
+            FOUND_LARGE=1
+        fi
+    done
+
+    if [ $FOUND_LARGE -eq 1 ]; then
+        echo ""
+        echo "Push blocked. Use Git LFS for large files or: git push --no-verify"
+        exit 1
+    fi
+done
+
+exit 0
