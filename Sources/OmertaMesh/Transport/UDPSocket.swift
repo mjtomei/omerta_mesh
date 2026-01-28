@@ -216,6 +216,7 @@ public actor UDPSocket {
             // IPv4 socket - can only send to IPv4
             // If we get an IPv6 address, this is an error
             if case .v6 = address {
+                logger.warning("Address mismatch: trying to send to IPv6 \(address) on IPv4 socket")
                 throw UDPSocketError.addressMismatch("Cannot send IPv6 address on IPv4 socket")
             }
             return address

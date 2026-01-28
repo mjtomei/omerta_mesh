@@ -70,6 +70,11 @@ let package = Package(
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
         ]),
+        .target(
+            name: "OmertaNetwork",
+            dependencies: ["OmertaMesh", "OmertaTunnel"]
+        ),
         .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaMesh"]),
+        .testTarget(name: "OmertaNetworkTests", dependencies: ["OmertaNetwork", "OmertaMesh"]),
     ]
 )

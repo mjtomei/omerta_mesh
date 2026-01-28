@@ -1567,9 +1567,15 @@ public actor MeshNode {
     /// - Returns: PingResult with latency and gossip info, or nil if failed
     public func sendPingWithDetails(to targetPeerId: PeerId, timeout: TimeInterval = 3.0, requestFullList: Bool = false) async -> PingResult? {
         // Get the endpoint for this peer
-        guard let endpoint = await endpointManager.getAllEndpoints(peerId: targetPeerId).first else {
+        let allEndpoints = await endpointManager.getAllEndpoints(peerId: targetPeerId)
+        guard let endpoint = allEndpoints.first else {
             logger.debug("sendPing: No endpoint for peer \(targetPeerId)")
             return nil
+        }
+
+        // Log endpoint selection for debugging (helps diagnose IPv4/IPv6 mismatch issues)
+        if allEndpoints.count > 1 {
+            logger.debug("sendPing: Selected endpoint \(endpoint) from \(allEndpoints.count) available for \(targetPeerId.prefix(8))...")
         }
 
         // Build our recentPeers to send (with machineId and NAT type)
@@ -1649,7 +1655,7 @@ public actor MeshNode {
             }
             return nil
         } catch {
-            logger.debug("sendPing: Failed to ping \(targetPeerId): \(error)")
+            logger.warning("sendPing: Failed to ping \(targetPeerId.prefix(8))... at \(endpoint): \(error)")
 
             // Log latency loss
             await eventLogger?.recordLatencyLoss(peerId: targetPeerId)
