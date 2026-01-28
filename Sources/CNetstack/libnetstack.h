@@ -126,6 +126,11 @@ extern int NetstackGetStats(uint64_t handle, uint32_t* tcpConns, uint32_t* udpCo
 // Returns a connection handle (>0) on success, 0 on failure.
 extern uint64_t NetstackDialTCP(uint64_t stackHandle, char* host, uint16_t port);
 
+// NetstackDialTCPByName resolves a hostname via DNS through the stack's network,
+// then creates a TCP connection to the resolved address.
+// Returns a connection handle (>0) on success, 0 on failure.
+extern uint64_t NetstackDialTCPByName(uint64_t stackHandle, char* host, uint16_t port);
+
 // NetstackConnRead reads data from a TCP connection.
 // Returns number of bytes read, 0 on EOF, -1 on error.
 extern int NetstackConnRead(uint64_t connHandle, uint8_t* buf, size_t maxLen);

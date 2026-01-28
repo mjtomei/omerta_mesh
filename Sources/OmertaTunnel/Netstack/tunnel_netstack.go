@@ -513,6 +513,76 @@ func (s *Stack) DialTCP(host string, port uint16) (*TCPConnection, error) {
 	}, nil
 }
 
+// DialTCPByName resolves a hostname through the stack's network (DNS over UDP
+// routed through the virtual NIC) and then dials TCP to the resolved address.
+// This ensures DNS queries travel through the same tunnel path as data traffic.
+func (s *Stack) DialTCPByName(host string, port uint16) (*TCPConnection, error) {
+	// If the host is already an IP address, just use DialTCP directly
+	if ip := net.ParseIP(host); ip != nil {
+		return s.DialTCP(host, port)
+	}
+
+	// Create a custom resolver that sends DNS queries through our gVisor stack.
+	// We always use 8.8.8.8:53 because the system resolver (e.g. 127.0.0.53)
+	// is unreachable from inside the userspace network stack.
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dnsAddr, err := parseIPAddress("8.8.8.8")
+			if err != nil {
+				return nil, err
+			}
+
+			fullAddr := tcpip.FullAddress{
+				Addr: dnsAddr,
+				Port: 53,
+			}
+
+			// Dial UDP through the gVisor stack — this generates UDP packets
+			// that exit via the channel endpoint, get routed through the mesh
+			// to the gateway, and reach a real DNS server
+			conn, err := gonet.DialUDP(s.stack, nil, &fullAddr, ipv4.ProtocolNumber)
+			if err != nil {
+				return nil, fmt.Errorf("gonet UDP dial to DNS failed: %v", err)
+			}
+			return conn, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, TCPConnectTimeout)
+	defer cancel()
+
+	addrs, err := resolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS resolution failed for %q: %v", host, err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no addresses found for %q", host)
+	}
+
+	// Filter to IPv4 addresses only (our stack uses ipv4.ProtocolNumber)
+	var ipv4Addrs []string
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			ipv4Addrs = append(ipv4Addrs, addr)
+		}
+	}
+	if len(ipv4Addrs) == 0 {
+		return nil, fmt.Errorf("no IPv4 addresses found for %q", host)
+	}
+
+	// Try each resolved address until one succeeds
+	var lastErr error
+	for _, addr := range ipv4Addrs {
+		conn, err := s.DialTCP(addr, port)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("all addresses failed for %q: %v", host, lastErr)
+}
+
 // Read reads data from the TCP connection
 func (tc *TCPConnection) Read(buf []byte) (int, error) {
 	return tc.conn.Read(buf)

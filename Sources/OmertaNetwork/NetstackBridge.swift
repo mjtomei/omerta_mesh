@@ -332,6 +332,34 @@ public final class NetstackBridge: NetstackBridgeProtocol, @unchecked Sendable {
         return NetstackTCPConnection(handle: connHandle)
     }
 
+    /// Dial TCP by hostname — resolves DNS through the stack's network, then connects.
+    public func dialTCPByName(host: String, port: UInt16) throws -> NetstackTCPConnection {
+        lock.lock()
+        let h = handle
+        let running = isRunning
+        lock.unlock()
+
+        guard running, h != 0 else {
+            throw NetstackError.notStarted
+        }
+
+        let cHost = host.withCString { strdup($0) }
+        defer { free(cHost) }
+
+        let connHandle = NetstackDialTCPByName(h, cHost, port)
+        if connHandle == 0 {
+            throw NetstackError.initializationFailed
+        }
+
+        logger.info("TCP connection established (by name)", metadata: [
+            "host": "\(host)",
+            "port": "\(port)",
+            "handle": "\(connHandle)"
+        ])
+
+        return NetstackTCPConnection(handle: connHandle)
+    }
+
     /// Called from C when a packet is returned
     fileprivate func handleReturnPacket(_ data: Data) {
         lock.lock()
@@ -346,7 +374,16 @@ public final class NetstackBridge: NetstackBridgeProtocol, @unchecked Sendable {
     /// Satisfies the protocol's `dialTCP(host:port:) async throws -> TCPConnection` requirement
     /// by wrapping the sync `NetstackTCPConnection` in an adapter.
     public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection {
-        let conn = try dialTCP(host: host, port: port) as NetstackTCPConnection
+        // If host is a domain name (not a raw IP), use dialTCPByName which
+        // resolves DNS through the gVisor stack's network path
+        let isIP = host.split(separator: ".").count == 4 &&
+                   host.split(separator: ".").allSatisfy { UInt8($0) != nil }
+        let conn: NetstackTCPConnection
+        if isIP {
+            conn = try dialTCP(host: host, port: port) as NetstackTCPConnection
+        } else {
+            conn = try dialTCPByName(host: host, port: port)
+        }
         return NetstackTCPConnectionWrapper(conn: conn, host: host, port: port)
     }
 }

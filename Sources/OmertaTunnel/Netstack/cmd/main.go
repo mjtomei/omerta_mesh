@@ -187,6 +187,33 @@ func NetstackDialTCP(stackHandle C.uint64_t, host *C.char, port C.uint16_t) C.ui
 	return C.uint64_t(id)
 }
 
+//export NetstackDialTCPByName
+// NetstackDialTCPByName resolves a hostname via DNS through the stack's network,
+// then creates a TCP connection to the resolved address.
+// Returns a connection handle (>0) on success, 0 on failure.
+func NetstackDialTCPByName(stackHandle C.uint64_t, host *C.char, port C.uint16_t) C.uint64_t {
+	stacksMu.RLock()
+	stack, ok := stacks[uint64(stackHandle)]
+	stacksMu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	conn, err := stack.DialTCPByName(C.GoString(host), uint16(port))
+	if err != nil {
+		return 0
+	}
+
+	connsMu.Lock()
+	id := nextConnID
+	nextConnID++
+	conns[id] = conn
+	connsMu.Unlock()
+
+	return C.uint64_t(id)
+}
+
 //export NetstackConnRead
 // NetstackConnRead reads data from a TCP connection.
 // Returns number of bytes read, 0 on EOF, -1 on error.
