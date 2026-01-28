@@ -96,6 +96,16 @@ LoggingSystem.bootstrap { label in
 
 let logger = Logger(label: "health-test")
 
+// MARK: - Root Check
+
+#if canImport(Glibc) || canImport(Darwin)
+if getuid() != 0 {
+    logger.error("HealthTestRunner must be run as root (for iptables/pfctl/ip commands)")
+    logger.error("Usage: sudo .build/debug/HealthTestRunner --role nodeA ...")
+    exit(1)
+}
+#endif
+
 // MARK: - Argument Parsing
 
 var role: String = "nodeA"
@@ -164,11 +174,11 @@ struct NetworkSnapshot: Equatable {
 
     static func capture() async -> NetworkSnapshot {
         #if os(Linux)
-        let (_, ipt) = await shell("sudo iptables-save 2>/dev/null | grep -v '^#' | grep -v '^:' | sort")
+        let (_, ipt) = await shell("iptables-save 2>/dev/null | grep -v '^#' | grep -v '^:' | sort")
         let (_, ips) = await shell("ip -4 addr show | grep 'inet ' | awk '{print $2, $NF}' | sort")
         return NetworkSnapshot(iptablesRules: ipt, ipAddresses: ips)
         #else
-        let (_, pfctl) = await shell("sudo pfctl -sr 2>/dev/null || true")
+        let (_, pfctl) = await shell("pfctl -sr 2>/dev/null || true")
         let (_, ips) = await shell("ifconfig | grep 'inet ' | awk '{print $2}' | sort")
         return NetworkSnapshot(iptablesRules: pfctl, ipAddresses: ips)
         #endif
@@ -423,8 +433,28 @@ if !isNodeA {
             await sendControl("phase5-done", detail: "\(await messageCounter.count)")
 
         case "phase6-block":
-            // Node B does nothing special during block — just waits
+            // Node B blocks incoming UDP from Node A locally
+            let blockPort = cmd.detail ?? "\(port)"
+            #if os(macOS)
+            let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
+            logger.info("Node B pfctl block: exit=\(exitCode) \(out)")
+            #else
+            let nodeAHost = cmd.detail ?? remoteHost
+            let (exitCode, out) = await shell("iptables -A INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP")
+            logger.info("Node B iptables block: exit=\(exitCode) \(out)")
+            #endif
             await sendControl("phase6-ack")
+
+        case "phase6-unblock":
+            #if os(macOS)
+            let (exitCode, out) = await shell("pfctl -d")
+            logger.info("Node B pfctl unblock: exit=\(exitCode) \(out)")
+            #else
+            let blockPort = cmd.detail ?? "\(port)"
+            let (exitCode, out) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
+            logger.info("Node B iptables unblock: exit=\(exitCode) \(out)")
+            #endif
+            await sendControl("phase6-unblock-ack")
 
         case "phase6-check":
             // Report session count
@@ -565,8 +595,8 @@ if let monitor {
 logPhase("Phase 4: Unidirectional Block — Failure Detection")
 
 do {
-    let blockCmd = "sudo iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockCmd = "sudo iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockCmd) }
     let (blockExit, blockOut) = await shell(blockCmd)
@@ -629,20 +659,17 @@ do {
     let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bidir")
     try await Task.sleep(for: .seconds(2))
 
-    let blockLinux = "sudo iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockLinux = "sudo iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let blockMac = "ssh mac \"echo 'block drop quick proto udp from any to any port \(port)' | sudo pfctl -ef -\""
-    let unblockMac = "ssh mac \"sudo pfctl -d\""
+    let blockLinux = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockLinux = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockLinux) }
-    await cleanup.register { let _ = await shell(unblockMac) }
+    await cleanup.register { await sendControl("phase6-unblock"); _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10)) }
 
-    await sendControl("phase6-block")
+    // Tell Node B to block, then block locally
+    await sendControl("phase6-block", detail: "\(port)")
     _ = await waitForAck("phase6-ack", timeout: .seconds(10))
-
     let (_, _) = await shell(blockLinux)
-    let (_, _) = await shell(blockMac)
-    logger.info("Bidirectional block applied")
+    logger.info("Bidirectional block applied (local iptables + remote via control channel)")
 
     // Wait for failure detection on Node A
     var phase6Pass = false
@@ -658,7 +685,8 @@ do {
 
     // Unblock both
     let (_, _) = await shell(unblockLinux)
-    let (_, _) = await shell(unblockMac)
+    await sendControl("phase6-unblock")
+    _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10))
     logger.info("Bidirectional block removed")
 
     try await Task.sleep(for: .seconds(3))
@@ -681,8 +709,8 @@ do {
     let session7 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-transient")
     try await Task.sleep(for: .seconds(2))
 
-    let blockCmd = "sudo iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockCmd = "sudo iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockCmd) }
 
@@ -714,8 +742,8 @@ do {
     await sendControl("phase8-start")
     _ = await waitForAck("phase8-ack", timeout: .seconds(10))
 
-    let blockCmd = "sudo iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockCmd = "sudo iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockCmd) }
 
@@ -775,8 +803,8 @@ do {
     }
     logger.info("Selected temp IP: \(tempIP) (existing: \(usedIPs.sorted()))")
 
-    let addCmd = "sudo ip addr add \(tempIP)/24 dev \(iface)"
-    let delCmd = "sudo ip addr del \(tempIP)/24 dev \(iface)"
+    let addCmd = "ip addr add \(tempIP)/24 dev \(iface)"
+    let delCmd = "ip addr del \(tempIP)/24 dev \(iface)"
 
     await cleanup.register { let _ = await shell(delCmd) }
 
