@@ -18,9 +18,12 @@ struct BuildNetstackPlugin: BuildToolPlugin {
 
         let netstackDir = packageDir.appending(subpath: "Sources/OmertaTunnel/Netstack")
 
-        // Use /bin/sh with explicit PATH so sandbox doesn't strip tool access
+        // Use /bin/sh with explicit PATH and HOME so sandbox doesn't strip
+        // tool access or Go module cache location
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
         let script = """
             export PATH=/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+            export HOME="\(home)"
             make -C "\(netstackDir.string)" install
             """
 
