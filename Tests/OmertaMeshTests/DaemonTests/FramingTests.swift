@@ -167,11 +167,12 @@ final class FramingTests: XCTestCase {
     func testBinaryLengthReading() {
         // Big-endian [0, 0, 1, 0] should be 256
         let bytes: [UInt8] = [0, 0, 1, 0]
-        let data = Data(bytes)
 
-        let length = data.withUnsafeBytes { ptr in
-            UInt32(bigEndian: ptr.load(as: UInt32.self))
-        }
+        // Construct UInt32 from bytes manually to avoid alignment issues on Linux
+        let length = UInt32(bytes[0]) << 24 |
+                     UInt32(bytes[1]) << 16 |
+                     UInt32(bytes[2]) << 8 |
+                     UInt32(bytes[3])
 
         XCTAssertEqual(length, 256)
     }
