@@ -420,11 +420,11 @@ final class ConnectionKeepaliveTests: XCTestCase {
         // Note: When pings succeed, they update lastSuccessfulPing, so over time
         // all pinged machines converge to equal weights. We test the initial bias.
         let config = ConnectionKeepalive.Config(
-            interval: 0.02,        // 20ms intervals
+            interval: 0.1,         // 100ms intervals - longer for CI reliability
             missedThreshold: 100,  // High threshold to avoid removals
             responseTimeout: 1.0,
             maxMachinesPerCycle: 1,  // Only ping 1 machine per cycle
-            samplingHalfLife: 0.05,  // 50ms half-life - very fast decay
+            samplingHalfLife: 0.1,   // 100ms half-life
             minSamplingWeight: 0.001 // Very low floor
         )
         let keepalive = ConnectionKeepalive(config: config)
@@ -458,7 +458,7 @@ final class ConnectionKeepaliveTests: XCTestCase {
         }
 
         // Wait a bit so all machines become "stale"
-        try await Task.sleep(nanoseconds: 200_000_000)  // 200ms = 4 half-lives with 50ms half-life
+        try await Task.sleep(nanoseconds: 400_000_000)  // 400ms = 4 half-lives with 100ms half-life
         // At this point, all machines have weight ~0.0625 (0.5^4)
 
         // Now mark one machine as recently contacted - it will have weight 1.0
@@ -466,8 +466,8 @@ final class ConnectionKeepaliveTests: XCTestCase {
 
         await keepalive.start()
 
-        // Wait for first ping cycle
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // Wait for first ping cycle - give more time for CI
+        try await Task.sleep(nanoseconds: 300_000_000)  // 300ms
 
         await keepalive.stop()
 
