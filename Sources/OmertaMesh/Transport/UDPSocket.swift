@@ -131,45 +131,30 @@ public actor UDPSocket {
         // Convert address if needed for socket type compatibility
         let sendAddress = try convertAddressForSocket(address)
 
-        // Retry logic for transient errors (especially macOS ICMP error caching)
-        let maxRetries = 3
-        var lastError: Error?
+        let buffer = channel.allocator.buffer(bytes: data)
+        let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
 
-        for attempt in 1...maxRetries {
-            // Create fresh buffer and envelope for each attempt
-            // This ensures no stale state from previous attempts
-            let buffer = channel.allocator.buffer(bytes: data)
-            let envelope = AddressedEnvelope(remoteAddress: sendAddress, data: buffer)
+        logger.info("UDP sending \(data.count) bytes to \(sendAddress)")
+        do {
+            try await channel.writeAndFlush(envelope)
+            logger.info("UDP sent \(data.count) bytes to \(sendAddress)")
+        } catch {
+            let errorString = "\(error)"
 
-            logger.info("UDP sending \(data.count) bytes to \(sendAddress)")
-            do {
-                try await channel.writeAndFlush(envelope)
-                logger.info("UDP sent \(data.count) bytes to \(sendAddress)")
-                return  // Success
-            } catch {
-                lastError = error
-                let errorString = "\(error)"
+            // Check if this is a known transient/spurious error
+            // On macOS, stale ICMP errors can be reported on UDP sends even when the
+            // network is fine. The packet may still have been sent. Log and continue
+            // rather than failing - let higher-level timeouts handle true failures.
+            let isSpuriousError = errorString.lowercased().contains("unreachable") ||
+                                  errorString.lowercased().contains("connection refused")
 
-                // Check if this is a transient error worth retrying
-                // "host unreachable" and "network unreachable" are often stale ICMP errors on macOS
-                let isTransientError = errorString.lowercased().contains("unreachable") ||
-                                       errorString.lowercased().contains("connection refused")
-
-                if isTransientError && attempt < maxRetries {
-                    logger.warning("UDP send attempt \(attempt) failed (transient): \(error), retrying...")
-                    // Longer delay before retry to allow error state to clear
-                    // macOS can cache ICMP errors for extended periods
-                    try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                    continue
-                }
-
-                logger.error("UDP send failed to \(sendAddress): \(error)")
-                throw UDPSocketError.sendFailed(destination: "\(sendAddress)", byteCount: data.count, underlying: error)
+            if isSpuriousError {
+                logger.warning("UDP send reported spurious error (packet may have been sent): \(error)")
+                // Don't throw - let higher-level timeout mechanisms handle actual failures
+                return
             }
-        }
 
-        // Should not reach here, but just in case
-        if let error = lastError {
+            logger.error("UDP send failed to \(sendAddress): \(error)")
             throw UDPSocketError.sendFailed(destination: "\(sendAddress)", byteCount: data.count, underlying: error)
         }
     }
