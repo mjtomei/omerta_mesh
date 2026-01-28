@@ -340,6 +340,26 @@ public actor TunnelManager {
                     try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
                 }
 
+                // Start health monitor for this machine if first session
+                if healthMonitors[machineId] == nil {
+                    let monitor = TunnelHealthMonitor(
+                        minProbeInterval: config.healthProbeMinInterval,
+                        maxProbeInterval: config.healthProbeMaxInterval,
+                        failureThreshold: config.healthFailureThreshold
+                    )
+                    healthMonitors[machineId] = monitor
+                    await monitor.startMonitoring(
+                        machineId: machineId,
+                        sendProbe: { [weak self] id in
+                            guard let self else { return }
+                            try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                        },
+                        onFailure: { [weak self] id in
+                            await self?.handleHealthFailure(machineId: id)
+                        }
+                    )
+                }
+
                 logger.info("Session accepted", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
 
                 if let handler = sessionEstablishedHandler {
