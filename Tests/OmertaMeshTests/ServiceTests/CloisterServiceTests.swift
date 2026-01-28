@@ -15,16 +15,16 @@ final class CloisterServiceTests: XCTestCase {
         // Start handler
         try await handler.start()
         let negotiateRegistered = await provider.hasHandler(for: CloisterChannels.negotiate)
-        let shareRegistered = await provider.hasHandler(for: CloisterChannels.share)
+        let inviteKeyExchangeRegistered = await provider.hasHandler(for: CloisterChannels.inviteKeyExchange)
         XCTAssertTrue(negotiateRegistered)
-        XCTAssertTrue(shareRegistered)
+        XCTAssertTrue(inviteKeyExchangeRegistered)
 
         // Stop handler
         await handler.stop()
         let negotiateUnregistered = await provider.hasHandler(for: CloisterChannels.negotiate)
-        let shareUnregistered = await provider.hasHandler(for: CloisterChannels.share)
+        let inviteKeyExchangeUnregistered = await provider.hasHandler(for: CloisterChannels.inviteKeyExchange)
         XCTAssertFalse(negotiateUnregistered)
-        XCTAssertFalse(shareUnregistered)
+        XCTAssertFalse(inviteKeyExchangeUnregistered)
     }
 
     func testCloisterHandlerAlreadyRunningError() async throws {

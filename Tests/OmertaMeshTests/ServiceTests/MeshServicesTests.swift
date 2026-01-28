@@ -26,12 +26,12 @@ final class MeshServicesTests: XCTestCase {
         let healthRegistered = await provider.hasHandler(for: HealthChannels.request)
         let messageRegistered = await provider.hasHandler(for: MessageChannels.inbox(for: "services-peer"))
         let cloisterNegotiateRegistered = await provider.hasHandler(for: CloisterChannels.negotiate)
-        let cloisterShareRegistered = await provider.hasHandler(for: CloisterChannels.share)
+        let cloisterInviteKeyExchangeRegistered = await provider.hasHandler(for: CloisterChannels.inviteKeyExchange)
 
         XCTAssertTrue(healthRegistered, "Health handler should be registered")
         XCTAssertTrue(messageRegistered, "Message handler should be registered")
         XCTAssertTrue(cloisterNegotiateRegistered, "Cloister negotiate handler should be registered")
-        XCTAssertTrue(cloisterShareRegistered, "Cloister share handler should be registered")
+        XCTAssertTrue(cloisterInviteKeyExchangeRegistered, "Cloister invite key exchange handler should be registered")
 
         await services.stopAllHandlers()
     }
@@ -47,12 +47,12 @@ final class MeshServicesTests: XCTestCase {
         let healthRegistered = await provider.hasHandler(for: HealthChannels.request)
         let messageRegistered = await provider.hasHandler(for: MessageChannels.inbox(for: "services-peer"))
         let cloisterNegotiateRegistered = await provider.hasHandler(for: CloisterChannels.negotiate)
-        let cloisterShareRegistered = await provider.hasHandler(for: CloisterChannels.share)
+        let cloisterInviteKeyExchangeRegistered = await provider.hasHandler(for: CloisterChannels.inviteKeyExchange)
 
         XCTAssertFalse(healthRegistered, "Health handler should be unregistered")
         XCTAssertFalse(messageRegistered, "Message handler should be unregistered")
         XCTAssertFalse(cloisterNegotiateRegistered, "Cloister negotiate handler should be unregistered")
-        XCTAssertFalse(cloisterShareRegistered, "Cloister share handler should be unregistered")
+        XCTAssertFalse(cloisterInviteKeyExchangeRegistered, "Cloister invite key exchange handler should be unregistered")
     }
 
     func testMeshServicesStartIndividualHandlers() async throws {

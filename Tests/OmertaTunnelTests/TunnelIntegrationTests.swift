@@ -35,7 +35,8 @@ final class TunnelIntegrationTests: XCTestCase {
         await mesh2.addPeer(identity1.peerId, endpoint: "127.0.0.1:\(port1)")
 
         // Wait for the mesh to process the peer additions
-        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+        // CI environments need more time for network setup
+        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
     }
 
     // MARK: - Two-Peer Session Tests
@@ -466,7 +467,8 @@ final class TunnelIntegrationTests: XCTestCase {
         await mesh2.addPeer(identity1.peerId, endpoint: "127.0.0.1:\(port1)")
 
         // Wait for the mesh to process peer additions
-        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+        // CI environments need more time for network setup
+        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
 
         // Create tunnel managers
         let tunnel1 = TunnelManager(provider: mesh1)
