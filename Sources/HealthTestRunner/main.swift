@@ -516,14 +516,19 @@ var session1: TunnelSession? = nil
 var monitor: TunnelHealthMonitor? = nil
 
 do {
+    // Tell Node B to start phase 1 — both sides create sessions
+    await sendControl("phase1-start")
+
+    // Create our session, then wait for handshake to settle
+    let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
+    try await Task.sleep(for: .seconds(2))
+
+    // Re-fetch session (handshake may have replaced the original)
     let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
     session1 = s
     await s.onReceive { data in
         await messageCounter.increment()
     }
-
-    // Tell Node B to start phase 1
-    await sendControl("phase1-start")
 
     // Send 10 messages from A
     for i in 1...10 {
@@ -658,6 +663,9 @@ do {
     await messageCounter.reset()
     await sendControl("phase5-start")
 
+    // Create session, wait for handshake to settle, re-fetch
+    let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
+    try await Task.sleep(for: .seconds(2))
     let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
     await session5.onReceive { data in
         await messageCounter.increment()
