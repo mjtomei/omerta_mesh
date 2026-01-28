@@ -512,82 +512,101 @@ func record(_ name: String, passed: Bool, detail: String) {
 
 logPhase("Phase 1: Baseline Bidirectional Traffic")
 
-let session1 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
-await session1.onReceive { data in
-    await messageCounter.increment()
+var session1: TunnelSession? = nil
+var monitor: TunnelHealthMonitor? = nil
+
+do {
+    let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
+    session1 = s
+    await s.onReceive { data in
+        await messageCounter.increment()
+    }
+
+    // Tell Node B to start phase 1
+    await sendControl("phase1-start")
+
+    // Send 10 messages from A
+    for i in 1...10 {
+        try await s.send(Data("A-msg-\(i)".utf8))
+        try await Task.sleep(for: .milliseconds(100))
+    }
+
+    // Wait for Node B to finish
+    let phase1Ack = await waitForAck("phase1-done", timeout: .seconds(30))
+    try await Task.sleep(for: .seconds(2)) // let straggler messages arrive
+
+    let phase1Received = await messageCounter.count
+    let phase1Pass = phase1Ack && phase1Received >= 5 // at least some messages arrived
+    record("Phase 1: Baseline Traffic", passed: phase1Pass,
+           detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
+
+    monitor = await manager.getHealthMonitor(for: remoteMachineId)
+} catch {
+    record("Phase 1: Baseline Traffic", passed: false, detail: "Error: \(error)")
 }
-
-// Tell Node B to start phase 1
-await sendControl("phase1-start")
-
-// Send 10 messages from A
-for i in 1...10 {
-    try await session1.send(Data("A-msg-\(i)".utf8))
-    try await Task.sleep(for: .milliseconds(100))
-}
-
-// Wait for Node B to finish
-let phase1Ack = await waitForAck("phase1-done", timeout: .seconds(30))
-try await Task.sleep(for: .seconds(2)) // let straggler messages arrive
-
-let phase1Received = await messageCounter.count
-let phase1Pass = phase1Ack && phase1Received >= 5 // at least some messages arrived
-record("Phase 1: Baseline Traffic", passed: phase1Pass,
-       detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
 
 // MARK: - Phase 2: Idle & Probe Backoff
 
 logPhase("Phase 2: Idle & Probe Backoff")
 
-await messageCounter.reset()
+do {
+    await messageCounter.reset()
 
-var probeIntervals: [Duration] = []
-let monitor = await manager.getHealthMonitor(for: remoteMachineId)
+    var probeIntervals: [Duration] = []
 
-if let monitor {
-    // Log probe interval every 2s for 30s
-    for _ in 0..<15 {
-        try await Task.sleep(for: .seconds(2))
-        let interval = await monitor._currentProbeInterval
-        probeIntervals.append(interval)
-        logger.info("  Probe interval: \(interval)")
+    if let monitor {
+        // Log probe interval every 2s for 30s
+        for _ in 0..<15 {
+            try await Task.sleep(for: .seconds(2))
+            let interval = await monitor._currentProbeInterval
+            probeIntervals.append(interval)
+            logger.info("  Probe interval: \(interval)")
+        }
+
+        // Check that interval increased from min (2s) toward max (10s)
+        let firstInterval = probeIntervals.first ?? .seconds(2)
+        let lastInterval = probeIntervals.last ?? .seconds(2)
+        let phase2Pass = lastInterval > firstInterval
+        record("Phase 2: Idle Probe Backoff", passed: phase2Pass,
+               detail: "interval went from \(firstInterval) to \(lastInterval)")
+    } else {
+        record("Phase 2: Idle Probe Backoff", passed: false,
+               detail: "No health monitor found for remote machine")
     }
-
-    // Check that interval increased from min (2s) toward max (10s)
-    let firstInterval = probeIntervals.first ?? .seconds(2)
-    let lastInterval = probeIntervals.last ?? .seconds(2)
-    let phase2Pass = lastInterval > firstInterval
-    record("Phase 2: Idle Probe Backoff", passed: phase2Pass,
-           detail: "interval went from \(firstInterval) to \(lastInterval)")
-} else {
-    record("Phase 2: Idle Probe Backoff", passed: false,
-           detail: "No health monitor found for remote machine")
+} catch {
+    record("Phase 2: Idle Probe Backoff", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 3: Traffic Resets Probes
 
 logPhase("Phase 3: Traffic Resets Probes")
 
-// Send burst from A
-for i in 1...5 {
-    try await session1.send(Data("A-burst-\(i)".utf8))
-    await manager.notifyPacketReceived(from: remoteMachineId)
-    try await Task.sleep(for: .milliseconds(100))
-}
-// Also tell B to send burst
-await sendControl("phase3-burst")
-_ = await waitForAck("phase3-burst-done", timeout: .seconds(15))
+do {
+    // Send burst from A
+    if let s = session1 {
+        for i in 1...5 {
+            try await s.send(Data("A-burst-\(i)".utf8))
+            await manager.notifyPacketReceived(from: remoteMachineId)
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+    // Also tell B to send burst
+    await sendControl("phase3-burst")
+    _ = await waitForAck("phase3-burst-done", timeout: .seconds(15))
 
-try await Task.sleep(for: .seconds(1))
+    try await Task.sleep(for: .seconds(1))
 
-if let monitor {
-    let intervalAfterTraffic = await monitor._currentProbeInterval
-    let failuresAfterTraffic = await monitor._consecutiveFailures
-    let phase3Pass = intervalAfterTraffic <= .seconds(2) && failuresAfterTraffic == 0
-    record("Phase 3: Traffic Resets Probes", passed: phase3Pass,
-           detail: "interval=\(intervalAfterTraffic), failures=\(failuresAfterTraffic)")
-} else {
-    record("Phase 3: Traffic Resets Probes", passed: false, detail: "No health monitor")
+    if let monitor {
+        let intervalAfterTraffic = await monitor._currentProbeInterval
+        let failuresAfterTraffic = await monitor._consecutiveFailures
+        let phase3Pass = intervalAfterTraffic <= .seconds(2) && failuresAfterTraffic == 0
+        record("Phase 3: Traffic Resets Probes", passed: phase3Pass,
+               detail: "interval=\(intervalAfterTraffic), failures=\(failuresAfterTraffic)")
+    } else {
+        record("Phase 3: Traffic Resets Probes", passed: false, detail: "No health monitor")
+    }
+} catch {
+    record("Phase 3: Traffic Resets Probes", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 4: Unidirectional Block — Failure Detection
@@ -627,28 +646,39 @@ do {
 
 logPhase("Phase 5: Recovery After Block")
 
-try await Task.sleep(for: .seconds(3)) // let network settle
+do {
+    try await Task.sleep(for: .seconds(3)) // let network settle
 
-await messageCounter.reset()
-await sendControl("phase5-start")
+    // Restart the manager if it was stopped during health failure
+    if await manager.sessionCount == 0 {
+        logger.info("Restarting TunnelManager for recovery test...")
+        try await manager.start()
+    }
 
-let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
-await session5.onReceive { data in
-    await messageCounter.increment()
+    await messageCounter.reset()
+    await sendControl("phase5-start")
+
+    let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
+    await session5.onReceive { data in
+        await messageCounter.increment()
+    }
+
+    for i in 1...5 {
+        try await session5.send(Data("A-recovery-\(i)".utf8))
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
+    let phase5Ack = await waitForAck("phase5-done", timeout: .seconds(30))
+    try await Task.sleep(for: .seconds(2))
+
+    let phase5Received = await messageCounter.count
+    let phase5Pass = phase5Ack && phase5Received >= 2
+    record("Phase 5: Recovery After Block", passed: phase5Pass,
+           detail: "received \(phase5Received) messages, ack=\(phase5Ack)")
+} catch {
+    record("Phase 5: Recovery After Block", passed: false,
+           detail: "Error: \(error)")
 }
-
-for i in 1...5 {
-    try await session5.send(Data("A-recovery-\(i)".utf8))
-    try await Task.sleep(for: .milliseconds(200))
-}
-
-let phase5Ack = await waitForAck("phase5-done", timeout: .seconds(30))
-try await Task.sleep(for: .seconds(2))
-
-let phase5Received = await messageCounter.count
-let phase5Pass = phase5Ack && phase5Received >= 2
-record("Phase 5: Recovery After Block", passed: phase5Pass,
-       detail: "received \(phase5Received) messages, ack=\(phase5Ack)")
 
 // MARK: - Phase 6: Bidirectional Block
 
@@ -698,6 +728,8 @@ do {
 
     record("Phase 6: Bidirectional Block", passed: phase6Pass,
            detail: "A sessions=0: \(phase6Pass), B sessions=\(bSessionCount)")
+} catch {
+    record("Phase 6: Bidirectional Block", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 7: Transient Failure (Block < Threshold)
@@ -728,6 +760,8 @@ do {
     let phase7Pass = count > 0
     record("Phase 7: Transient Failure", passed: phase7Pass,
            detail: "sessions=\(count), session state=\(state)")
+} catch {
+    record("Phase 7: Transient Failure", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 8: Rapid Flapping
@@ -777,6 +811,8 @@ do {
     let phase8Pass = aCount > 0 || canRecover
     record("Phase 8: Rapid Flapping", passed: phase8Pass,
            detail: "A sessions=\(aCount), B sessions=\(bCount), recovered=\(canRecover)")
+} catch {
+    record("Phase 8: Rapid Flapping", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 9: Endpoint Change Detection (Linux only)
@@ -833,6 +869,8 @@ do {
 
     record("Phase 9: Endpoint Change Detection", passed: endpointTestPass,
            detail: "IP add/del on \(iface), mesh still functional: \(endpointTestPass)")
+} catch {
+    record("Phase 9: Endpoint Change Detection", passed: false, detail: "Error: \(error)")
 }
 #else
 record("Phase 9: Endpoint Change Detection", passed: true,
