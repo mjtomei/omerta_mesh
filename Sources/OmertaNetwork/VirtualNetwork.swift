@@ -103,24 +103,21 @@ public actor VirtualNetwork {
     }
 
     private func isInSubnet(_ ip: String) -> Bool {
-        // Parse subnet and netmask to do proper comparison
-        let subnetOctets = parseIPv4(config.subnet)
-        let maskOctets = parseIPv4(config.netmask)
-        let ipOctets = parseIPv4(ip)
-
-        guard subnetOctets.count == 4, maskOctets.count == 4, ipOctets.count == 4 else {
+        // Use CIDR prefix-based check via SubnetSelector utility
+        guard let ipAddr = SubnetSelector.parseIPv4(ip),
+              let subnetAddr = SubnetSelector.parseIPv4(config.subnet) else {
             return false
         }
 
-        for i in 0..<4 {
-            if (ipOctets[i] & maskOctets[i]) != (subnetOctets[i] & maskOctets[i]) {
-                return false
-            }
-        }
-        return true
+        let prefixLength = config.prefixLength
+        guard prefixLength > 0, prefixLength <= 32 else { return false }
+
+        let mask = UInt32.max << (32 - prefixLength)
+        return (ipAddr & mask) == (subnetAddr & mask)
     }
 
-    private func parseIPv4(_ ip: String) -> [UInt8] {
-        ip.split(separator: ".").compactMap { UInt8($0) }
+    /// Get the current config
+    public func getConfig() -> VirtualNetworkConfig {
+        config
     }
 }
