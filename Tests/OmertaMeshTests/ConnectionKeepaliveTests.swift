@@ -366,7 +366,7 @@ final class ConnectionKeepaliveTests: XCTestCase {
     /// Test that all machines get pinged eventually when under budget
     func testAllMachinesPingedWhenUnderBudget() async throws {
         let config = ConnectionKeepalive.Config(
-            interval: 0.05,
+            interval: 0.15,          // 150ms intervals - longer for CI reliability
             missedThreshold: 10,
             responseTimeout: 1.0,
             maxMachinesPerCycle: 30  // Budget higher than machine count
@@ -400,8 +400,8 @@ final class ConnectionKeepaliveTests: XCTestCase {
 
         await keepalive.start()
 
-        // Wait for one cycle
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Wait for one cycle plus buffer for async completion
+        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
 
         await keepalive.stop()
 

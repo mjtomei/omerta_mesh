@@ -217,8 +217,8 @@ public actor CloisterHandler {
 
         do {
             let responseData = try JSONCoding.encoder.encode(response)
-            let myPeerId = await provider.peerId
-            let responseChannel = CloisterChannels.response(for: myPeerId)
+            // Use requester's machineId for the response channel so they know where to listen
+            let responseChannel = CloisterChannels.response(for: machineId)
             try await provider.sendOnChannel(responseData, toMachine: machineId, channel: responseChannel)
         } catch {
             logger.error("Failed to send cloister response to machine \(machineId.prefix(8))...: \(error)")
@@ -311,8 +311,8 @@ public actor CloisterHandler {
 
         do {
             let responseData = try JSONCoding.encoder.encode(response)
-            let myPeerId = await provider.peerId
-            let responseChannel = CloisterChannels.inviteKeyExchangeResponse(for: myPeerId)
+            // Use requester's machineId for the response channel so they know where to listen
+            let responseChannel = CloisterChannels.inviteKeyExchangeResponse(for: machineId)
             try await provider.sendOnChannel(responseData, toMachine: machineId, channel: responseChannel)
         } catch {
             logger.error("Failed to send invite key exchange response to machine \(machineId.prefix(8))...: \(error)")
@@ -433,8 +433,8 @@ public actor CloisterHandler {
 
         do {
             let ackData = try JSONCoding.encoder.encode(ack)
-            let myPeerId = await provider.peerId
-            let ackChannel = CloisterChannels.inviteFinalAck(for: myPeerId)
+            // Use requester's machineId for the ack channel so they know where to listen
+            let ackChannel = CloisterChannels.inviteFinalAck(for: machineId)
             try await provider.sendOnChannel(ackData, toMachine: machineId, channel: ackChannel)
         } catch {
             logger.error("Failed to send invite final ack to machine \(machineId.prefix(8))...: \(error)")
