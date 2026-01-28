@@ -77,7 +77,7 @@ private actor LoopbackBridge: NetstackBridgeProtocol {
     func setReturnCallback(_ callback: @escaping @Sendable (Data) -> Void) async {}
 
     func dialTCP(host: String, port: UInt16) async throws -> TCPConnection {
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw InterfaceError.dialFailed("socket: \(errno)") }
 
         var addr = sockaddr_in()

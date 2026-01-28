@@ -109,7 +109,7 @@ final class PortForwarderTests: XCTestCase {
 
     private func connectSocket() async throws -> SocketHelper {
         let port = await forwarder.actualPort
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
         XCTAssertGreaterThan(fd, 0)
 
         var addr = sockaddr_in()

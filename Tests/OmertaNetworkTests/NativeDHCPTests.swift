@@ -46,6 +46,10 @@ actor MockDHCPChannelProvider: ChannelProvider {
     func clearMessages() {
         sentMessages.removeAll()
     }
+
+    func clearMessages(for target: String) {
+        sentMessages.removeAll { $0.target == target }
+    }
 }
 
 // MARK: - DHCP Messages Tests
@@ -692,6 +696,7 @@ final class NativeDHCPIntegrationTests: XCTestCase {
             let machineId = "m\(i + 1)"
 
             // Simple direct relay for this client
+            // Only clear this client's messages to avoid racing with other clients
             let relayTask = Task {
                 while !Task.isCancelled {
                     let msgs = await provider.sentMessages
@@ -704,7 +709,8 @@ final class NativeDHCPIntegrationTests: XCTestCase {
                     for msg in serviceMsgs where msg.target == machineId {
                         await provider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                     }
-                    await serviceProvider.clearMessages()
+                    // Only clear messages targeted at this client
+                    await serviceProvider.clearMessages(for: machineId)
 
                     try? await Task.sleep(for: .milliseconds(10))
                 }
