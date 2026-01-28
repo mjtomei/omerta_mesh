@@ -208,11 +208,8 @@ public actor DataSocketClient {
                     }
                 }
 
-                // Parse length
-                let lengthData = Data(headerBuffer[16..<18])
-                let length = lengthData.withUnsafeBytes { ptr in
-                    Int(ptr.load(as: UInt16.self).bigEndian)
-                }
+                // Parse length - construct UInt16 manually to avoid alignment issues on Linux
+                let length = Int(UInt16(headerBuffer[16]) << 8 | UInt16(headerBuffer[17]))
 
                 guard length <= DataSocketServer.maxPacketSize else {
                     await self.handleReceiveError()
