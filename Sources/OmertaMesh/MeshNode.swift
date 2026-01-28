@@ -740,6 +740,9 @@ public actor MeshNode {
             // Pong sender is already recorded in handleIncomingData via endpointManager.recordMessageReceived
             logger.info("Received pong from: \(peerId.prefix(8))... at \(endpoint) with \(recentPeers.count) peers")
 
+            // Notify hole punch manager in case this pong completes a hole punch
+            await holePunchManager.holePuncher.handlePongReceived(from: endpoint, peerId: peerId)
+
             // Track sender's NAT type
             await endpointManager.updateNATType(peerId: peerId, natType: theirNATType)
 
