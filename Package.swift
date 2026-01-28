@@ -68,13 +68,22 @@ let package = Package(
         ]),
         .target(
             name: "OmertaNetwork",
-            dependencies: ["OmertaMesh", "OmertaTunnel", "CNetstack", .product(name: "Logging", package: "swift-log")],
+            dependencies: [
+                "OmertaMesh", "OmertaTunnel", "CNetstack",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
             linkerSettings: [
                 .linkedLibrary("netstack", .when(platforms: [.macOS, .linux])),
                 .unsafeFlags(["-L\(packageDir)/Sources/CNetstack"], .when(platforms: [.macOS, .linux])),
             ]
         ),
         .testTarget(name: "OmertaTunnelTests", dependencies: ["OmertaTunnel", "OmertaNetwork", "OmertaMesh"]),
-        .testTarget(name: "OmertaNetworkTests", dependencies: ["OmertaNetwork", "OmertaMesh"]),
+        .testTarget(name: "OmertaNetworkTests", dependencies: [
+            "OmertaNetwork", "OmertaMesh",
+            .product(name: "NIOCore", package: "swift-nio"),
+            .product(name: "NIOPosix", package: "swift-nio"),
+        ]),
     ]
 )

@@ -63,6 +63,7 @@ public actor MockNetworkInterface: NetworkInterface {
 
     // For dialTCP tracking
     private var connections: [(host: String, port: UInt16, connection: MockTCPConnection)] = []
+    private var _shouldFailDial = false
 
     // Continuation for async packet reading
     private var readContinuation: CheckedContinuation<Data, Error>?
@@ -108,9 +109,15 @@ public actor MockNetworkInterface: NetworkInterface {
     }
 
     public func dialTCP(host: String, port: UInt16) async throws -> TCPConnection? {
+        if _shouldFailDial { return nil }
         let conn = MockTCPConnection(host: host, port: port)
         connections.append((host, port, conn))
         return conn
+    }
+
+    /// Configure dialTCP to return nil (simulating failure).
+    public func setShouldFailDial(_ fail: Bool) {
+        _shouldFailDial = fail
     }
 
     // MARK: - Test Helpers
