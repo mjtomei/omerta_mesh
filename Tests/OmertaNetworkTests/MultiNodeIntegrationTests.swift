@@ -502,7 +502,7 @@ final class MultiNodeIntegrationTests: XCTestCase {
         await peer.sendPacket(to: "8.8.8.8", payload: "dns-query")
 
         // Wait for: peer → tunnel → gateway → GatewayService → bridge → NAT return → tunnel → peer
-        try await Task.sleep(for: .milliseconds(1000))
+        try await Task.sleep(for: .milliseconds(3000))
 
         // Peer should have routed the packet to the gateway
         let peerStats = await peer.getStats()

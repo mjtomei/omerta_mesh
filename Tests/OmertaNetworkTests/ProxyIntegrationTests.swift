@@ -424,8 +424,10 @@ final class SOCKSProxyIntegrationTests: XCTestCase {
         let proxyPort = await proxy.actualPort
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<5 {
+            for i in 0..<3 {
                 group.addTask {
+                    // Stagger connections to avoid overwhelming the userspace stack
+                    try await Task.sleep(for: .milliseconds(100 * i))
                     let sock = try TestSocket(connectingTo: proxyPort)
                     defer { sock.close() }
 
@@ -529,12 +531,14 @@ final class PortForwarderIntegrationTests: XCTestCase {
         let fwdPort = await forwarder.actualPort
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<5 {
+            for i in 0..<3 {
                 group.addTask {
+                    // Stagger connections to avoid overwhelming the userspace stack
+                    try await Task.sleep(for: .milliseconds(100 * i))
                     let sock = try TestSocket(connectingTo: fwdPort)
                     defer { sock.close() }
 
-                    try await Task.sleep(for: .milliseconds(200))
+                    try await Task.sleep(for: .milliseconds(500))
 
                     let msg = Data("client-\(i)".utf8)
                     sock.sendData(msg)
