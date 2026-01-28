@@ -12,7 +12,8 @@ let package = Package(
         .library(name: "OmertaMesh", targets: ["OmertaMesh"]),
         .library(name: "OmertaTunnel", targets: ["OmertaTunnel"]),
         .library(name: "OmertaSSH", targets: ["OmertaSSH"]),
-        .executable(name: "omerta_mesh", targets: ["OmertaMeshCLI"]),
+        .executable(name: "omerta-mesh", targets: ["OmertaMeshCLI"]),
+        .executable(name: "omerta-meshd", targets: ["OmertaMeshDaemon"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.60.0"),
@@ -46,6 +47,16 @@ let package = Package(
         ),
         .executableTarget(
             name: "OmertaMeshCLI",
+            dependencies: [
+                "OmertaMesh",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+            ]
+        ),
+        .executableTarget(
+            name: "OmertaMeshDaemon",
             dependencies: [
                 "OmertaMesh",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),

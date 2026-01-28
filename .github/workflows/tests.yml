@@ -1,0 +1,17 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    uses: mjtomei/omerta/.github/workflows/test-swift.yml@master
+    with:
+      package-path: '.'
+      package-name: 'omerta-mesh'
+      needs-libnetstack: true
+      libnetstack-path: 'Sources/OmertaTunnel/Netstack'
