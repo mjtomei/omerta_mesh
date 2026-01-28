@@ -119,13 +119,52 @@ public actor UDPSocket {
 
     // MARK: - Sending
 
+    /// Check and clear any pending socket errors (from ICMP responses, etc.)
+    /// Returns the error code if one was pending, or 0 if no error
+    private func checkAndClearSocketError() async -> Int32 {
+        guard let channel = channel else { return 0 }
+
+        do {
+            // Get SO_ERROR - this retrieves AND clears the pending error
+            let errorCode: SocketOptionValue = try await channel.getOption(
+                ChannelOptions.socketOption(.so_error)
+            )
+            let code = Int32(errorCode)
+            if code != 0 {
+                logger.warning("Cleared pending socket error before send: errno=\(code) (\(errnoDescription(code)))")
+            }
+            return code
+        } catch {
+            // If we can't get the option, just continue
+            logger.debug("Could not check SO_ERROR: \(error)")
+            return 0
+        }
+    }
+
+    /// Get a human-readable description for an errno value
+    private func errnoDescription(_ code: Int32) -> String {
+        switch code {
+        case EHOSTUNREACH: return "Host unreachable"
+        case ENETUNREACH: return "Network unreachable"
+        case ECONNREFUSED: return "Connection refused"
+        case EHOSTDOWN: return "Host is down"
+        case ENETDOWN: return "Network is down"
+        default: return String(cString: strerror(code))
+        }
+    }
+
     /// Send data to a specific address
-    /// Retries on transient errors like "host unreachable" which can occur on macOS
-    /// due to stale ICMP error caching
     public func send(_ data: Data, to address: SocketAddress) async throws {
         guard let channel = channel, isRunning else {
             logger.warning("UDP send failed: socket not running")
             throw UDPSocketError.notRunning
+        }
+
+        // Check for any pending ICMP errors before sending
+        // This tells us if a previous packet triggered an error
+        let pendingError = await checkAndClearSocketError()
+        if pendingError != 0 {
+            logger.info("Previous packet triggered ICMP error, cleared before this send")
         }
 
         // Convert address if needed for socket type compatibility
@@ -143,13 +182,13 @@ public actor UDPSocket {
 
             // Check if this is a known transient/spurious error
             // On macOS, stale ICMP errors can be reported on UDP sends even when the
-            // network is fine. The packet may still have been sent. Log and continue
-            // rather than failing - let higher-level timeouts handle true failures.
+            // network is fine. Log details and continue - let higher-level timeouts
+            // handle actual failures.
             let isSpuriousError = errorString.lowercased().contains("unreachable") ||
                                   errorString.lowercased().contains("connection refused")
 
             if isSpuriousError {
-                logger.warning("UDP send reported spurious error (packet may have been sent): \(error)")
+                logger.warning("UDP send reported error (may be stale ICMP): \(error)")
                 // Don't throw - let higher-level timeout mechanisms handle actual failures
                 return
             }
