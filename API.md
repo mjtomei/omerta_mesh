@@ -971,7 +971,7 @@ actor ChatApp {
 | `activeSessions()` | List all active sessions |
 | `setSessionEstablishedHandler(_:)` | Handler for incoming sessions |
 
-Endpoint management (hole-punch, relay, reconnection) is internal. For fine-grained control, use `MeshNetwork` directly.
+Health monitoring is internal. Connection establishment (hole-punch, relay) is handled by `MeshNetwork`. For fine-grained control, use `MeshNetwork` directly.
 
 ### TunnelSession (OmertaTunnel)
 
@@ -993,19 +993,23 @@ For latency-sensitive applications like SSH or real-time communication, OmertaTu
 
 ### Reactive vs Proactive Connection Management
 
-The base `MeshNetwork` already handles hole-punching, relay fallback, and reconnection — but it does so **reactively**, only refreshing connections when traffic flows. This is efficient for background operations, but connections may go stale between uses, causing latency spikes when traffic resumes.
+**Separation of concerns:**
+- `MeshNetwork` handles the mechanics: hole-punching, relay coordination, encryption
+- `TunnelManager` triggers and monitors: sends probes to force establishment, tracks health
 
-`TunnelManager` adds **proactive** connection management:
+The base `MeshNetwork` establishes connections **reactively** when user traffic flows. This is efficient for background operations, but the first message may have high latency while connection is established.
+
+`TunnelManager` is **proactive**:
 
 | Aspect | MeshNetwork (Reactive) | TunnelManager (Proactive) |
 |--------|------------------------|---------------------------|
-| Connection refresh | When traffic flows | Continuous, even when idle |
+| Connection establishment | When first user data sent | Immediately on getSession() |
 | Problem detection | When a send fails | Before sends fail (health probes) |
-| Reconnection | After failure | Preemptive, before timeout |
 | Latency visibility | Per-message | Continuous RTT tracking |
+| Monitoring | None when idle | Continuous probes |
 | Best for | Background/bulk traffic | User-facing, latency-sensitive |
 
-The underlying mechanisms (hole-punch, relay, encryption) are identical. The difference is **timing**: TunnelManager doesn't wait for traffic to discover a problem.
+The underlying mechanisms (hole-punch, relay) are identical. The difference is **timing**: TunnelManager sends probes immediately to trigger establishment, then continues monitoring.
 
 ### Basic Usage
 
@@ -1017,7 +1021,7 @@ let tunnelManager = TunnelManager(provider: mesh)
 try await tunnelManager.start()
 
 // Get or create a session to a remote machine
-// This triggers endpoint negotiation if no connection exists
+// This immediately sends probes to establish connection (doesn't wait for user traffic)
 let session = try await tunnelManager.getSession(
     for: remoteMachineId,
     channel: "ssh"  // Logical channel name
@@ -1047,14 +1051,14 @@ Sessions are identified by `(MachineId, channel)`:
 - **MachineId**: The remote machine (a peer may have multiple machines)
 - **channel**: A logical name for the session purpose (e.g., "ssh", "packets", "control")
 
-Multiple sessions to the same machine on different channels are supported. All sessions to the same machine share a single actively-managed endpoint.
+Multiple sessions to the same machine on different channels are supported. All sessions to the same machine share health monitoring state.
 
 ```swift
 // Multiple channels to the same machine
 let sshSession = try await tunnelManager.getSession(for: machineId, channel: "ssh")
 let fileSession = try await tunnelManager.getSession(for: machineId, channel: "files")
 
-// Both share the same underlying endpoint (one set of health probes)
+// Both share the same health monitoring (one set of probes per machine)
 ```
 
 ### TunnelSession API
@@ -1124,7 +1128,7 @@ public actor TunnelManager {
 }
 ```
 
-Endpoint management (hole-punch, relay fallback, health probes, reconnection) is handled internally. TunnelManager proactively maintains connections so they're ready when you need them. For fine-grained endpoint control, use `MeshNetwork` directly.
+TunnelManager proactively establishes connections by sending probes immediately (triggering the mesh's hole-punch/relay mechanisms), then continues monitoring health. The mesh handles the actual connection mechanics. For fine-grained control, use `MeshNetwork` directly.
 
 ### Configuration
 
@@ -1134,14 +1138,18 @@ public struct TunnelManagerConfig: Sendable {
     public var maxSessionsPerMachine: Int = 10
     public var maxTotalSessions: Int = 1000
 
-    // Proactive health monitoring
+    // Proactive connection establishment
+    public var initialProbeAttempts: Int = 5    // Attempts to establish connection
+    public var initialProbeRetryMs: Int = 500   // Delay between initial attempts
+
+    // Ongoing health monitoring
     public var probeIntervalMs: Int = 5000      // Probe every 5 seconds
     public var probeTimeoutMs: Int = 2000       // Probe timeout
-    public var relayFallbackThreshold: Int = 3  // Switch to relay after 3 failed probes
+    public var failureThreshold: Int = 3        // Request endpoint change after 3 failures
 }
 
-let config = TunnelManagerConfig()
-config.probeIntervalMs = 1000  // More aggressive for SSH
+var config = TunnelManagerConfig()
+config.probeIntervalMs = 1000  // More aggressive monitoring for SSH
 let tunnelManager = TunnelManager(provider: mesh, config: config)
 ```
 

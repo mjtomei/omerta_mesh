@@ -358,7 +358,7 @@ swift test
 
 ### Phase 2: TunnelManager Session Pool
 
-**Goal:** Rework TunnelManager to maintain a pool of sessions keyed by (machineId, channel), with active endpoint management for connection reliability.
+**Goal:** Rework TunnelManager to maintain a pool of sessions keyed by (machineId, channel), with health monitoring for connection reliability.
 
 #### Architecture Context
 
@@ -366,32 +366,34 @@ swift test
 
 **New:** TunnelManager maintains multiple sessions keyed by TunnelSessionKey. Sessions are created on-demand when packets need to be sent. Multiple channels to the same machine are supported.
 
-**Connection management:** The base MeshNetwork already provides hole-punching, relay fallback, and reconnection — but it does so *reactively*, only refreshing connections when they're actually used. This is efficient for background traffic but means connections may go stale between uses, causing latency spikes when traffic resumes.
+**Separation of concerns:**
+- **MeshNetwork** handles the mechanics: hole-punching, relay coordination, endpoint discovery
+- **TunnelManager** triggers and monitors connections: sends probes to force establishment, tracks health
 
-TunnelManager adds *proactive* connection management for latency-sensitive applications (SSH, real-time communication):
-- **Active health monitoring** — Periodic probes even when idle, so connection problems are detected immediately
-- **Preemptive reconnection** — Re-establishes connections before they're needed, not when a send fails
+The tunnel layer is agnostic to how connections are established (cloister, manual key, etc.) — it triggers establishment by sending packets, then monitors health.
+
+**Reactive vs Proactive:** The base MeshNetwork establishes connections *reactively* when user traffic flows. TunnelManager is *proactive*:
+- **Eager establishment** — Sends probe packets immediately to force hole-punch/relay, not waiting for user data
+- **Health probing** — Continuous probes even when idle, detecting problems before they impact traffic
 - **Latency tracking** — Continuous RTT measurement for connection quality visibility
-- **Faster failover** — Switches to relay sooner when direct path degrades
+- **Endpoint switching** — Can request the mesh to try alternative endpoints when health degrades
 
-The underlying mechanisms (hole-punch, relay, etc.) are the same as MeshNetwork. The difference is timing: TunnelManager doesn't wait for traffic to discover a problem.
-
-This responsibility is per-machine, not per-session. Multiple sessions to the same machine share a single actively-managed endpoint.
+This is per-machine, not per-session. Multiple sessions to the same machine share connection state.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │  TunnelManager                                                    │
 │  ├── sessions: [TunnelSessionKey: TunnelSession]                  │
 │  │   └── Keyed by (machineId, channel)                            │
-│  ├── (internal) endpoints, health monitors                        │
-│  │   └── Proactive connection management (probes even when idle)  │
+│  ├── (internal) healthState: [MachineId: EndpointHealth]          │
+│  │   └── Probes, latency, failure count (monitoring only)         │
 │  ├── getSession(machineId:channel:)                               │
 │  ├── closeSession(key:)                                           │
 │  └── onSessionEstablished(handler:)                               │
 └───────────────────────────────────────────────────────────────────┘
 
 Public:   (machineId, channel) → TunnelSession
-Internal: machineId → endpoint state, health probes
+Internal: machineId → health monitoring state
 ```
 
 #### Module: OmertaTunnel
@@ -407,10 +409,10 @@ Internal: machineId → endpoint state, health probes
 ```swift
 public actor TunnelManager {
     private var sessions: [TunnelSessionKey: TunnelSession] = [:]
-    private var endpoints: [MachineId: TunnelEndpoint] = [:]  // Per-machine connection state
+    private var healthState: [MachineId: EndpointHealth] = [:]  // Per-machine health tracking
+    private var healthMonitors: [MachineId: Task<Void, Never>] = [:]
     private let provider: any ChannelProvider
     private let config: TunnelManagerConfig
-    private var healthMonitors: [MachineId: Task<Void, Never>] = [:]
 
     /// Callback when a new session is established (incoming or outgoing)
     private var sessionEstablishedHandler: ((TunnelSession) async -> Void)?
@@ -421,8 +423,7 @@ public actor TunnelManager {
     }
 
     /// Get or create a session to a specific machine on a specific channel.
-    /// If no endpoint exists for this machine, triggers endpoint negotiation
-    /// (hole-punch, relay fallback) before returning the session.
+    /// Proactively establishes connection by sending probes (doesn't wait for user traffic).
     public func getSession(
         machineId: MachineId,
         channel: String
@@ -433,9 +434,9 @@ public actor TunnelManager {
             return existing
         }
 
-        // Ensure we have a managed endpoint to this machine
-        if endpoints[machineId] == nil {
-            try await negotiateEndpoint(for: machineId)
+        // Proactively establish connection if this is first session to this machine
+        if healthState[machineId] == nil {
+            try await establishConnection(to: machineId)
         }
 
         let session = TunnelSession(
@@ -450,21 +451,55 @@ public actor TunnelManager {
         return session
     }
 
-    /// Internal: negotiate endpoint (hole-punch, relay fallback)
-    private func negotiateEndpoint(for machineId: MachineId) async throws {
-        endpoints[machineId] = TunnelEndpoint(
-            machineId: machineId,
-            connectionType: .connecting,
-            latencyMs: nil,
-            lastProbeTime: nil
-        )
+    /// Internal: proactively establish connection by sending probes
+    /// This triggers the mesh's hole-punch/relay mechanisms immediately,
+    /// rather than waiting for user traffic.
+    private func establishConnection(to machineId: MachineId) async throws {
+        healthState[machineId] = EndpointHealth(state: .connecting)
 
-        // 1. Attempt UDP hole-punch via mesh signaling
-        // 2. If fails after timeout, request relay from RelayCoordinator
-        // 3. Update endpoint with result
-        // 4. Start health monitor for this machine
+        // Send initial probes to force connection establishment
+        // The mesh will do hole-punch/relay as needed
+        for attempt in 1...config.initialProbeAttempts {
+            do {
+                let start = ContinuousClock.now
+                try await sendProbe(to: machineId)
+                let latency = ContinuousClock.now - start
+                healthState[machineId]?.recordSuccess(latencyMs: Int(latency.components.milliseconds))
 
-        // (Implementation details in TunnelEndpointNegotiator)
+                // Connection established, start ongoing monitoring
+                startHealthMonitor(for: machineId)
+                return
+            } catch {
+                if attempt == config.initialProbeAttempts {
+                    healthState[machineId] = nil
+                    throw TunnelError.connectionFailed("Failed to establish connection after \(attempt) attempts")
+                }
+                try? await Task.sleep(for: .milliseconds(config.initialProbeRetryMs))
+            }
+        }
+    }
+
+    /// Internal: start ongoing health monitoring for a machine
+    private func startHealthMonitor(for machineId: MachineId) {
+        healthMonitors[machineId] = Task {
+            await runHealthProbes(for: machineId)
+        }
+    }
+
+    /// Internal: run periodic health probes
+    private func runHealthProbes(for machineId: MachineId) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(config.probeIntervalMs))
+            let start = ContinuousClock.now
+            do {
+                try await sendProbe(to: machineId)
+                let latency = ContinuousClock.now - start
+                healthState[machineId]?.recordSuccess(latencyMs: Int(latency.components.milliseconds))
+            } catch {
+                healthState[machineId]?.recordFailure()
+                // If too many failures, could request endpoint change from mesh
+            }
+        }
     }
 
     /// Get existing session by key (does not create)
@@ -523,32 +558,51 @@ public struct TunnelManagerConfig: Sendable {
     public var maxSessionsPerMachine: Int = 10
     public var maxTotalSessions: Int = 1000
 
-    // Proactive health monitoring — the key difference from base MeshNetwork.
-    // These probes run even when no traffic is flowing, so connection
-    // problems are detected before they impact user-facing latency.
-    public var probeIntervalMs: Int = 5000      // How often to probe idle connections
+    // Proactive connection establishment — triggers hole-punch/relay immediately
+    public var initialProbeAttempts: Int = 5    // Attempts to establish connection
+    public var initialProbeRetryMs: Int = 500   // Delay between initial attempts
+
+    // Ongoing health monitoring — detects problems before they impact traffic
+    public var probeIntervalMs: Int = 5000      // How often to probe established connections
     public var probeTimeoutMs: Int = 2000       // When to consider a probe failed
-    public var relayFallbackThreshold: Int = 3  // Failed probes before switching to relay
+    public var failureThreshold: Int = 3        // Failures before requesting endpoint change
 
     public static let `default` = TunnelManagerConfig()
 }
 
-// MARK: - Endpoint Management (Internal)
+// MARK: - Health Monitoring (Internal)
 //
-// TunnelManager actively manages the connection to each remote machine.
-// Multiple sessions to the same machine share a single managed endpoint.
-// This is all internal — users who need fine-grained endpoint control
-// should use the MeshNetwork API directly.
+// TunnelManager monitors connection health for each remote machine.
+// Multiple sessions to the same machine share health state.
+// Connection establishment (hole-punch, relay) is handled by MeshNetwork.
 //
 // Internal state:
-// - endpoints: [MachineId: EndpointState]
-// - healthMonitors: [MachineId: Task] — continuous probes
+// - healthState: [MachineId: EndpointHealth] — latency, failure count
+// - healthMonitors: [MachineId: Task] — continuous probe tasks
 //
 // Internal behavior:
-// - getSession() triggers endpoint negotiation if needed
-// - Health probes run continuously, even when idle
-// - Auto-failover to relay after probeFailureThreshold failures
-// - Auto-reconnect on network changes
+// - getSession() starts health monitoring if not already running
+// - Health probes run continuously via ping/pong messages
+// - Tracks latency and consecutive failures
+// - Can request mesh to try alternative endpoints on degradation
+
+/// Health tracking for a machine's connection
+struct EndpointHealth {
+    var latencyMs: Int?
+    var consecutiveFailures: Int = 0
+    var lastProbeTime: Date?
+
+    mutating func recordSuccess(latencyMs: Int) {
+        self.latencyMs = latencyMs
+        self.consecutiveFailures = 0
+        self.lastProbeTime = Date()
+    }
+
+    mutating func recordFailure() {
+        self.consecutiveFailures += 1
+        self.lastProbeTime = Date()
+    }
+}
 ```
 
 #### Unit Tests
