@@ -105,15 +105,17 @@ public actor TunnelHealthMonitor {
                 continue
             }
 
-            // Haven't heard from remote — send probe so it knows we're here
-            let timeBeforeProbe = lastPacketTime
+            // Haven't heard from remote — send probe so remote knows we're here
+            // (our probe tells remote we're alive; remote's independent probes tell us it's alive)
             try? await sendProbe(machineId)
 
-            // Wait for response (fraction of probe interval for network RTT)
-            try? await Task.sleep(for: interval / 4)
+            // Wait for remote's next probe to arrive. Both sides probe independently,
+            // so we need to wait long enough for the remote's next probe cycle.
+            try? await Task.sleep(for: interval)
 
-            // If a packet arrived during or right after the probe send, remote is alive
-            if lastPacketTime > timeBeforeProbe {
+            // Check if any packet arrived during the wait
+            let elapsedSinceWait = ContinuousClock.now - lastPacketTime
+            if elapsedSinceWait < interval {
                 consecutiveFailures = 0
                 currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
                 continue
