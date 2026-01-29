@@ -302,6 +302,14 @@ let peerId = mesh.peerId
 let machineId = await mesh.machineId
 logger.info("Mesh started - peerId: \(peerId) machineId: \(machineId)")
 
+// Auto-bootstrap: ping the remote host so the mesh discovers the other node
+// Use a dummy peerId — the real one will be learned from the ping response
+let remoteEndpoint = "\(remoteHost):\(port)"
+let dummyPeerId = "0000000000000000"
+logger.info("Auto-bootstrap: pinging \(remoteEndpoint)...")
+await mesh.addPeer(dummyPeerId, endpoint: remoteEndpoint)
+let _ = await mesh.ping(dummyPeerId, timeout: 3.0)
+
 await cleanup.register {
     logger.info("Cleanup: stopping mesh")
     await mesh.stop()
