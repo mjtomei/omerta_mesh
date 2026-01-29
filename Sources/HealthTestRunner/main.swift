@@ -251,11 +251,27 @@ for line in existingTempIPs.split(separator: "\n") {
     }
 }
 #else
-// macOS: disable pfctl if it has rules mentioning our port
+// macOS: disable pfctl unconditionally (in case rules exist from a previous run)
+let (_, pfEnabled) = await shell("pfctl -s info 2>&1 | head -1 || true")
+logger.info("  pfctl status: \(pfEnabled.trimmingCharacters(in: .whitespacesAndNewlines))")
 let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
-if pfRules.contains("port = \(port)") || pfRules.contains("port \(port)") {
+if !pfRules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+    logger.info("  Active pfctl rules:\n\(pfRules)")
+}
+if pfRules.contains("port = \(port)") || pfRules.contains("port \(port)") || pfRules.contains("block") {
     logger.info("  Disabling stale pfctl rules")
     let _ = await shell("pfctl -d 2>/dev/null")
+    let _ = await shell("pfctl -F all 2>/dev/null")
+}
+// Check macOS application firewall
+let (_, fwState) = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true")
+logger.info("  macOS Application Firewall: \(fwState.trimmingCharacters(in: .whitespacesAndNewlines))")
+if fwState.contains("enabled") {
+    // Allow our binary through the app firewall
+    let binaryPath = ProcessInfo.processInfo.arguments[0]
+    let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --add \(binaryPath) 2>/dev/null")
+    let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \(binaryPath) 2>/dev/null")
+    logger.info("  Added HealthTestRunner to application firewall allow list")
 }
 #endif
 logger.info("Pre-flight cleanup done.")
