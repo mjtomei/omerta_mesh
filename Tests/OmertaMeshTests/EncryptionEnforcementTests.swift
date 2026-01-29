@@ -89,20 +89,30 @@ final class EncryptionEnforcementTests: XCTestCase {
     }
 
     /// Runs last (alphabetically) — asserts that no non-demo test sent unencrypted data,
-    /// and that the demo tests did trigger the expected violations.
+    /// and that the expected demo violations were triggered by exact test name.
     func testZZ_noUnencryptedPacketsAcrossAllTests() {
         let allViolations = GlobalEncryptionObserver.shared.violations
-        let demoViolations = allViolations.filter { $0.testName.contains("EncryptionAuditDemo") }
-        let realViolations = allViolations.filter { !$0.testName.contains("EncryptionAuditDemo") }
 
-        // The demo tests must have triggered their expected violations
-        XCTAssertGreaterThanOrEqual(demoViolations.count, 3,
-            "EncryptionAuditDemoTests should trigger at least 3 violations (plaintext JSON, raw bytes, legacy encryption), got \(demoViolations.count)")
+        // These demo tests must each trigger exactly one violation
+        let expectedDemoTests = [
+            "testCatchesPlaintextJSON",
+            "testCatchesRawDebugBytes",
+            "testCatchesLegacyEncryptionFormat",
+        ]
 
-        // No real test should have sent unencrypted data
-        if !realViolations.isEmpty {
-            let summary = realViolations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
-            XCTFail("Unencrypted packets detected in \(realViolations.count) non-demo send(s):\n\(summary.joined(separator: "\n"))")
+        for testName in expectedDemoTests {
+            let matches = allViolations.filter { $0.testName.contains(testName) }
+            XCTAssertEqual(matches.count, 1,
+                "Expected exactly 1 violation from \(testName), got \(matches.count)")
+        }
+
+        // No non-demo test should have sent unencrypted data
+        let unexpectedViolations = allViolations.filter { v in
+            !expectedDemoTests.contains(where: { v.testName.contains($0) })
+        }
+        if !unexpectedViolations.isEmpty {
+            let summary = unexpectedViolations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
+            XCTFail("Unexpected unencrypted packets in \(unexpectedViolations.count) send(s):\n\(summary.joined(separator: "\n"))")
         }
     }
     #endif
