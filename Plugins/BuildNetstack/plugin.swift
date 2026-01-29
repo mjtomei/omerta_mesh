@@ -11,7 +11,7 @@ struct BuildNetstackPlugin: BuildToolPlugin {
         let cnetstackDir = packageDir.appending(subpath: "Sources/CNetstack")
         let libPath = cnetstackDir.appending(subpath: "libnetstack.a")
 
-        // Skip if libnetstack.a already exists (incremental builds)
+        // Skip if libnetstack.a already exists (CI pre-builds it outside the sandbox)
         if FileManager.default.fileExists(atPath: libPath.string) {
             return []
         }

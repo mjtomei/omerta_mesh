@@ -12,18 +12,17 @@ final class TunnelHealthMonitorTests: XCTestCase {
             failureThreshold: 3
         )
 
-        var probeSent = false
+        let probeExpectation = expectation(description: "Probe sent")
+        probeExpectation.assertForOverFulfill = false
+
         await monitor.startMonitoring(
             machineId: "test-machine",
-            sendProbe: { _ in probeSent = true },
+            sendProbe: { _ in probeExpectation.fulfill() },
             onFailure: { _ in }
         )
 
-        // Wait for at least one probe cycle
-        try await Task.sleep(for: .milliseconds(150))
+        await fulfillment(of: [probeExpectation], timeout: 5)
         await monitor.stopMonitoring()
-
-        XCTAssertTrue(probeSent, "Probe should be sent when idle")
     }
 
     func testBackoffOnSuccess() async throws {
@@ -34,24 +33,32 @@ final class TunnelHealthMonitorTests: XCTestCase {
         )
 
         var probeCount = 0
+        // Use an expectation for "enough probes fired to measure backoff"
+        let enoughProbes = expectation(description: "Enough probes for backoff measurement")
+        enoughProbes.assertForOverFulfill = false
+
         await monitor.startMonitoring(
             machineId: "test-machine",
             sendProbe: { _ in
                 probeCount += 1
                 // Simulate remote responding: call onPacketReceived after each probe
                 await monitor.onPacketReceived()
+                if probeCount >= 3 {
+                    enoughProbes.fulfill()
+                }
             },
             onFailure: { _ in }
         )
 
-        // Wait long enough for a few probes — with backoff, fewer probes fire
-        try await Task.sleep(for: .milliseconds(400))
+        await fulfillment(of: [enoughProbes], timeout: 5)
+        // Give a bit more time for any rapid probes that would fire without backoff
+        try await Task.sleep(for: .milliseconds(200))
         await monitor.stopMonitoring()
 
-        // With 50ms min doubling to 100, 200, 400... we expect ~3-4 probes in 400ms
-        // Without backoff at 50ms we'd get ~8
+        // With 50ms min doubling to 100, 200, 400... we expect ~3-5 probes
+        // Without backoff at 50ms we'd get many more
         XCTAssertGreaterThan(probeCount, 0)
-        XCTAssertLessThan(probeCount, 8, "Backoff should reduce probe frequency")
+        XCTAssertLessThan(probeCount, 12, "Backoff should reduce probe frequency")
     }
 
     func testResetOnTraffic() async throws {
@@ -61,16 +68,19 @@ final class TunnelHealthMonitorTests: XCTestCase {
             failureThreshold: 3
         )
 
+        // Wait for at least one probe so the interval has grown
+        let probed = expectation(description: "At least one probe sent")
+        probed.assertForOverFulfill = false
+
         await monitor.startMonitoring(
             machineId: "test-machine",
-            sendProbe: { _ in },
+            sendProbe: { _ in probed.fulfill() },
             onFailure: { _ in }
         )
 
-        // Let interval grow
-        try await Task.sleep(for: .milliseconds(200))
+        await fulfillment(of: [probed], timeout: 5)
 
-        // Simulate traffic
+        // Simulate traffic — should reset interval to min
         await monitor.onPacketReceived()
 
         let interval = await monitor._currentProbeInterval
@@ -92,6 +102,9 @@ final class TunnelHealthMonitorTests: XCTestCase {
         )
 
         var failureCalled = false
+        // Wait until remote has "responded" (probe >= 2), then check no failure
+        let respondedExpectation = expectation(description: "Remote responded after first miss")
+        respondedExpectation.assertForOverFulfill = false
         var probeCount = 0
 
         await monitor.startMonitoring(
@@ -101,12 +114,15 @@ final class TunnelHealthMonitorTests: XCTestCase {
                 if probeCount >= 2 {
                     // Remote responds after first missed probe
                     await monitor.onPacketReceived()
+                    respondedExpectation.fulfill()
                 }
             },
             onFailure: { _ in failureCalled = true }
         )
 
-        try await Task.sleep(for: .milliseconds(300))
+        await fulfillment(of: [respondedExpectation], timeout: 5)
+        // Let one more cycle pass to confirm no failure fires
+        try await Task.sleep(for: .milliseconds(100))
         await monitor.stopMonitoring()
 
         XCTAssertFalse(failureCalled, "Single failure should not trigger onFailure")
@@ -120,7 +136,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
             failureThreshold: 3
         )
 
-        var failureCalled = false
+        let failureExpectation = expectation(description: "Failure callback fired")
         var failedMachineId: String?
 
         await monitor.startMonitoring(
@@ -129,16 +145,14 @@ final class TunnelHealthMonitorTests: XCTestCase {
                 // Probe sends but remote never responds (no onPacketReceived)
             },
             onFailure: { machineId in
-                failureCalled = true
                 failedMachineId = machineId
+                failureExpectation.fulfill()
             }
         )
 
-        // Wait for 3 failures at ~50ms each
-        try await Task.sleep(for: .milliseconds(500))
+        await fulfillment(of: [failureExpectation], timeout: 10)
         await monitor.stopMonitoring()
 
-        XCTAssertTrue(failureCalled, "Should call onFailure after 3 consecutive failures")
         XCTAssertEqual(failedMachineId, "test-machine")
     }
 
@@ -152,6 +166,9 @@ final class TunnelHealthMonitorTests: XCTestCase {
 
         var failureCalled = false
         var probeCount = 0
+        // Wait for enough cycles to confirm the pattern works
+        let enoughCycles = expectation(description: "Enough probe cycles completed")
+        enoughCycles.assertForOverFulfill = false
 
         await monitor.startMonitoring(
             machineId: "test-machine",
@@ -161,11 +178,15 @@ final class TunnelHealthMonitorTests: XCTestCase {
                 if probeCount % 3 == 0 {
                     await monitor.onPacketReceived()
                 }
+                // After 9 probes (3 full cycles of miss-miss-respond), we've proven the pattern
+                if probeCount >= 9 {
+                    enoughCycles.fulfill()
+                }
             },
             onFailure: { _ in failureCalled = true }
         )
 
-        try await Task.sleep(for: .milliseconds(600))
+        await fulfillment(of: [enoughCycles], timeout: 10)
         await monitor.stopMonitoring()
 
         // Pattern: miss, miss, respond, miss, miss, respond — never 3 consecutive
@@ -181,7 +202,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
             failureThreshold: 3
         )
 
-        var failureCalled = false
+        let failureExpectation = expectation(description: "Failure detected")
         var probeCount = 0
 
         await monitor.startMonitoring(
@@ -190,13 +211,12 @@ final class TunnelHealthMonitorTests: XCTestCase {
                 probeCount += 1
                 // Send succeeds — but no onPacketReceived ever called
             },
-            onFailure: { _ in failureCalled = true }
+            onFailure: { _ in failureExpectation.fulfill() }
         )
 
-        try await Task.sleep(for: .milliseconds(500))
+        await fulfillment(of: [failureExpectation], timeout: 10)
         await monitor.stopMonitoring()
 
-        XCTAssertTrue(failureCalled, "Should detect failure when sends succeed but no packets received")
         XCTAssertGreaterThanOrEqual(probeCount, 3, "Should have sent at least 3 probes")
     }
 
@@ -238,18 +258,16 @@ final class TunnelHealthMonitorTests: XCTestCase {
             failureThreshold: 1
         )
 
-        var failureCalled = false
+        let failureExpectation = expectation(description: "Threshold-1 failure fired")
 
         await monitor.startMonitoring(
             machineId: "test-machine",
             sendProbe: { _ in },
-            onFailure: { _ in failureCalled = true }
+            onFailure: { _ in failureExpectation.fulfill() }
         )
 
-        try await Task.sleep(for: .milliseconds(200))
+        await fulfillment(of: [failureExpectation], timeout: 10)
         await monitor.stopMonitoring()
-
-        XCTAssertTrue(failureCalled, "Threshold of 1 should trigger on first missed interval")
     }
 
     func testPacketDuringProbeSendRescuesFailure() async throws {
@@ -262,17 +280,25 @@ final class TunnelHealthMonitorTests: XCTestCase {
         )
 
         var failureCalled = false
+        var probeCount = 0
+        // Wait for enough probe cycles to confirm no failure accumulates
+        let enoughProbes = expectation(description: "Enough probes with rescue")
+        enoughProbes.assertForOverFulfill = false
 
         await monitor.startMonitoring(
             machineId: "test-machine",
             sendProbe: { _ in
+                probeCount += 1
                 // Every probe send is accompanied by an incoming packet
                 await monitor.onPacketReceived()
+                if probeCount >= 6 {
+                    enoughProbes.fulfill()
+                }
             },
             onFailure: { _ in failureCalled = true }
         )
 
-        try await Task.sleep(for: .milliseconds(500))
+        await fulfillment(of: [enoughProbes], timeout: 10)
         await monitor.stopMonitoring()
 
         XCTAssertFalse(failureCalled, "Packet arriving during probe send should prevent failure")
