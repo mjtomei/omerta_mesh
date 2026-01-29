@@ -201,7 +201,7 @@ NETWORK_PATTERNS=(
     '\bssh\s+\S+\s+"?sudo\b'
 
     # Machine-specific hostnames and paths
-    '\b(enP[0-9]s[0-9]|eth[0-9]|wlan[0-9])\b'
+    '\b(en[opsx][0-9]+s[0-9]+|eth[0-9]+|wlan[0-9]+)\b'
 )
 
 # RFC 5737 documentation IPs that are safe to use in code:
@@ -252,7 +252,7 @@ ABSPATH_PATTERNS=(
     '/home/[a-zA-Z0-9_]+'
     '/Users/[a-zA-Z0-9_]+'
     '/tmp/[a-zA-Z0-9_]+'
-    '/var/[a-zA-Z0-9_]+/[a-zA-Z0-9_]+'
+    '/var/[a-zA-Z0-9_]+(/[a-zA-Z0-9_]+)?'
     '/opt/[a-zA-Z0-9_]+/[a-zA-Z0-9_]+'
 )
 
