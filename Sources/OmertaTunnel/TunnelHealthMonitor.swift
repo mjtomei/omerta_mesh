@@ -38,15 +38,9 @@ public actor TunnelHealthMonitor {
         self.lastPacketTime = ContinuousClock.now - minProbeInterval
     }
 
-    /// Called by TunnelManager when any packet arrives from this machine (application data or incoming probes)
+    /// Called when any packet arrives from the remote machine (application data, probes, etc.)
+    /// Resets probe interval to minimum and clears failure count.
     public func onPacketReceived() {
-        lastPacketTime = ContinuousClock.now
-        currentProbeInterval = minProbeInterval
-        consecutiveFailures = 0
-    }
-
-    /// Called when a probe arrives from the remote — updates liveness and resets probe interval
-    public func onProbeReceived() {
         lastPacketTime = ContinuousClock.now
         currentProbeInterval = minProbeInterval
         consecutiveFailures = 0
@@ -85,43 +79,32 @@ public actor TunnelHealthMonitor {
         var graceRemaining = graceIntervals
 
         while !Task.isCancelled {
+            // Snapshot the last packet time before sleeping
+            let packetTimeBefore = lastPacketTime
             let interval = currentProbeInterval
+
+            // Send our probe so the remote knows we're alive
+            try? await sendProbe(machineId)
+
+            // Wait for the probe interval
             try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { break }
 
-            // During grace period, send probes but don't count failures
+            // During grace period, don't count failures
             if graceRemaining > 0 {
-                try? await sendProbe(machineId)
-                try? await Task.sleep(for: interval / 4)
                 graceRemaining -= 1
                 continue
             }
 
-            let elapsed = ContinuousClock.now - lastPacketTime
-            if elapsed < interval {
-                // Traffic received recently — remote is alive, back off
+            // Check: did we receive ANY packet between the previous and current check?
+            if lastPacketTime > packetTimeBefore {
+                // Remote is alive — back off probe frequency
                 consecutiveFailures = 0
                 currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
                 continue
             }
 
-            // Haven't heard from remote — send probe so remote knows we're here
-            // (our probe tells remote we're alive; remote's independent probes tell us it's alive)
-            try? await sendProbe(machineId)
-
-            // Wait for remote's next probe to arrive. Both sides probe independently,
-            // so we need to wait long enough for the remote's next probe cycle.
-            try? await Task.sleep(for: interval)
-
-            // Check if any packet arrived during the wait
-            let elapsedSinceWait = ContinuousClock.now - lastPacketTime
-            if elapsedSinceWait < interval {
-                consecutiveFailures = 0
-                currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
-                continue
-            }
-
-            // Still no incoming traffic — count as failure
+            // No packet received since last check — count as failure
             consecutiveFailures += 1
             if consecutiveFailures >= failureThreshold {
                 await onFailure(machineId)

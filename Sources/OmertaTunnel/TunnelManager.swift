@@ -107,12 +107,10 @@ public actor TunnelManager {
         }
 
         // Register health probe handler — receiving a probe means remote is alive.
-        // No response needed: both sides run monitors and send their own probes,
-        // so each side's outgoing probe serves as the liveness signal for the other.
+        // Both sides run monitors and send probes independently. No echo response needed.
         try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
             guard let self else { return }
-            self.logger.info("Health probe received from \(machineId.prefix(8))...")
-            await self.notifyProbeReceived(from: machineId)
+            await self.notifyPacketReceived(from: machineId)
         }
 
         isRunning = true
@@ -305,13 +303,6 @@ public actor TunnelManager {
     public func notifyPacketReceived(from machineId: MachineId) async {
         if let monitor = healthMonitors[machineId] {
             await monitor.onPacketReceived()
-        }
-    }
-
-    /// Notify health monitor that a probe arrived (liveness only, no interval reset)
-    private func notifyProbeReceived(from machineId: MachineId) async {
-        if let monitor = healthMonitors[machineId] {
-            await monitor.onProbeReceived()
         }
     }
 
