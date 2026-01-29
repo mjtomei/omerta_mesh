@@ -779,12 +779,12 @@ do {
     await sendControl("phase3-burst")
     _ = await waitForAck("phase3-burst-done", timeout: .seconds(15))
 
-    try await Task.sleep(for: .seconds(1))
-
+    // Sample immediately — the last notifyPacketReceived resets interval to min (500ms).
+    // One monitor loop iteration may have doubled it to 1s, so allow up to 1s.
     if let monitor {
         let intervalAfterTraffic = await monitor._currentProbeInterval
         let failuresAfterTraffic = await monitor._consecutiveFailures
-        let phase3Pass = intervalAfterTraffic <= .milliseconds(500) && failuresAfterTraffic == 0
+        let phase3Pass = intervalAfterTraffic <= .seconds(1) && failuresAfterTraffic == 0
         record("Phase 3: Traffic Resets Probes", passed: phase3Pass,
                detail: "interval=\(intervalAfterTraffic), failures=\(failuresAfterTraffic)")
     } else {
