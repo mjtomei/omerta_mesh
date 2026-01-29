@@ -43,6 +43,12 @@ actor MockDHCPChannelProvider: ChannelProvider {
         }
     }
 
+    func drainMessages() -> [(data: Data, target: String, channel: String)] {
+        let msgs = sentMessages
+        sentMessages.removeAll()
+        return msgs
+    }
+
     func clearMessages() {
         sentMessages.removeAll()
     }
@@ -503,18 +509,14 @@ final class NativeDHCPIntegrationTests: XCTestCase {
         let relayTask = Task {
             while !Task.isCancelled {
                 // Relay client -> service
-                let clientMsgs = await clientProvider.sentMessages
-                for msg in clientMsgs where msg.target == "gateway" {
+                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
                     await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
-                await clientProvider.clearMessages()
 
                 // Relay service -> client
-                let serviceMsgs = await serviceProvider.sentMessages
-                for msg in serviceMsgs where msg.target == "m1" {
+                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
                     await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                 }
-                await serviceProvider.clearMessages()
 
                 try? await Task.sleep(for: .milliseconds(10))
             }
@@ -565,17 +567,13 @@ final class NativeDHCPIntegrationTests: XCTestCase {
 
         let relayTask = Task {
             while !Task.isCancelled {
-                let clientMsgs = await clientProvider.sentMessages
-                for msg in clientMsgs where msg.target == "gateway" {
+                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
                     await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
-                await clientProvider.clearMessages()
 
-                let serviceMsgs = await serviceProvider.sentMessages
-                for msg in serviceMsgs where msg.target == "m1" {
+                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
                     await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                 }
-                await serviceProvider.clearMessages()
 
                 try? await Task.sleep(for: .milliseconds(10))
             }
@@ -616,17 +614,13 @@ final class NativeDHCPIntegrationTests: XCTestCase {
 
         let relayTask = Task {
             while !Task.isCancelled {
-                let clientMsgs = await clientProvider.sentMessages
-                for msg in clientMsgs where msg.target == "gateway" {
+                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
                     await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
-                await clientProvider.clearMessages()
 
-                let serviceMsgs = await serviceProvider.sentMessages
-                for msg in serviceMsgs where msg.target == "m1" {
+                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
                     await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                 }
-                await serviceProvider.clearMessages()
 
                 try? await Task.sleep(for: .milliseconds(10))
             }
@@ -701,17 +695,13 @@ final class NativeDHCPIntegrationTests: XCTestCase {
 
             let relayTask = Task {
                 while !Task.isCancelled {
-                    let msgs = await provider.sentMessages
-                    for msg in msgs where msg.target == "gateway" {
+                    for msg in await provider.drainMessages() where msg.target == "gateway" {
                         await serviceProvider.simulateReceive(msg.data, from: machineId, on: msg.channel)
                     }
-                    await provider.clearMessages()
 
-                    let serviceMsgs = await serviceProvider.sentMessages
-                    for msg in serviceMsgs where msg.target == machineId {
+                    for msg in await serviceProvider.drainMessages() where msg.target == machineId {
                         await provider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                     }
-                    await serviceProvider.clearMessages()
 
                     try? await Task.sleep(for: .milliseconds(5))
                 }

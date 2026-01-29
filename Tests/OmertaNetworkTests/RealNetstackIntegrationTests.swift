@@ -295,6 +295,12 @@ private actor E2EChannelProvider: ChannelProvider {
         }
     }
 
+    func drainSentMessages() -> [(data: Data, target: MachineId, channel: String)] {
+        let msgs = sentMessages
+        sentMessages.removeAll()
+        return msgs
+    }
+
     func clearSentMessages() {
         sentMessages.removeAll()
     }
@@ -327,11 +333,9 @@ private actor E2ERelay {
         var pending: [(from: MachineId, to: MachineId, data: Data, channel: String)] = []
 
         for (machineId, provider) in providers {
-            let messages = await provider.sentMessages
-            for msg in messages {
+            for msg in await provider.drainSentMessages() {
                 pending.append((machineId, msg.target, msg.data, msg.channel))
             }
-            await provider.clearSentMessages()
         }
 
         for msg in pending {
