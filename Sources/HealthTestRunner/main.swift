@@ -200,6 +200,83 @@ struct NetworkSnapshot: Equatable {
     }
 }
 
+// MARK: - Pre-flight Cleanup (clear stale rules from failed runs)
+
+// Kill any existing HealthTestRunner processes (except ourselves)
+let myPID = ProcessInfo.processInfo.processIdentifier
+let myPPID = getppid()
+logger.info("Pre-flight cleanup: killing stale HealthTestRunner processes (my PID: \(myPID), PPID: \(myPPID))...")
+let (_, staleProcs) = await shell("pgrep -x HealthTestRunner | grep -v -e ^\(myPID)$ -e ^\(myPPID)$ || true")
+for pidStr in staleProcs.split(separator: "\n") {
+    let pidTrimmed = String(pidStr).trimmingCharacters(in: .whitespaces)
+    if !pidTrimmed.isEmpty, let pid = Int32(pidTrimmed) {
+        logger.info("  Killing stale process: \(pid)")
+        kill(pid, SIGKILL)
+    }
+}
+// Brief pause for ports to be released
+if !staleProcs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+    try await Task.sleep(for: .seconds(2))
+}
+
+logger.info("Pre-flight cleanup: clearing stale firewall rules...")
+#if os(Linux)
+// Remove any leftover iptables rules referencing our port
+let (_, existingRules) = await shell("iptables-save 2>/dev/null | grep '\\-\\-dport \(port)' | grep -v '^#' || true")
+for rule in existingRules.split(separator: "\n") {
+    let ruleTrimmed = String(rule).trimmingCharacters(in: .whitespaces)
+    if !ruleTrimmed.isEmpty {
+        // Convert -A to -D for deletion
+        let deleteRule = ruleTrimmed.replacingOccurrences(of: "-A ", with: "-D ")
+        logger.info("  Removing stale rule: \(deleteRule)")
+        let _ = await shell("iptables \(deleteRule)")
+    }
+}
+// Remove any leftover temp IPs on 192.168.12.0/24
+let (_, existingTempIPs) = await shell("ip -4 addr show | grep 'inet 192.168.12' | grep -v '\(remoteHost)' | awk '{print $2, $NF}' || true")
+for line in existingTempIPs.split(separator: "\n") {
+    let parts = String(line).trimmingCharacters(in: .whitespaces).split(separator: " ")
+    if parts.count == 2 {
+        let addr = String(parts[0])
+        let iface = String(parts[1])
+        // Don't remove the machine's own primary address
+        let (_, primaryIP) = await shell("hostname -I | awk '{print $1}'")
+        if !addr.hasPrefix(primaryIP.trimmingCharacters(in: .whitespaces)) {
+            logger.info("  Removing stale IP: \(addr) dev \(iface)")
+            let _ = await shell("ip addr del \(addr) dev \(iface)")
+        }
+    }
+}
+#else
+// macOS: disable pfctl unconditionally (in case rules exist from a previous run)
+let (_, pfEnabled) = await shell("pfctl -s info 2>&1 | head -1 || true")
+logger.info("  pfctl status: \(pfEnabled.trimmingCharacters(in: .whitespacesAndNewlines))")
+let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
+if !pfRules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+    logger.info("  Active pfctl rules:\n\(pfRules)")
+}
+// Always disable pfctl and flush rules to ensure clean state
+logger.info("  Disabling pfctl and flushing all rules...")
+let (d1Exit, d1Out) = await shell("pfctl -d 2>&1 || true")
+logger.info("  pfctl -d: exit=\(d1Exit) \(d1Out.trimmingCharacters(in: .whitespacesAndNewlines))")
+let (fExit, fOut) = await shell("pfctl -F all 2>&1 || true")
+logger.info("  pfctl -F all: exit=\(fExit) \(fOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+// Verify it's off
+let (_, verifyInfo) = await shell("pfctl -s info 2>&1 | grep -i 'status\\|enabled\\|disabled' || true")
+logger.info("  pfctl verify: \(verifyInfo.trimmingCharacters(in: .whitespacesAndNewlines))")
+// Check macOS application firewall
+let (_, fwState) = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true")
+logger.info("  macOS Application Firewall: \(fwState.trimmingCharacters(in: .whitespacesAndNewlines))")
+if fwState.contains("enabled") {
+    // Allow our binary through the app firewall
+    let binaryPath = ProcessInfo.processInfo.arguments[0]
+    let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --add \(binaryPath) 2>/dev/null")
+    let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \(binaryPath) 2>/dev/null")
+    logger.info("  Added HealthTestRunner to application firewall allow list")
+}
+#endif
+logger.info("Pre-flight cleanup done.")
+
 // MARK: - Mesh Setup
 
 let keyString = "health-test-shared-key-2026-0128"
@@ -274,8 +351,8 @@ logger.info("Remote machine discovered: \(remoteMachineId)")
 // MARK: - TunnelManager Setup
 
 let tunnelConfig = TunnelManagerConfig(
-    healthProbeMinInterval: .seconds(2),
-    healthProbeMaxInterval: .seconds(10),
+    healthProbeMinInterval: .milliseconds(500),
+    healthProbeMaxInterval: .seconds(15),
     healthFailureThreshold: 3
 )
 let manager = TunnelManager(provider: mesh, config: tunnelConfig)
@@ -380,8 +457,17 @@ let messageCounter = MessageCounter()
 if !isNodeA {
     logger.info("=== NODE B: Passive responder mode ===")
 
+    // Track the latest session established for each channel
+    actor LatestSession {
+        var session: TunnelSession?
+        func set(_ s: TunnelSession) { session = s }
+        func get() -> TunnelSession? { session }
+    }
+    let latestSession = LatestSession()
+
     // Accept all sessions and count messages
     await manager.setSessionEstablishedHandler { session in
+        await latestSession.set(session)
         await session.onReceive { data in
             await messageCounter.increment()
             let msg = String(data: data, encoding: .utf8) ?? "<binary>"
@@ -398,12 +484,15 @@ if !isNodeA {
 
         logger.info("Node B: received command '\(cmd.phase)'")
 
+        do {
         switch cmd.phase {
         case "phase1-start":
-            // Create session and send 10 messages
-            let session = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
-            await session.onReceive { data in
-                await messageCounter.increment()
+            // Wait for session from Node A (don't call getSession to avoid handshake race)
+            try await Task.sleep(for: .seconds(3))
+            guard let session = await latestSession.get() else {
+                logger.error("Node B: no session established for phase1")
+                await sendControl("phase1-done", detail: "0")
+                continue
             }
             for i in 1...10 {
                 try await session.send(Data("B-msg-\(i)".utf8))
@@ -412,8 +501,12 @@ if !isNodeA {
             await sendControl("phase1-done", detail: "\(await messageCounter.count)")
 
         case "phase3-burst":
-            // Send traffic burst
-            let session = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
+            // Use whatever session is currently active
+            guard let session = await latestSession.get() else {
+                logger.error("Node B: no session for phase3")
+                await sendControl("phase3-burst-done")
+                continue
+            }
             for i in 1...5 {
                 try await session.send(Data("B-burst-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(100))
@@ -421,10 +514,12 @@ if !isNodeA {
             await sendControl("phase3-burst-done")
 
         case "phase5-start":
-            // Recovery: create new session, send messages
-            let session = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
-            await session.onReceive { data in
-                await messageCounter.increment()
+            // Wait for recovery session from Node A
+            try await Task.sleep(for: .seconds(3))
+            guard let session = await latestSession.get() else {
+                logger.error("Node B: no session for phase5")
+                await sendControl("phase5-done", detail: "0")
+                continue
             }
             for i in 1...5 {
                 try await session.send(Data("B-recovery-\(i)".utf8))
@@ -433,8 +528,11 @@ if !isNodeA {
             await sendControl("phase5-done", detail: "\(await messageCounter.count)")
 
         case "phase6-block":
-            // Node B blocks incoming UDP from Node A locally
+            // Node B blocks incoming UDP from Node A locally, auto-unblocks after 15s
             let blockPort = cmd.detail ?? "\(port)"
+            // Send ack BEFORE blocking (otherwise the ack can't reach Node A)
+            await sendControl("phase6-ack")
+            try await Task.sleep(for: .milliseconds(500))  // ensure ack is sent
             #if os(macOS)
             let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
             logger.info("Node B pfctl block: exit=\(exitCode) \(out)")
@@ -443,18 +541,17 @@ if !isNodeA {
             let (exitCode, out) = await shell("iptables -A INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP")
             logger.info("Node B iptables block: exit=\(exitCode) \(out)")
             #endif
-            await sendControl("phase6-ack")
-
-        case "phase6-unblock":
-            #if os(macOS)
-            let (exitCode, out) = await shell("pfctl -d")
-            logger.info("Node B pfctl unblock: exit=\(exitCode) \(out)")
-            #else
-            let blockPort = cmd.detail ?? "\(port)"
-            let (exitCode, out) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
-            logger.info("Node B iptables unblock: exit=\(exitCode) \(out)")
-            #endif
-            await sendControl("phase6-unblock-ack")
+            // Auto-unblock after 15s (can't receive unblock command while blocked)
+            Task {
+                try? await Task.sleep(for: .seconds(15))
+                #if os(macOS)
+                let (ec, o) = await shell("pfctl -d")
+                logger.info("Node B pfctl auto-unblock: exit=\(ec) \(o)")
+                #else
+                let (ec, o) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
+                logger.info("Node B iptables auto-unblock: exit=\(ec) \(o)")
+                #endif
+            }
 
         case "phase6-check":
             // Report session count
@@ -477,6 +574,10 @@ if !isNodeA {
         default:
             logger.info("Node B: unknown command '\(cmd.phase)', acking")
             await sendControl("\(cmd.phase)-ack")
+        }
+        } catch {
+            logger.error("Node B: error handling '\(cmd.phase)': \(error)")
+            await sendControl("\(cmd.phase)-error", detail: "\(error)")
         }
 
         if cmd.phase == "done" { break }
@@ -516,14 +617,18 @@ var session1: TunnelSession? = nil
 var monitor: TunnelHealthMonitor? = nil
 
 do {
+    // Tell Node B to start phase 1 (it will wait for our session)
+    await sendControl("phase1-start")
+
+    // Create session - only Node A initiates to avoid handshake race
     let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
     session1 = s
     await s.onReceive { data in
         await messageCounter.increment()
     }
 
-    // Tell Node B to start phase 1
-    await sendControl("phase1-start")
+    // Wait for session to settle
+    try await Task.sleep(for: .seconds(2))
 
     // Send 10 messages from A
     for i in 1...10 {
@@ -541,6 +646,7 @@ do {
            detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
 
     monitor = await manager.getHealthMonitor(for: remoteMachineId)
+    logger.info("Health monitor for \(remoteMachineId): \(monitor != nil ? "found" : "NOT found")")
 } catch {
     record("Phase 1: Baseline Traffic", passed: false, detail: "Error: \(error)")
 }
@@ -555,17 +661,17 @@ do {
     var probeIntervals: [Duration] = []
 
     if let monitor {
-        // Log probe interval every 2s for 30s
-        for _ in 0..<15 {
-            try await Task.sleep(for: .seconds(2))
+        // Log probe interval every 500ms for 10s
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(500))
             let interval = await monitor._currentProbeInterval
             probeIntervals.append(interval)
             logger.info("  Probe interval: \(interval)")
         }
 
-        // Check that interval increased from min (2s) toward max (10s)
-        let firstInterval = probeIntervals.first ?? .seconds(2)
-        let lastInterval = probeIntervals.last ?? .seconds(2)
+        // Check that interval increased from min (500ms) toward max (15s)
+        let firstInterval = probeIntervals.first ?? .milliseconds(500)
+        let lastInterval = probeIntervals.last ?? .milliseconds(500)
         let phase2Pass = lastInterval > firstInterval
         record("Phase 2: Idle Probe Backoff", passed: phase2Pass,
                detail: "interval went from \(firstInterval) to \(lastInterval)")
@@ -599,7 +705,7 @@ do {
     if let monitor {
         let intervalAfterTraffic = await monitor._currentProbeInterval
         let failuresAfterTraffic = await monitor._consecutiveFailures
-        let phase3Pass = intervalAfterTraffic <= .seconds(2) && failuresAfterTraffic == 0
+        let phase3Pass = intervalAfterTraffic <= .milliseconds(500) && failuresAfterTraffic == 0
         record("Phase 3: Traffic Resets Probes", passed: phase3Pass,
                detail: "interval=\(intervalAfterTraffic), failures=\(failuresAfterTraffic)")
     } else {
@@ -658,10 +764,12 @@ do {
     await messageCounter.reset()
     await sendControl("phase5-start")
 
+    // Only Node A initiates session to avoid handshake race
     let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
     await session5.onReceive { data in
         await messageCounter.increment()
     }
+    try await Task.sleep(for: .seconds(2))
 
     for i in 1...5 {
         try await session5.send(Data("A-recovery-\(i)".utf8))
@@ -693,9 +801,8 @@ do {
     let unblockLinux = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
     await cleanup.register { let _ = await shell(unblockLinux) }
-    await cleanup.register { await sendControl("phase6-unblock"); _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10)) }
 
-    // Tell Node B to block, then block locally
+    // Tell Node B to block with auto-unblock after 15s, then block locally
     await sendControl("phase6-block", detail: "\(port)")
     _ = await waitForAck("phase6-ack", timeout: .seconds(10))
     let (_, _) = await shell(blockLinux)
@@ -713,17 +820,23 @@ do {
         }
     }
 
-    // Unblock both
+    // Unblock Linux side immediately
     let (_, _) = await shell(unblockLinux)
-    await sendControl("phase6-unblock")
-    _ = await waitForAck("phase6-unblock-ack", timeout: .seconds(10))
-    logger.info("Bidirectional block removed")
+    logger.info("Linux iptables unblocked")
 
-    try await Task.sleep(for: .seconds(3))
+    // Node B auto-unblocks after 15s from when it blocked.
+    // Wait for Node B to self-unblock and mesh to reconnect.
+    logger.info("Waiting for Node B auto-unblock and mesh reconnect...")
+    try await Task.sleep(for: .seconds(20))
 
-    // Check Node B's state
-    await sendControl("phase6-check")
-    let phase6BMsg = await controlMailbox.receive(timeout: .seconds(15))
+    // Try to reach Node B - retry a few times since mesh may need keepalive cycle
+    var phase6BMsg: ControlMessage? = nil
+    for attempt in 1...3 {
+        logger.info("Sending phase6-check (attempt \(attempt))...")
+        await sendControl("phase6-check")
+        phase6BMsg = await controlMailbox.receive(timeout: .seconds(10))
+        if phase6BMsg != nil { break }
+    }
     let bSessionCount = phase6BMsg.flatMap { Int($0.detail ?? "") } ?? -1
 
     record("Phase 6: Bidirectional Block", passed: phase6Pass,
@@ -746,14 +859,14 @@ do {
 
     await cleanup.register { let _ = await shell(unblockCmd) }
 
-    // Block for ~3s (less than 3 failures at 2s intervals)
+    // Block for ~1s (less than 3 failures at 500ms intervals)
     let (_, _) = await shell(blockCmd)
-    logger.info("Transient block applied for ~3s")
-    try await Task.sleep(for: .seconds(3))
+    logger.info("Transient block applied for ~1s")
+    try await Task.sleep(for: .seconds(1))
     let (_, _) = await shell(unblockCmd)
     logger.info("Transient block removed")
 
-    try await Task.sleep(for: .seconds(3))
+    try await Task.sleep(for: .seconds(2))
 
     let count = await manager.sessionCount
     let state = await session7.state

@@ -38,6 +38,9 @@ public actor TunnelManager {
     /// Session pool keyed by (machineId, channel)
     private var sessions: [TunnelSessionKey: TunnelSession] = [:]
 
+    /// Session IDs for verifying close handshakes
+    private var sessionIds: [TunnelSessionKey: String] = [:]
+
     /// Per-machine health monitors
     private var healthMonitors: [MachineId: TunnelHealthMonitor] = [:]
 
@@ -74,7 +77,11 @@ public actor TunnelManager {
 
     /// Get the health monitor for a specific machine (for test observation)
     public func getHealthMonitor(for machineId: MachineId) -> TunnelHealthMonitor? {
-        return healthMonitors[machineId]
+        let result = healthMonitors[machineId]
+        if result == nil {
+            logger.debug("getHealthMonitor: nil for \(machineId), keys=\(Array(healthMonitors.keys))")
+        }
+        return result
     }
 
     /// Initialize the tunnel manager
@@ -96,9 +103,18 @@ public actor TunnelManager {
             await self?.handleHandshake(from: machineId, data: data)
         }
 
-        // Register health probe handler — respond to probes and notify monitor
-        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
-            await self?.notifyPacketReceived(from: machineId)
+        // Register health probe handler — receiving a probe means remote is alive
+        // Echo back a response so the sender knows we're alive too
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
+            guard let self else { return }
+            if data.first == 0x01 {
+                // Incoming probe: remote is actively checking us. Update liveness and echo back.
+                await self.notifyPacketReceived(from: machineId)
+                try? await self.provider.sendOnChannel(Data([0x02]), toMachine: machineId, channel: self.healthProbeChannel)
+            } else if data.first == 0x02 {
+                // Probe response: only update lastPacketTime for liveness, don't reset probe interval
+                await self.notifyProbeResponseReceived(from: machineId)
+            }
         }
 
         isRunning = true
@@ -136,6 +152,7 @@ public actor TunnelManager {
             await session.close()
         }
         sessions.removeAll()
+        sessionIds.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
@@ -181,8 +198,11 @@ public actor TunnelManager {
 
         logger.info("Creating session", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
 
+        // Generate session ID for this session
+        let sid = UUID().uuidString.prefix(8).lowercased()
+
         // Send handshake with channel info
-        let handshake = SessionHandshake(type: .request, channel: channel)
+        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid))
         let data = try JSONEncoder().encode(handshake)
         try await provider.sendOnChannel(data, toMachine: machineId, channel: handshakeChannel)
 
@@ -195,13 +215,16 @@ public actor TunnelManager {
 
         await newSession.activate()
         sessions[key] = newSession
+        sessionIds[key] = String(sid)
 
         // Start health monitor for this machine if first session
         if healthMonitors[machineId] == nil {
+            logger.info("Creating health monitor for machine \(machineId.prefix(8))...")
             let monitor = TunnelHealthMonitor(
                 minProbeInterval: config.healthProbeMinInterval,
                 maxProbeInterval: config.healthProbeMaxInterval,
-                failureThreshold: config.healthFailureThreshold
+                failureThreshold: config.healthFailureThreshold,
+                graceIntervals: config.healthGraceIntervals
             )
             healthMonitors[machineId] = monitor
             await monitor.startMonitoring(
@@ -215,6 +238,8 @@ public actor TunnelManager {
                     await self.handleHealthFailure(machineId: id)
                 }
             )
+        } else {
+            logger.debug("Health monitor already exists for \(machineId.prefix(8))...")
         }
 
         logger.info("Session created", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
@@ -235,9 +260,12 @@ public actor TunnelManager {
     /// Close a specific session by key
     public func closeSession(key: TunnelSessionKey) async {
         guard let session = sessions.removeValue(forKey: key) else { return }
+        let sid = sessionIds.removeValue(forKey: key)
+
+        logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
         // Notify remote machine
-        let handshake = SessionHandshake(type: .close, channel: key.channel)
+        let handshake = SessionHandshake(type: .close, channel: key.channel, sessionId: sid)
         if let data = try? JSONEncoder().encode(handshake) {
             try? await provider.sendOnChannel(data, toMachine: key.remoteMachineId, channel: handshakeChannel)
         }
@@ -276,9 +304,18 @@ public actor TunnelManager {
         }
     }
 
+    /// Notify health monitor that a probe response arrived (liveness only, no interval reset)
+    private func notifyProbeResponseReceived(from machineId: MachineId) async {
+        if let monitor = healthMonitors[machineId] {
+            await monitor.onProbeResponseReceived()
+        }
+    }
+
     private func handleHealthFailure(machineId: MachineId) async {
-        logger.warning("Health check failed for machine", metadata: ["machine": "\(machineId)"])
+        logger.warning("Health check FAILED for machine — closing all sessions", metadata: ["machine": "\(machineId)"])
         await closeAllSessions(to: machineId)
+        // Remove dead monitor so new sessions get a fresh one
+        healthMonitors.removeValue(forKey: machineId)
     }
 
     private func reprobeAllMachines() async {
@@ -333,11 +370,33 @@ public actor TunnelManager {
                 )
                 await newSession.activate()
                 sessions[key] = newSession
+                sessionIds[key] = handshake.sessionId
 
                 // Send ack
-                let ack = SessionHandshake(type: .ack, channel: channel)
+                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
                 if let ackData = try? JSONEncoder().encode(ack) {
                     try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                }
+
+                // Start health monitor for this machine if first session
+                if healthMonitors[machineId] == nil {
+                    let monitor = TunnelHealthMonitor(
+                        minProbeInterval: config.healthProbeMinInterval,
+                        maxProbeInterval: config.healthProbeMaxInterval,
+                        failureThreshold: config.healthFailureThreshold,
+                        graceIntervals: config.healthGraceIntervals
+                    )
+                    healthMonitors[machineId] = monitor
+                    await monitor.startMonitoring(
+                        machineId: machineId,
+                        sendProbe: { [weak self] id in
+                            guard let self else { return }
+                            try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                        },
+                        onFailure: { [weak self] id in
+                            await self?.handleHealthFailure(machineId: id)
+                        }
+                    )
                 }
 
                 logger.info("Session accepted", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
@@ -361,7 +420,16 @@ public actor TunnelManager {
 
         case .close:
             let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            // Verify sessionId matches to reject stale close from old sessions
+            if let currentSid = sessionIds[key] {
+                let closeSid = handshake.sessionId
+                if closeSid != currentSid {
+                    logger.info("Ignoring stale close handshake (sid \(closeSid ?? "nil") != \(currentSid))", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                    return
+                }
+            }
             if let session = sessions.removeValue(forKey: key) {
+                sessionIds.removeValue(forKey: key)
                 await session.close()
                 logger.info("Session closed by machine", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
             }
@@ -381,9 +449,11 @@ struct SessionHandshake: Codable, Sendable {
 
     let type: HandshakeType
     let channel: String?
+    let sessionId: String?
 
-    init(type: HandshakeType, channel: String? = nil) {
+    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil) {
         self.type = type
         self.channel = channel
+        self.sessionId = sessionId
     }
 }
