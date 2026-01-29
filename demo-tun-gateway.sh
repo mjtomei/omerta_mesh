@@ -4,7 +4,8 @@
 #
 # What this tests:
 #   A single-process demo using real Linux TUN interfaces instead of userspace
-#   gVisor netstack. Requires Linux and sudo access.
+#   gVisor netstack. Linux only — macOS kernel networking (utun) is not yet
+#   implemented. Requires Linux and sudo access.
 #
 #   Mode "tun":
 #     Peer: TUNInterface (omerta0, kernel networking)

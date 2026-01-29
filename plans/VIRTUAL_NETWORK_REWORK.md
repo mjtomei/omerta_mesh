@@ -113,7 +113,8 @@ VirtualNetwork, TunnelManager) is identical regardless of which mode is used.
 ### Build Configuration
 
 - **App Store build** (`OMERTA_APPSTORE_BUILD`): Userspace only
-- **Direct build** (Linux/macOS): Both modes available, TUN requires root
+- **Direct build** (Linux): Both modes available, TUN requires root
+- **Direct build** (macOS): Userspace only — kernel networking (TUN/utun) not yet implemented
 
 ---
 
@@ -2091,10 +2092,14 @@ ssh -p 2222 localhost
 
 ---
 
-### Phase 9: TUN Interface (Linux)
+### Phase 9: TUN Interface (Linux Only)
 
 **Goal:** Implement real TUN interface for Linux, usable both as a mesh node's
 local interface and as a gateway's internet bridge.
+
+> **Platform note:** This phase is Linux-only. macOS uses a different kernel
+> interface (`utun` via `NetworkExtension.framework`) which is not yet
+> implemented. On macOS, use the userspace netstack mode (DemoSOCKSGateway).
 
 #### Architecture Context
 
@@ -2902,8 +2907,9 @@ ping -c 3 8.8.8.8
 
 **Deliverable:** TUN interface works on Linux with root, both as a mesh node
 local interface and as a gateway internet bridge via TUNBridgeAdapter. Two demo
-binaries demonstrate both modes: netstack (cross-platform, SOCKS proxy) and TUN
-(Linux-only, standard sockets).
+binaries demonstrate both modes: netstack (cross-platform including macOS, SOCKS
+proxy) and TUN (Linux-only, standard sockets). macOS kernel networking (utun)
+is deferred to a future phase.
 
 ---
 
