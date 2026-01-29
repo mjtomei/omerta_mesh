@@ -593,7 +593,20 @@ final class MultiNodeIntegrationTests: XCTestCase {
         await peers[1].sendPacket(to: "1.1.1.1", payload: "p2-dns")
         await peers[2].sendPacket(to: "9.9.9.9", payload: "p3-dns")
 
-        try await Task.sleep(for: .milliseconds(5000))
+        // Poll until all peers have received responses (timeout 10s)
+        let peerDeadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < peerDeadline {
+            var allReceived = true
+            for peer in peers {
+                let count = await peer.interface.receivedInboundCount()
+                if count == 0 {
+                    allReceived = false
+                    break
+                }
+            }
+            if allReceived { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
 
         // Each peer should have sent one packet to gateway
         for (i, peer) in peers.enumerated() {
@@ -677,7 +690,23 @@ final class MultiNodeIntegrationTests: XCTestCase {
         await peers[1].sendPacket(to: "1.1.1.1", payload: "p2-query")
         await peers[2].sendPacket(to: "9.9.9.9", payload: "p3-query")
 
-        try await Task.sleep(for: .milliseconds(5000))
+        // Poll until all nodes have received responses (timeout 10s)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
+            let gwCount = await gateway.interface.receivedInboundCount()
+            var allPeersReceived = true
+            for peer in peers {
+                let count = await peer.interface.receivedInboundCount()
+                if count == 0 {
+                    allPeersReceived = false
+                    break
+                }
+            }
+            if gwCount > 0 && allPeersReceived {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
 
         // --- Verify gateway's own internet access ---
 
