@@ -105,5 +105,12 @@ let package = Package(
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
         ]),
+        .plugin(
+            name: "SetupHooks",
+            capability: .command(
+                intent: .custom(verb: "setup-hooks", description: "Configure git hooks path to .githooks"),
+                permissions: []
+            )
+        ),
     ]
 )
