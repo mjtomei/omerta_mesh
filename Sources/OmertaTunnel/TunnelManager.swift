@@ -74,7 +74,11 @@ public actor TunnelManager {
 
     /// Get the health monitor for a specific machine (for test observation)
     public func getHealthMonitor(for machineId: MachineId) -> TunnelHealthMonitor? {
-        return healthMonitors[machineId]
+        let result = healthMonitors[machineId]
+        if result == nil {
+            logger.debug("getHealthMonitor: nil for \(machineId), keys=\(Array(healthMonitors.keys))")
+        }
+        return result
     }
 
     /// Initialize the tunnel manager
@@ -198,6 +202,7 @@ public actor TunnelManager {
 
         // Start health monitor for this machine if first session
         if healthMonitors[machineId] == nil {
+            logger.info("Creating health monitor for machine \(machineId.prefix(8))...")
             let monitor = TunnelHealthMonitor(
                 minProbeInterval: config.healthProbeMinInterval,
                 maxProbeInterval: config.healthProbeMaxInterval,
@@ -215,6 +220,8 @@ public actor TunnelManager {
                     await self.handleHealthFailure(machineId: id)
                 }
             )
+        } else {
+            logger.debug("Health monitor already exists for \(machineId.prefix(8))...")
         }
 
         logger.info("Session created", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])

@@ -1664,6 +1664,107 @@ public actor MeshNode {
         }
     }
 
+    /// Ping a specific machine by MachineId. Used when multiple machines share a PeerId.
+    /// - Parameters:
+    ///   - machineId: The machine to ping
+    ///   - timeout: Timeout in seconds
+    ///   - requestFullList: If true, request the peer's full peer list (for bootstrap/reconnection)
+    /// - Returns: PingResult with latency and gossip info, or nil if failed
+    public func sendPingWithDetails(toMachine machineId: MachineId, timeout: TimeInterval = 3.0, requestFullList: Bool = false) async -> PingResult? {
+        // Look up peerId from registry
+        guard let peerId = await machinePeerRegistry.getMostRecentPeer(for: machineId) else {
+            logger.debug("sendPing: No peer found for machine \(machineId)")
+            return nil
+        }
+
+        // Get endpoints for this specific machine (not all machines for the peer)
+        let endpoints = await endpointManager.getEndpoints(peerId: peerId, machineId: machineId)
+        guard let endpoint = EndpointUtils.preferredEndpoint(from: endpoints) else {
+            logger.debug("sendPing: No endpoint for machine \(machineId) (peer \(peerId))")
+            return nil
+        }
+
+        // Log endpoint selection for debugging
+        if endpoints.count > 1 {
+            logger.debug("sendPing: Selected endpoint \(endpoint) from \(endpoints.count) available for machine \(machineId)")
+        }
+
+        // Build our recentPeers to send (with machineId and NAT type)
+        let peerInfoList = await buildPeerEndpointInfoList(currentEndpoint: endpoint)
+        let sentPeers = Array(peerInfoList.prefix(5))
+        let myNATType = await getPredictedNATType().type
+        let ping = MeshMessage.ping(recentPeers: sentPeers, myNATType: myNATType, requestFullList: requestFullList)
+
+        let startTime = Date()
+        do {
+            let response = try await sendAndReceive(ping, to: endpoint, timeout: timeout)
+            if case .pong(let receivedPeers, let yourEndpoint, let theirNATType) = response {
+                let latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
+                logger.info("Received pong from machine \(machineId) (peer \(peerId.prefix(8))...) with \(receivedPeers.count) peers, ourEndpoint=\(yourEndpoint)")
+
+                // Update our observed endpoint for NAT prediction
+                await updateObservedEndpoint(yourEndpoint, reportedBy: peerId)
+
+                // Track sender's NAT type
+                await endpointManager.updateNATType(peerId: peerId, natType: theirNATType)
+
+                // Learn new peers from gossip
+                var newPeers: [PeerEndpointInfo] = []
+                for peerInfo in receivedPeers where peerInfo.peerId != identity.peerId {
+                    let existingEndpoints = await endpointManager.getAllEndpoints(peerId: peerInfo.peerId)
+                    let isNewlyLearnedPeer = existingEndpoints.isEmpty
+
+                    await endpointManager.recordMessageReceived(
+                        from: peerInfo.peerId,
+                        machineId: peerInfo.machineId,
+                        endpoint: peerInfo.endpoint
+                    )
+
+                    await endpointManager.updateNATType(peerId: peerInfo.peerId, natType: peerInfo.natType)
+
+                    if isNewlyLearnedPeer {
+                        logger.info("Learned NEW peer \(peerInfo.peerId.prefix(16))... at \(peerInfo.endpoint) from pong")
+                        newPeers.append(peerInfo)
+                    } else if !existingEndpoints.contains(peerInfo.endpoint) {
+                        logger.info("Learned NEW endpoint for \(peerInfo.peerId.prefix(16))...: \(peerInfo.endpoint) (had: \(existingEndpoints.first ?? "none"))")
+                        newPeers.append(peerInfo)
+                    }
+                }
+
+                // Record this as a recent contact
+                await freshnessManager.recordContact(
+                    peerId: peerId,
+                    reachability: .direct(endpoint: endpoint),
+                    latencyMs: latencyMs,
+                    connectionType: .direct
+                )
+
+                // In forceRelayOnly mode, add any responsive peer as a potential relay
+                if config.forceRelayOnly && !connectedRelays.contains(peerId) {
+                    connectedRelays.insert(peerId)
+                    logger.info("forceRelayOnly: Added \(peerId.prefix(16))... as connected relay")
+                }
+
+                // Log latency sample
+                await eventLogger?.recordLatencySample(peerId: peerId, latencyMs: Double(latencyMs))
+
+                return PingResult(
+                    peerId: peerId,
+                    endpoint: endpoint,
+                    latencyMs: latencyMs,
+                    sentPeers: sentPeers,
+                    receivedPeers: receivedPeers,
+                    newPeers: newPeers
+                )
+            }
+            return nil
+        } catch {
+            logger.warning("sendPing: Failed to ping machine \(machineId) (peer \(peerId.prefix(8))...) at \(endpoint): \(error)")
+            await eventLogger?.recordLatencyLoss(peerId: peerId)
+            return nil
+        }
+    }
+
     // MARK: - Keepalive Management
 
     /// Add a direct connection to keepalive monitoring
