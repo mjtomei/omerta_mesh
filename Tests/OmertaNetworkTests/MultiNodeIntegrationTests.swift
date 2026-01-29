@@ -132,6 +132,12 @@ actor TestChannelProvider: ChannelProvider {
     func clearSentMessages() {
         sentMessages.removeAll()
     }
+
+    func drainSentMessages() -> [(data: Data, target: MachineId, channel: String)] {
+        let messages = sentMessages
+        sentMessages.removeAll()
+        return messages
+    }
 }
 
 /// Manages connections between test nodes and relays messages
@@ -164,11 +170,10 @@ actor TestNetworkMesh {
 
         for (machineId, node) in nodes {
             let provider = await node.provider
-            let messages = await provider.sentMessages
+            let messages = await provider.drainSentMessages()
             for msg in messages {
                 pendingMessages.append((machineId, msg.target, msg.data, msg.channel))
             }
-            await provider.clearSentMessages()
         }
 
         // Deliver messages to target nodes
