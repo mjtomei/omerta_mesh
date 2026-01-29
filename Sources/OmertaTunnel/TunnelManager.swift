@@ -111,6 +111,7 @@ public actor TunnelManager {
         // so each side's outgoing probe serves as the liveness signal for the other.
         try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
             guard let self else { return }
+            self.logger.info("Health probe received from \(machineId.prefix(8))...")
             await self.notifyProbeReceived(from: machineId)
         }
 
