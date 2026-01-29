@@ -363,14 +363,13 @@ final class TunnelManagerTests: XCTestCase {
         let remoteMachineId = await establishedSession?.remoteMachineId
         XCTAssertEqual(remoteMachineId, "remote-initiator")
 
-        // Ack should have been sent
-        let messages = await provider.getSentMessages()
-        XCTAssertEqual(messages.count, 1)
-        XCTAssertEqual(messages[0].to, "remote-initiator")
-        XCTAssertEqual(messages[0].channel, "tunnel-handshake")
+        // Ack should have been sent (filter to handshake channel — health probes may also be sent)
+        let handshakeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-handshake" }
+        XCTAssertEqual(handshakeMessages.count, 1)
+        XCTAssertEqual(handshakeMessages[0].to, "remote-initiator")
 
         // Verify it's an ack
-        let sentHandshake = try JSONDecoder().decode(SessionHandshake.self, from: messages[0].data)
+        let sentHandshake = try JSONDecoder().decode(SessionHandshake.self, from: handshakeMessages[0].data)
         XCTAssertEqual(sentHandshake.type, .ack)
 
         await manager.stop()
@@ -496,7 +495,8 @@ final class TunnelManagerTests: XCTestCase {
 
         _ = try await manager.getSession(machineId: "machine-1", channel: "control")
 
-        let messages = await provider.getSentMessages()
+        // Filter to handshake channel — health probes may also be sent
+        let messages = await provider.getSentMessages().filter { $0.channel == "tunnel-handshake" }
         XCTAssertEqual(messages.count, 1)
 
         let handshake = try JSONDecoder().decode(SessionHandshake.self, from: messages[0].data)
