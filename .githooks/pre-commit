@@ -145,6 +145,11 @@ for file in $STAGED_FILES; do
         continue
     fi
 
+    # Skip git hooks (they contain the pattern strings they check for)
+    if [[ "$file" =~ \.githooks/ ]]; then
+        continue
+    fi
+
     # Skip if file doesn't exist (deleted)
     [ -f "$file" ] || continue
 
@@ -153,6 +158,129 @@ for file in $STAGED_FILES; do
             echo "ERROR: Potential sensitive data in $file"
             echo "  Pattern: $pattern"
             grep -niE "$pattern" "$file" | head -3 | sed 's/^/  /'
+            FOUND=1
+        fi
+    done
+done
+
+# =============================================================================
+# BLOCK: Local network state — IP addresses, firewall rules, network commands
+# =============================================================================
+# These patterns catch hardcoded LAN IPs, firewall manipulation, traffic control,
+# and other machine-specific network state that should not be committed.
+
+NETWORK_PATTERNS=(
+    # Private/LAN IPv4 addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+    '192\.168\.[0-9]+\.[0-9]+'
+    '\b10\.[0-9]+\.[0-9]+\.[0-9]+'
+    '172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+'
+
+    # Firewall manipulation
+    '\biptables\b'
+    '\bip6tables\b'
+    '\bnftables\b'
+    '\bnft\b'
+    '\bpfctl\b'
+    '\bufw\b'
+    '\bfirewall-cmd\b'
+
+    # Traffic control / network emulation
+    '\btc qdisc\b'
+    '\btc class\b'
+    '\btc filter\b'
+    '\bnetem\b'
+
+    # Interface / routing manipulation
+    '\bip addr add\b'
+    '\bip addr del\b'
+    '\bip route add\b'
+    '\bip route del\b'
+    '\bifconfig\b.*\b(up|down|add|delete)\b'
+
+    # SSH to specific hosts (machine-specific orchestration)
+    '\bssh\s+\S+\s+"?sudo\b'
+
+    # Machine-specific hostnames and paths
+    '\b(enP[0-9]s[0-9]|eth[0-9]|wlan[0-9])\b'
+)
+
+# RFC 5737 documentation IPs that are safe to use in code:
+#   192.0.2.0/24 (TEST-NET-1), 198.51.100.0/24 (TEST-NET-2), 203.0.113.0/24 (TEST-NET-3)
+# These are excluded from the private IP checks below.
+SAFE_IP_EXCLUDE='192\.0\.2\.|198\.51\.100\.|203\.0\.113\.'
+
+for file in $STAGED_FILES; do
+    # Skip binary files
+    if [[ "$file" =~ \.(png|jpg|gif|ico|woff|ttf|eot|pdf|zip|tar|gz|exe|dll|so|dylib)$ ]]; then
+        continue
+    fi
+
+    # Skip git hooks themselves
+    if [[ "$file" =~ \.githooks/ ]]; then
+        continue
+    fi
+
+    # Skip if file doesn't exist (deleted)
+    [ -f "$file" ] || continue
+
+    for pattern in "${NETWORK_PATTERNS[@]}"; do
+        # For IP address patterns, exclude RFC 5737 documentation IPs
+        if [[ "$pattern" == *'192\.'* ]] || [[ "$pattern" == *'10\.'* ]] || [[ "$pattern" == *'172\.'* ]]; then
+            MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null | grep -vE "$SAFE_IP_EXCLUDE" || true)
+        else
+            MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null || true)
+        fi
+        if [ -n "$MATCHES" ]; then
+            echo "ERROR: Local network state in $file"
+            echo "  Pattern: $pattern"
+            echo "  Scripts with machine-specific network state should not be committed."
+            echo "  For examples/docs, use RFC 5737 IPs: 192.0.2.x, 198.51.100.x, 203.0.113.x"
+            echo "$MATCHES" | head -3 | sed 's/^/  /'
+            FOUND=1
+        fi
+    done
+done
+
+# =============================================================================
+# BLOCK: Absolute paths — machine-specific filesystem references
+# =============================================================================
+# Absolute paths tie code to a specific machine layout and should be avoided
+# in committed code. Use relative paths or environment variables instead.
+
+ABSPATH_PATTERNS=(
+    # Unix absolute paths (but not common system paths used in shebangs/includes)
+    '/home/[a-zA-Z0-9_]+'
+    '/Users/[a-zA-Z0-9_]+'
+    '/tmp/[a-zA-Z0-9_]+'
+    '/var/[a-zA-Z0-9_]+/[a-zA-Z0-9_]+'
+    '/opt/[a-zA-Z0-9_]+/[a-zA-Z0-9_]+'
+)
+
+# Lines to exclude (shebangs, comments referencing standard paths, build system)
+ABSPATH_EXCLUDE='(^#!|^[0-9]+:[[:space:]]*(#|//|/\*)|/usr/bin|/usr/lib|/usr/local|/usr/share|Package\.resolved|\.build/)'
+
+for file in $STAGED_FILES; do
+    # Skip binary files
+    if [[ "$file" =~ \.(png|jpg|gif|ico|woff|ttf|eot|pdf|zip|tar|gz|exe|dll|so|dylib)$ ]]; then
+        continue
+    fi
+
+    # Skip git hooks themselves (they legitimately use $REPO_ROOT etc.)
+    if [[ "$file" =~ \.githooks/ ]]; then
+        continue
+    fi
+
+    # Skip if file doesn't exist (deleted)
+    [ -f "$file" ] || continue
+
+    for pattern in "${ABSPATH_PATTERNS[@]}"; do
+        # Find matches, then exclude known-safe lines
+        MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null | grep -vE "$ABSPATH_EXCLUDE" || true)
+        if [ -n "$MATCHES" ]; then
+            echo "ERROR: Absolute path in $file"
+            echo "  Pattern: $pattern"
+            echo "  Use relative paths or environment variables instead."
+            echo "$MATCHES" | head -3 | sed 's/^/  /'
             FOUND=1
         fi
     done
