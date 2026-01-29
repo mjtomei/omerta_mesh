@@ -775,6 +775,19 @@ if !isNodeA {
             let count = await manager.sessionCount
             await sendControl("phase8-report", detail: "\(count)")
 
+        case "phase10-latency-start":
+            // Send messages on demand during latency sub-phases
+            guard let session = await latestSession.get() else {
+                logger.error("Node B: no session for phase10")
+                await sendControl("phase10-latency-ack")
+                continue
+            }
+            for i in 1...5 {
+                try await session.send(Data("B-latency-\(i)".utf8))
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            await sendControl("phase10-latency-ack", detail: "\(await messageCounter.count)")
+
         case "done":
             logger.info("Node B: test complete")
             await sendControl("done-ack")
@@ -1213,9 +1226,126 @@ record("Phase 9: Endpoint Change Detection", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-// MARK: - Phase 10: Summary
+// MARK: - Phase 10: Artificial Latency & Jitter (Linux only)
 
-logPhase("Phase 10: Summary")
+logPhase("Phase 10: Artificial Latency & Jitter")
+
+#if os(Linux)
+do {
+    // Find the outgoing interface to the remote host
+    let (_, ifOutput10) = await shell("ip route get \(remoteHost) | head -1 | awk '{print $5}'")
+    let iface10 = ifOutput10.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !iface10.isEmpty else {
+        record("Phase 10: Latency & Jitter", passed: false, detail: "Could not determine interface")
+        throw TunnelError.notConnected
+    }
+    logger.info("Using interface: \(iface10)")
+
+    // Ensure a fresh session
+    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency")
+    await session10.onReceive { _ in await messageCounter.increment() }
+    try await Task.sleep(for: .seconds(2))
+
+    struct LatencyProfile {
+        let name: String
+        let tcArgs: String      // netem arguments
+        let expectAlive: Bool   // do we expect sessions to survive?
+    }
+
+    let profiles: [LatencyProfile] = [
+        LatencyProfile(name: "50ms fixed", tcArgs: "delay 50ms", expectAlive: true),
+        LatencyProfile(name: "200ms fixed", tcArgs: "delay 200ms", expectAlive: true),
+        LatencyProfile(name: "100ms +/- 80ms jitter", tcArgs: "delay 100ms 80ms distribution normal", expectAlive: true),
+        LatencyProfile(name: "500ms +/- 400ms high jitter", tcArgs: "delay 500ms 400ms distribution normal", expectAlive: true),
+        LatencyProfile(name: "1% packet loss", tcArgs: "loss 1%", expectAlive: true),
+        LatencyProfile(name: "10% packet loss", tcArgs: "loss 10%", expectAlive: true),
+    ]
+
+    var subResults: [(String, Bool, String)] = []
+
+    for profile in profiles {
+        logger.info("  Sub-test: \(profile.name)")
+
+        // Apply netem qdisc
+        let addQdisc = "tc qdisc add dev \(iface10) root netem \(profile.tcArgs)"
+        await stateTracker.recordIptablesRule(addQdisc) // reuse iptables tracker for tc rules
+        let (addExit, addOut) = await shell(addQdisc)
+        if addExit != 0 {
+            logger.warning("  tc add failed: \(addOut), trying replace...")
+            let (replExit, replOut) = await shell("tc qdisc replace dev \(iface10) root netem \(profile.tcArgs)")
+            if replExit != 0 {
+                logger.error("  tc replace also failed: \(replOut)")
+                subResults.append((profile.name, false, "tc setup failed"))
+                continue
+            }
+        }
+
+        // Register cleanup
+        let delQdisc = "tc qdisc del dev \(iface10) root netem"
+
+        // Send traffic both directions
+        await messageCounter.reset()
+        await sendControl("phase10-latency-start")
+
+        for i in 1...5 {
+            try? await session10.send(Data("A-latency-\(i)".utf8))
+            try await Task.sleep(for: .milliseconds(200))
+        }
+
+        // Wait for messages + ack
+        let latencyAck = await waitForAck("phase10-latency-ack", timeout: .seconds(30))
+        try await Task.sleep(for: .seconds(2))
+
+        let received = await messageCounter.count
+        let sessionAlive = await manager.sessionCount > 0
+        let monitorOk: Bool
+        if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+            let failures = await mon._consecutiveFailures
+            monitorOk = failures < 3
+        } else {
+            monitorOk = false
+        }
+
+        // Remove netem
+        let (_, _) = await shell(delQdisc)
+        await stateTracker.removeIptablesRule(addQdisc)
+
+        let pass: Bool
+        if profile.expectAlive {
+            pass = sessionAlive && latencyAck && monitorOk
+        } else {
+            pass = !sessionAlive
+        }
+
+        let detail = "recv=\(received), alive=\(sessionAlive), ack=\(latencyAck), monitorOk=\(monitorOk)"
+        subResults.append((profile.name, pass, detail))
+        logger.info("    [\(pass ? "PASS" : "FAIL")] \(profile.name): \(detail)")
+
+        // Let network settle between profiles
+        try await Task.sleep(for: .seconds(2))
+
+        // Re-create session if it died
+        if !sessionAlive {
+            let _ = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency")
+            try await Task.sleep(for: .seconds(2))
+        }
+    }
+
+    let allSubPassed = subResults.allSatisfy { $0.1 }
+    let summaryDetail = subResults.map { "  \($0.1 ? "PASS" : "FAIL") \($0.0): \($0.2)" }.joined(separator: "\n")
+    record("Phase 10: Latency & Jitter", passed: allSubPassed,
+           detail: "\(subResults.filter { $0.1 }.count)/\(subResults.count) sub-tests passed\n\(summaryDetail)")
+} catch {
+    record("Phase 10: Latency & Jitter", passed: false, detail: "Error: \(error)")
+}
+#else
+record("Phase 10: Latency & Jitter", passed: true,
+       detail: "Skipped (Linux only)")
+#endif
+
+// MARK: - Phase 11: Summary
+
+logPhase("Phase 11: Summary")
 
 await sendControl("done")
 _ = await waitForAck("done-ack", timeout: .seconds(10))
