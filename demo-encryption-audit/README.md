@@ -20,7 +20,7 @@ Each `.patch` file simulates a different bad change to `MeshNode.swift`:
 ## Running
 
 ```bash
-cd plans/encryption-audit-demo
+cd demo-encryption-audit
 ./run-demo.sh
 ```
 

@@ -142,9 +142,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
 
         // Zero out the last 32 bytes (payload ciphertext + tag area)
         let start = corrupted.count - 32
-        for i in start..<corrupted.count {
-            corrupted[i] = 0x00
-        }
+        corrupted.replaceSubrange(start..<corrupted.count,
+                                  with: Data(repeating: 0x00, count: 32))
 
         XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(corrupted), "Prefix still valid")
         XCTAssertThrowsError(try BinaryEnvelopeV2.decode(corrupted, networkKey: testKey),

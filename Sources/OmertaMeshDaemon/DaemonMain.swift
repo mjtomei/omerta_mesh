@@ -137,7 +137,7 @@ struct Start: AsyncParsableCommand {
         }
         #else
         if auditEncryption {
-            logger.warning("--audit-encryption is only available in DEBUG builds")
+            fatalError("--audit-encryption is only available in DEBUG builds; rebuild with DEBUG enabled or remove this flag.")
         }
         #endif
 

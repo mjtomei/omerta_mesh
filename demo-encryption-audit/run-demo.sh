@@ -18,7 +18,7 @@ set -euo pipefail
 REPO_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 DEMO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK_DIR=$(mktemp -d)
-BRANCH="security-fixes"
+BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD)"
 
 trap 'rm -rf "$WORK_DIR"' EXIT
 
