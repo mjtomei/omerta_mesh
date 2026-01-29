@@ -86,6 +86,10 @@ struct PhaseResult {
 
 // MARK: - Logging Setup
 
+// Disable output buffering so logs appear immediately when redirected to a file
+setbuf(stdout, nil)
+setbuf(stderr, nil)
+
 LoggingSystem.bootstrap { label in
     var handler = StreamLogHandler.standardOutput(label: label)
     if label.contains("tunnel") || label.contains("health-test") {
