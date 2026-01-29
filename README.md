@@ -5,10 +5,10 @@ A standalone P2P mesh networking library in Swift, providing secure peer-to-peer
 ## Features
 
 - **End-to-end encrypted messaging** using ChaCha20-Poly1305
-- **NAT traversal** with automatic type detection and hole punching
-- **Relay support** for peers behind symmetric NAT
-- **Gossip-based peer discovery** for decentralized networking
-- **TCP/UDP tunneling** over mesh connections via netstack
+- **NAT traversal and relay support**
+- **Link health monitoring and automated gossip protocol** 
+- **Virtual network** with userspace server support
+- **Encryption enforcement audit** (`--audit-encryption`)
 - **Cross-platform** (macOS 13+, Linux)
 
 ## Modules
@@ -16,9 +16,15 @@ A standalone P2P mesh networking library in Swift, providing secure peer-to-peer
 | Module | Description |
 |--------|-------------|
 | **OmertaMesh** | Core mesh networking library |
+| **OmertaNetwork** | Virtual networking: DHCP, TUN interfaces, packet routing, subnet selection |
 | **OmertaTunnel** | TCP/UDP tunnels over mesh connections |
 | **OmertaSSH** | SSH client over mesh tunnels |
+| **OmertaMeshDaemon** | `omerta-meshd` daemon with IPC |
 | **OmertaMeshCLI** | CLI for testing and debugging |
+| **DemoSOCKSGateway** | SOCKS5 proxy with DNS through gateway netstack |
+| **DemoTUNGateway** | TUN interface gateway demo |
+| **HealthTestRunner** | Multi-phase cross-machine health monitoring test |
+| **CNetstack** | C bridge for gVisor netstack |
 
 ## Building
 
@@ -58,7 +64,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/your-org/omerta_mesh.git", from: "1.0.0"),
+    .package(url: "https://github.com/mjtomei/omerta_mesh.git", from: "1.0.0"),
 ],
 targets: [
     .target(
@@ -99,6 +105,16 @@ See [plans/notes.txt](../plans/notes.txt) for the latest human-managed TODO list
 - [x] TCP/UDP tunneling via gVisor netstack
 - [x] Cross-platform support (macOS 13+, Linux)
 - [x] Separated into standalone library with clean API
+- [x] OmertaNetwork module (virtual networking, DHCP, packet routing, TUN)
+- [x] Health monitoring and endpoint change detection
+- [x] SOCKS5 proxy and TCP port forwarder
+- [x] Security hardening: encryption enforcement, SealedEnvelope, audit mode
+- [x] Multi-phase cross-machine health test runner
+- [x] SPM build plugins
+
+### LOC
+
+~30,000 implementation / ~27,000 tests
 
 ### TODO
 
@@ -107,6 +123,7 @@ See [plans/notes.txt](../plans/notes.txt) for the latest human-managed TODO list
 - [ ] Handle diverse cases where inbound traffic isn't allowed (IPv4 and IPv6)
 - [ ] Add reasonable rate limiting to UDP socket wrapper
 - [ ] Implement mosh-clone SSH client for use with mesh tunnel
+- [ ] macOS kernel networking for TUN interfaces
 - [ ] Implement VPN functionality using Tunnel utility for internet connections
 - [ ] Multi-radio support and connection prioritization
 - [ ] Traffic shaping and bandwidth splitting
