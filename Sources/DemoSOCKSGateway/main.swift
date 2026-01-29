@@ -84,9 +84,38 @@ actor E2ERelay {
     }
 }
 
+// MARK: - Stale process cleanup
+
+/// Kill any other running instances of this binary so we don't get port conflicts.
+func killStaleInstances() {
+    let myPID = ProcessInfo.processInfo.processIdentifier
+    // Use pgrep -x (exact comm name match) to avoid matching sudo wrappers.
+    // Comm name is truncated to 15 chars: "DemoSOCKSGatewa"
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    proc.arguments = ["-x", "DemoSOCKSGatewa"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch { return }
+    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    for line in output.split(separator: "\n") {
+        guard let pid = Int32(line.trimmingCharacters(in: .whitespaces)),
+              pid != myPID else { continue }
+        kill(pid, SIGTERM)
+        usleep(500_000)
+        kill(pid, SIGKILL)
+    }
+}
+
 // MARK: - Main
 
 let logger = Logger(label: "demo.socks-gateway")
+
+killStaleInstances()
 
 logger.info("Setting up DemoSOCKSGateway...")
 
@@ -163,6 +192,7 @@ print("""
 ============================================================
 
 """)
+fflush(stdout)
 
 // 9. Wait for SIGINT, printing stats periodically
 signal(SIGINT, SIG_IGN)
