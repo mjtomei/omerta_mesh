@@ -16,6 +16,104 @@ import NIOPosix
 import Glibc
 #endif
 
+// MARK: - Test State Tracker
+//
+// Tracks all system modifications (iptables rules, pfctl rules, temp IPs) in hidden
+// files so that cleanup and pre-flight only remove what the test actually added.
+// State directory: ~/.health-test-state/
+
+actor TestStateTracker {
+    private let stateDir: String
+
+    init() {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
+        stateDir = "\(home)/.health-test-state"
+    }
+
+    private func ensureDir() {
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+    }
+
+    private func filePath(_ name: String) -> String { "\(stateDir)/\(name)" }
+
+    private func readEntries(_ name: String) -> [String] {
+        guard let data = FileManager.default.contents(atPath: filePath(name)),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    }
+
+    private func writeEntries(_ name: String, _ entries: [String]) {
+        ensureDir()
+        let text = entries.joined(separator: "\n") + (entries.isEmpty ? "" : "\n")
+        try? text.write(toFile: filePath(name), atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - iptables rules
+
+    func recordIptablesRule(_ rule: String) {
+        var entries = readEntries("iptables-rules")
+        entries.append(rule)
+        writeEntries("iptables-rules", entries)
+    }
+
+    func removeIptablesRule(_ rule: String) {
+        var entries = readEntries("iptables-rules")
+        if let idx = entries.firstIndex(of: rule) {
+            entries.remove(at: idx)
+        }
+        writeEntries("iptables-rules", entries)
+    }
+
+    func allIptablesRules() -> [String] { readEntries("iptables-rules") }
+
+    // MARK: - pfctl rules
+
+    func recordPfctlRule(_ rule: String) {
+        var entries = readEntries("pfctl-rules")
+        entries.append(rule)
+        writeEntries("pfctl-rules", entries)
+    }
+
+    func removePfctlRule(_ rule: String) {
+        var entries = readEntries("pfctl-rules")
+        if let idx = entries.firstIndex(of: rule) {
+            entries.remove(at: idx)
+        }
+        writeEntries("pfctl-rules", entries)
+    }
+
+    func allPfctlRules() -> [String] { readEntries("pfctl-rules") }
+
+    // MARK: - temp IPs
+
+    func recordTempIP(_ entry: String) {
+        // entry format: "192.168.12.122/24 dev eth0"
+        var entries = readEntries("temp-ips")
+        entries.append(entry)
+        writeEntries("temp-ips", entries)
+    }
+
+    func removeTempIP(_ entry: String) {
+        var entries = readEntries("temp-ips")
+        if let idx = entries.firstIndex(of: entry) {
+            entries.remove(at: idx)
+        }
+        writeEntries("temp-ips", entries)
+    }
+
+    func allTempIPs() -> [String] { readEntries("temp-ips") }
+
+    // MARK: - Clear all state
+
+    func clearAll() {
+        writeEntries("iptables-rules", [])
+        writeEntries("pfctl-rules", [])
+        writeEntries("temp-ips", [])
+    }
+}
+
+let stateTracker = TestStateTracker()
+
 // MARK: - Cleanup Actor
 
 actor Cleanup {
@@ -225,79 +323,69 @@ if !staleProcs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
     try await Task.sleep(for: .seconds(2))
 }
 
-logger.info("Pre-flight cleanup: clearing stale firewall rules...")
+logger.info("Pre-flight cleanup: clearing stale state from previous runs...")
+
+// Only remove modifications that were tracked in state files from previous runs
 #if os(Linux)
-// Remove any leftover iptables rules referencing our port
-let (_, existingRules) = await shell("iptables-save 2>/dev/null | grep '\\-\\-dport \(port)' | grep -v '^#' || true")
-for rule in existingRules.split(separator: "\n") {
-    let ruleTrimmed = String(rule).trimmingCharacters(in: .whitespaces)
-    if !ruleTrimmed.isEmpty {
-        // Convert -A to -D for deletion
-        let deleteRule = ruleTrimmed.replacingOccurrences(of: "-A ", with: "-D ")
-        logger.info("  Removing stale rule: \(deleteRule)")
-        let _ = await shell("iptables \(deleteRule)")
+// Remove iptables rules recorded by a previous test run
+let staleIptables = await stateTracker.allIptablesRules()
+if !staleIptables.isEmpty {
+    logger.info("  Found \(staleIptables.count) tracked iptables rule(s) to remove")
+    for rule in staleIptables {
+        // rule is stored as the -A command; convert to -D for deletion
+        let deleteRule = rule.replacingOccurrences(of: "iptables -A ", with: "iptables -D ")
+        logger.info("  Removing: \(deleteRule)")
+        let _ = await shell(deleteRule)
     }
 }
-// Remove only temp IPs from the 192.168.12.122-254 range that the test may have added.
-// Don't touch .121 (our host), .209 (remote host), or anything below .122.
-let (_, existingTempIPs) = await shell("ip -4 addr show | grep 'inet 192.168.12' | awk '{print $2, $NF}' || true")
-for line in existingTempIPs.split(separator: "\n") {
-    let parts = String(line).trimmingCharacters(in: .whitespaces).split(separator: " ")
-    if parts.count == 2 {
-        let addr = String(parts[0]) // e.g. "192.168.12.122/24"
-        let iface = String(parts[1])
-        let ipOnly = addr.split(separator: "/").first.map(String.init) ?? addr
-        // Only remove IPs in the test's temp range (122-254)
-        let octets = ipOnly.split(separator: ".")
-        if octets.count == 4, let lastOctet = Int(octets[3]), lastOctet >= 122 {
-            logger.info("  Removing stale test IP: \(addr) dev \(iface)")
-            let _ = await shell("ip addr del \(addr) dev \(iface)")
-        }
+
+// Remove temp IPs recorded by a previous test run
+let staleIPs = await stateTracker.allTempIPs()
+if !staleIPs.isEmpty {
+    logger.info("  Found \(staleIPs.count) tracked temp IP(s) to remove")
+    for entry in staleIPs {
+        // entry format: "ip addr add 192.168.12.X/24 dev ethN"
+        let delCmd = entry.replacingOccurrences(of: "ip addr add ", with: "ip addr del ")
+        logger.info("  Removing: \(delCmd)")
+        let _ = await shell(delCmd)
     }
 }
 #else
-// macOS: only remove test-specific pfctl rules (don't destroy pre-existing rules)
-let (_, pfEnabled) = await shell("pfctl -s info 2>&1 | head -1 || true")
-logger.info("  pfctl status: \(pfEnabled.trimmingCharacters(in: .whitespacesAndNewlines))")
-let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
-let pfRulesTrimmed = pfRules.trimmingCharacters(in: .whitespacesAndNewlines)
-if !pfRulesTrimmed.isEmpty {
-    logger.info("  Active pfctl rules:\n\(pfRules)")
-}
-// Only remove rules that reference our test port — leave other rules intact
-let testPortStr = "port \(port)"
-let hasTestRules = pfRulesTrimmed.split(separator: "\n").contains { $0.contains(testPortStr) }
-if hasTestRules {
-    logger.info("  Found test-specific pfctl rules (port \(port)), removing...")
-    // Reload rules without the test-specific ones
+// macOS: remove pfctl rules recorded by a previous test run
+let stalePfctl = await stateTracker.allPfctlRules()
+if !stalePfctl.isEmpty {
+    logger.info("  Found \(stalePfctl.count) tracked pfctl rule(s) to remove")
+    // Get current rules and remove only the tracked ones
+    let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
+    let pfRulesTrimmed = pfRules.trimmingCharacters(in: .whitespacesAndNewlines)
+    let stalePfctlSet = Set(stalePfctl)
     let cleanedRules = pfRulesTrimmed.split(separator: "\n")
-        .filter { !$0.contains(testPortStr) }
+        .filter { !stalePfctlSet.contains(String($0)) }
         .joined(separator: "\n")
-    if cleanedRules.isEmpty {
-        // All rules were ours — disable pfctl
-        let (d1Exit, d1Out) = await shell("pfctl -d 2>&1 || true")
-        logger.info("  pfctl -d (all rules were test rules): exit=\(d1Exit) \(d1Out.trimmingCharacters(in: .whitespacesAndNewlines))")
-        let (fExit, fOut) = await shell("pfctl -F rules 2>&1 || true")
-        logger.info("  pfctl -F rules: exit=\(fExit) \(fOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+    if cleanedRules.isEmpty && !pfRulesTrimmed.isEmpty {
+        let (_, _) = await shell("pfctl -d 2>&1 || true")
+        let (_, _) = await shell("pfctl -F rules 2>&1 || true")
+        logger.info("  Disabled pfctl (all active rules were test rules)")
+    } else if cleanedRules != pfRulesTrimmed && !pfRulesTrimmed.isEmpty {
+        let (_, _) = await shell("echo '\(cleanedRules)' | pfctl -f - 2>&1 || true")
+        logger.info("  Reloaded pfctl without test rules")
     } else {
-        // Reload with non-test rules preserved
-        let (rExit, rOut) = await shell("echo '\(cleanedRules)' | pfctl -f - 2>&1 || true")
-        logger.info("  Reloaded pfctl without test rules: exit=\(rExit) \(rOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+        logger.info("  No tracked pfctl rules found in active ruleset")
     }
-} else {
-    logger.info("  No test-specific pfctl rules found, leaving pfctl as-is")
 }
 // Check macOS application firewall
 let (_, fwState) = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true")
 logger.info("  macOS Application Firewall: \(fwState.trimmingCharacters(in: .whitespacesAndNewlines))")
 if fwState.contains("enabled") {
-    // Allow our binary through the app firewall
     let binaryPath = ProcessInfo.processInfo.arguments[0]
     let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --add \(binaryPath) 2>/dev/null")
     let _ = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp \(binaryPath) 2>/dev/null")
     logger.info("  Added HealthTestRunner to application firewall allow list")
 }
 #endif
+
+// Clear all state files for a fresh start
+await stateTracker.clearAll()
 logger.info("Pre-flight cleanup done.")
 
 // MARK: - Mesh Setup
@@ -636,20 +724,24 @@ if !isNodeA {
             let (_, previousRules) = await shell("pfctl -sr 2>/dev/null || true")
             logger.info("Node B pfctl pre-block state: enabled=\(pfctlPreviouslyEnabled), rules=\(previousRules.count) chars")
 
-            let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
+            let pfctlRule = "block drop quick proto udp from any to any port \(blockPort)"
+            await stateTracker.recordPfctlRule(pfctlRule)
+            let (exitCode, out) = await shell("echo '\(pfctlRule)' | pfctl -ef -")
             logger.info("Node B pfctl block: exit=\(exitCode) \(out)")
             #else
             let nodeAHost = cmd.detail ?? remoteHost
-            let (exitCode, out) = await shell("iptables -A INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP")
+            let nodeBIptRule = "iptables -A INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP"
+            await stateTracker.recordIptablesRule(nodeBIptRule)
+            let (exitCode, out) = await shell(nodeBIptRule)
             logger.info("Node B iptables block: exit=\(exitCode) \(out)")
             #endif
             // Auto-unblock after 15s (can't receive unblock command while blocked)
             Task {
                 try? await Task.sleep(for: .seconds(15))
                 #if os(macOS)
+                await stateTracker.removePfctlRule(pfctlRule)
                 // Restore previous pfctl state instead of blindly disabling
                 if pfctlPreviouslyEnabled {
-                    // Re-load previous rules
                     let trimmed = previousRules.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmed.isEmpty {
                         let (ec, o) = await shell("echo '\(trimmed)' | pfctl -ef -")
@@ -663,7 +755,9 @@ if !isNodeA {
                     logger.info("Node B pfctl disabled (was not enabled before): exit=\(ec) \(o)")
                 }
                 #else
-                let (ec, o) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
+                let unblockNodeB = "iptables -D INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP"
+                let (ec, o) = await shell(unblockNodeB)
+                await stateTracker.removeIptablesRule(nodeBIptRule)
                 logger.info("Node B iptables auto-unblock: exit=\(ec) \(o)")
                 #endif
             }
@@ -840,15 +934,15 @@ do {
 logPhase("Phase 4: Unidirectional Block — Failure Detection")
 
 do {
-    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let iptRule = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
     let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
-    await cleanup.register { let _ = await shell(unblockCmd) }
-    let (blockExit, blockOut) = await shell(blockCmd)
+    await stateTracker.recordIptablesRule(iptRule)
+    await cleanup.register { let _ = await shell(unblockCmd); await stateTracker.removeIptablesRule(iptRule) }
+    let (blockExit, blockOut) = await shell(iptRule)
     logger.info("iptables block: exit=\(blockExit) output=\(blockOut)")
 
     // Wait for health failure (sessions should get closed)
-    // Health monitor with threshold=3 and min interval=2s should detect in ~6-10s
     var phase4Pass = false
     for _ in 0..<20 {
         try await Task.sleep(for: .seconds(1))
@@ -862,6 +956,7 @@ do {
 
     // Unblock
     let (unblockExit, _) = await shell(unblockCmd)
+    await stateTracker.removeIptablesRule(iptRule)
     logger.info("iptables unblock: exit=\(unblockExit)")
 
     record("Phase 4: Failure Detection", passed: phase4Pass,
@@ -917,15 +1012,16 @@ do {
     let _ = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bidir")
     try await Task.sleep(for: .seconds(2))
 
-    let blockLinux = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let iptRule6 = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
     let unblockLinux = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
-    await cleanup.register { let _ = await shell(unblockLinux) }
+    await stateTracker.recordIptablesRule(iptRule6)
+    await cleanup.register { let _ = await shell(unblockLinux); await stateTracker.removeIptablesRule(iptRule6) }
 
     // Tell Node B to block with auto-unblock after 15s, then block locally
     await sendControl("phase6-block", detail: "\(port)")
     _ = await waitForAck("phase6-ack", timeout: .seconds(10))
-    let (_, _) = await shell(blockLinux)
+    let (_, _) = await shell(iptRule6)
     logger.info("Bidirectional block applied (local iptables + remote via control channel)")
 
     // Wait for failure detection on Node A
@@ -942,6 +1038,7 @@ do {
 
     // Unblock Linux side immediately
     let (_, _) = await shell(unblockLinux)
+    await stateTracker.removeIptablesRule(iptRule6)
     logger.info("Linux iptables unblocked")
 
     // Node B auto-unblocks after 15s from when it blocked.
@@ -974,16 +1071,18 @@ do {
     let session7 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-transient")
     try await Task.sleep(for: .seconds(2))
 
-    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let iptRule7 = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockCmd7 = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
-    await cleanup.register { let _ = await shell(unblockCmd) }
+    await stateTracker.recordIptablesRule(iptRule7)
+    await cleanup.register { let _ = await shell(unblockCmd7); await stateTracker.removeIptablesRule(iptRule7) }
 
     // Block for ~1s (less than 3 failures at 500ms intervals)
-    let (_, _) = await shell(blockCmd)
+    let (_, _) = await shell(iptRule7)
     logger.info("Transient block applied for ~1s")
     try await Task.sleep(for: .seconds(1))
-    let (_, _) = await shell(unblockCmd)
+    let (_, _) = await shell(unblockCmd7)
+    await stateTracker.removeIptablesRule(iptRule7)
     logger.info("Transient block removed")
 
     try await Task.sleep(for: .seconds(2))
@@ -1009,20 +1108,22 @@ do {
     await sendControl("phase8-start")
     _ = await waitForAck("phase8-ack", timeout: .seconds(10))
 
-    let blockCmd = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
-    let unblockCmd = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let iptRule8 = "iptables -A INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
+    let unblockCmd8 = "iptables -D INPUT -s \(remoteHost) -p udp --dport \(port) -j DROP"
 
-    await cleanup.register { let _ = await shell(unblockCmd) }
+    await stateTracker.recordIptablesRule(iptRule8)
+    await cleanup.register { let _ = await shell(unblockCmd8); await stateTracker.removeIptablesRule(iptRule8) }
 
     // Flap 10 times over 20s
     for i in 1...10 {
-        let (_, _) = await shell(blockCmd)
+        let (_, _) = await shell(iptRule8)
         logger.info("  Flap \(i)/10: blocked")
         try await Task.sleep(for: .seconds(1))
-        let (_, _) = await shell(unblockCmd)
+        let (_, _) = await shell(unblockCmd8)
         logger.info("  Flap \(i)/10: unblocked")
         try await Task.sleep(for: .seconds(1))
     }
+    await stateTracker.removeIptablesRule(iptRule8)
 
     try await Task.sleep(for: .seconds(3))
 
@@ -1075,7 +1176,8 @@ do {
     let addCmd = "ip addr add \(tempIP)/24 dev \(iface)"
     let delCmd = "ip addr del \(tempIP)/24 dev \(iface)"
 
-    await cleanup.register { let _ = await shell(delCmd) }
+    await stateTracker.recordTempIP(addCmd)
+    await cleanup.register { let _ = await shell(delCmd); await stateTracker.removeTempIP(addCmd) }
 
     let (addExit, addOut) = await shell(addCmd)
     logger.info("Added temp IP: exit=\(addExit) \(addOut)")
@@ -1084,6 +1186,7 @@ do {
     try await Task.sleep(for: .seconds(10))
 
     let (delExit, _) = await shell(delCmd)
+    await stateTracker.removeTempIP(addCmd)
     logger.info("Removed temp IP: exit=\(delExit)")
 
     // We can't directly observe the detector from here, but if no crash occurred
