@@ -1169,7 +1169,7 @@ logPhase("Phase 9: Endpoint Change Detection")
 #if os(Linux)
 do {
     // Find the network interface
-    let (_, ifOutput) = await shell("ip route get \(remoteHost) | head -1 | awk '{print $5}'")
+    let (_, ifOutput) = await shell("ip route get \(remoteHost) | head -1 | sed -n 's/.*dev \\([^ ]*\\).*/\\1/p'")
     let iface = ifOutput.isEmpty ? "eth0" : ifOutput
     logger.info("Using interface: \(iface)")
 
@@ -1233,7 +1233,7 @@ logPhase("Phase 10: Artificial Latency & Jitter")
 #if os(Linux)
 do {
     // Find the outgoing interface to the remote host
-    let (_, ifOutput10) = await shell("ip route get \(remoteHost) | head -1 | awk '{print $5}'")
+    let (_, ifOutput10) = await shell("ip route get \(remoteHost) | head -1 | sed -n 's/.*dev \\([^ ]*\\).*/\\1/p'")
     let iface10 = ifOutput10.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !iface10.isEmpty else {
         record("Phase 10: Latency & Jitter", passed: false, detail: "Could not determine interface")
@@ -1263,25 +1263,25 @@ do {
 
     var subResults: [(String, Bool, String)] = []
 
+    // Register a single cleanup action to remove any netem qdisc left behind
+    let delQdisc = "tc qdisc del dev \(iface10) root netem"
+    await cleanup.register { let _ = await shell(delQdisc) }
+
     for profile in profiles {
         logger.info("  Sub-test: \(profile.name)")
 
-        // Apply netem qdisc
+        // Apply netem qdisc (use replace to handle existing qdisc from previous sub-test)
         let addQdisc = "tc qdisc add dev \(iface10) root netem \(profile.tcArgs)"
-        await stateTracker.recordIptablesRule(addQdisc) // reuse iptables tracker for tc rules
         let (addExit, addOut) = await shell(addQdisc)
         if addExit != 0 {
-            logger.warning("  tc add failed: \(addOut), trying replace...")
+            logger.info("  tc add returned \(addExit), trying replace...")
             let (replExit, replOut) = await shell("tc qdisc replace dev \(iface10) root netem \(profile.tcArgs)")
             if replExit != 0 {
                 logger.error("  tc replace also failed: \(replOut)")
-                subResults.append((profile.name, false, "tc setup failed"))
+                subResults.append((profile.name, false, "tc setup failed: \(replOut)"))
                 continue
             }
         }
-
-        // Register cleanup
-        let delQdisc = "tc qdisc del dev \(iface10) root netem"
 
         // Send traffic both directions
         await messageCounter.reset()
@@ -1306,9 +1306,8 @@ do {
             monitorOk = false
         }
 
-        // Remove netem
+        // Remove netem between sub-tests
         let (_, _) = await shell(delQdisc)
-        await stateTracker.removeIptablesRule(addQdisc)
 
         let pass: Bool
         if profile.expectAlive {
