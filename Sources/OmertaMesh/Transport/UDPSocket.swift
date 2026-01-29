@@ -34,6 +34,7 @@ public actor UDPSocket {
     private func makeBootstrap() -> DatagramBootstrap {
         DatagramBootstrap(group: group)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .channelOption(ChannelOptions.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: 65535))
             .channelInitializer { channel in
                 channel.pipeline.addHandler(UDPInboundHandler(socket: self))
             }
