@@ -47,6 +47,9 @@ public actor TunnelManager {
     /// Network endpoint change detector
     private let endpointChangeDetector = EndpointChangeDetector()
 
+    /// Wire channels registered for dispatch
+    private var registeredWireChannels: Set<String> = []
+
     /// Whether the manager is running
     private var isRunning: Bool = false
 
@@ -150,6 +153,11 @@ public actor TunnelManager {
         await provider.offChannel(handshakeChannel)
         await provider.offChannel(healthProbeChannel)
 
+        for wireChannel in registeredWireChannels {
+            await provider.offChannel(wireChannel)
+        }
+        registeredWireChannels.removeAll()
+
         for (_, session) in sessions {
             await session.close()
         }
@@ -218,6 +226,7 @@ public actor TunnelManager {
         await newSession.activate()
         sessions[key] = newSession
         sessionIds[key] = String(sid)
+        await ensureWireChannelRegistered(for: channel)
 
         // Start health monitor for this machine if first session
         if healthMonitors[machineId] == nil {
@@ -326,6 +335,30 @@ public actor TunnelManager {
         }
     }
 
+    private func ensureWireChannelRegistered(for channel: String) async {
+        let wireChannel = "tunnel-\(channel)"
+        guard !registeredWireChannels.contains(wireChannel) else { return }
+        do {
+            try await provider.onChannel(wireChannel) { [weak self] machineId, data in
+                await self?.dispatchToSession(data, from: machineId, channel: channel)
+            }
+            registeredWireChannels.insert(wireChannel)
+        } catch {
+            logger.error("Failed to register wire channel", metadata: [
+                "wireChannel": "\(wireChannel)",
+                "channel": "\(channel)",
+                "error": "\(error)"
+            ])
+        }
+    }
+
+    private func dispatchToSession(_ data: Data, from machineId: MachineId, channel: String) async {
+        let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+        if let session = sessions[key] {
+            await session.deliverIncoming(data)
+        }
+    }
+
     private func checkSessionLimits(forMachine machineId: MachineId) throws {
         // Check total limit
         if sessions.count >= config.maxTotalSessions {
@@ -373,6 +406,7 @@ public actor TunnelManager {
                 await newSession.activate()
                 sessions[key] = newSession
                 sessionIds[key] = handshake.sessionId
+                await ensureWireChannelRegistered(for: channel)
 
                 // Send ack
                 let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
