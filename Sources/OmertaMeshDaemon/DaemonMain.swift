@@ -11,6 +11,24 @@ import ArgumentParser
 import OmertaMesh
 import Logging
 
+#if DEBUG
+/// Thread-safe box for passing the network key to the encryption audit hook.
+private final class NetworkKeyBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _key: Data?
+    var key: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _key
+    }
+    func set(_ key: Data) {
+        lock.lock()
+        _key = key
+        lock.unlock()
+    }
+}
+#endif
+
 // MARK: - Main Command
 
 @main
@@ -68,6 +86,9 @@ struct Start: AsyncParsableCommand {
     @Flag(name: .long, help: "LAN mode - bind to IPv4 for cross-machine LAN testing")
     var lan: Bool = false
 
+    @Flag(name: .long, help: "Audit every UDP send and log any packet missing the encrypted envelope prefix")
+    var auditEncryption: Bool = false
+
     mutating func run() async throws {
         // Configure logging
         let level = parseLogLevel(logLevel)
@@ -78,6 +99,47 @@ struct Start: AsyncParsableCommand {
         }
 
         let logger = Logger(label: "io.omerta.meshd.cli")
+
+        // Install encryption audit hook if requested
+        #if DEBUG
+        let keyBox = NetworkKeyBox()
+        if auditEncryption {
+            UDPSocket.captureHook = { data, dest in
+                let hex = data.prefix(16).map { String(format: "%02x", $0) }.joined()
+                let bt = Thread.callStackSymbols.joined(separator: "\n")
+
+                // Check 1: valid envelope prefix
+                guard BinaryEnvelopeV2.isValidPrefix(data) else {
+                    fatalError("""
+                        ENCRYPTION AUDIT FAILURE: missing encrypted envelope prefix (\(data.count) bytes) to \(dest)
+                        Data prefix: \(hex)
+                        Backtrace:
+                        \(bt)
+                        """)
+                }
+
+                // Check 2: if we have the network key, verify decryption succeeds
+                if let networkKey = keyBox.key {
+                    do {
+                        _ = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
+                    } catch {
+                        fatalError("""
+                            ENCRYPTION AUDIT FAILURE: packet has valid prefix but decryption failed (\(data.count) bytes) to \(dest)
+                            Error: \(error)
+                            Data prefix: \(hex)
+                            Backtrace:
+                            \(bt)
+                            """)
+                    }
+                }
+            }
+            logger.info("Encryption audit enabled — all UDP sends will be verified for valid encryption")
+        }
+        #else
+        if auditEncryption {
+            logger.warning("--audit-encryption is only available in DEBUG builds")
+        }
+        #endif
 
         // Load base config from file if provided
         var daemonConfig: MeshDaemonConfig
@@ -107,6 +169,20 @@ struct Start: AsyncParsableCommand {
         if lan {
             daemonConfig.lanMode = true
         }
+
+        // Supply the network key to the encryption audit hook
+        #if DEBUG
+        if auditEncryption {
+            let store = NetworkStore.defaultStore()
+            try await store.load()
+            if let network = await store.network(id: networkId) {
+                keyBox.set(network.key.networkKey)
+                logger.info("Encryption audit: network key loaded for full decryption verification")
+            } else {
+                logger.warning("Encryption audit: network key not found — will only check envelope prefix")
+            }
+        }
+        #endif
 
         // Check if already running
         let controlPath = DaemonSocketPaths.meshDaemonControl(networkId: networkId)

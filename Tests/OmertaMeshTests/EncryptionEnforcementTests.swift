@@ -7,11 +7,15 @@ import NIOCore
 
 final class EncryptionEnforcementTests: XCTestCase {
 
+    override class func setUp() {
+        super.setUp()
+        #if DEBUG
+        GlobalEncryptionObserver.install()
+        #endif
+    }
+
     override func tearDown() {
         super.tearDown()
-        #if DEBUG
-        UDPSocket.captureHook = nil
-        #endif
     }
 
     /// Verify that SealedEnvelope can only be constructed by encryption methods,
@@ -50,14 +54,6 @@ final class EncryptionEnforcementTests: XCTestCase {
     #if DEBUG
     /// Verify that all packets sent through UDPSocket have the BinaryEnvelopeV2 prefix.
     func testAllTrafficIsEncrypted() async throws {
-        var captured: [Data] = []
-        let lock = NSLock()
-        UDPSocket.captureHook = { data, _ in
-            lock.lock()
-            captured.append(data)
-            lock.unlock()
-        }
-
         let testKey = Data(repeating: 0x42, count: 32)
         let keypair = IdentityKeypair()
 
@@ -85,15 +81,19 @@ final class EncryptionEnforcementTests: XCTestCase {
         // Brief pause to let capture hook fire
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        lock.lock()
-        let packets = captured
-        lock.unlock()
+        // The global observer should not have flagged this as a violation
+        let violations = GlobalEncryptionObserver.shared.violations
+        let myViolations = violations.filter { $0.testName.contains("testAllTrafficIsEncrypted") }
+        XCTAssertTrue(myViolations.isEmpty,
+                     "Encrypted sends should not produce violations, got: \(myViolations.count)")
+    }
 
-        XCTAssertFalse(packets.isEmpty, "Should have captured at least one packet")
-
-        for (i, packet) in packets.enumerated() {
-            XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(packet),
-                         "Packet \(i) missing encrypted prefix: \(packet.prefix(8).map { String(format: "%02x", $0) }.joined())")
+    /// Runs last (alphabetically) — asserts that no test in the entire suite sent unencrypted data.
+    func testZZ_noUnencryptedPacketsAcrossAllTests() {
+        let violations = GlobalEncryptionObserver.shared.violations
+        if !violations.isEmpty {
+            let summary = violations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
+            XCTFail("Unencrypted packets detected in \(violations.count) send(s):\n\(summary.joined(separator: "\n"))")
         }
     }
     #endif
