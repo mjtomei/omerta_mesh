@@ -915,7 +915,7 @@ final class MeshConsumerClientTests: XCTestCase {
             identity: identity,
             networkKey: networkKey,
             providerPeerId: "testprovider1234",
-            providerEndpoint: "192.168.1.100:9999",
+            providerEndpoint: "192.0.2.100:9999",
             dryRun: true
         )
 
@@ -1199,7 +1199,7 @@ These tests require two machines on the same LAN (or with port forwarding config
 # Run from consumer machine, provider runs on remote machine
 #
 # Usage:
-#   PROVIDER_HOST=192.168.1.100 ./run-cross-machine.sh
+#   PROVIDER_HOST=192.0.2.100 ./run-cross-machine.sh
 
 set -e
 
@@ -1694,7 +1694,7 @@ Both direct (IP-based) and mesh (peer ID-based) modes will be supported:
 
 ```bash
 # Legacy: Direct connection (works without mesh infrastructure)
-omerta vm request --provider 192.168.1.100:51820
+omerta vm request --provider 192.0.2.100:51820
 
 # New: Mesh connection (works through NAT)
 omerta vm request --peer provider-abc123

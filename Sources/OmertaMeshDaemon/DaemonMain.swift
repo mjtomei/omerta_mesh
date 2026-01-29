@@ -43,8 +43,8 @@ struct MeshDaemonCLI: AsyncParsableCommand {
             sockets to access mesh network functionality.
 
             Socket paths:
-              Control: /tmp/omerta-meshd-{network-id}.sock
-              Data:    /tmp/omerta-meshd-{network-id}.data.sock
+              Control: $TMPDIR/omerta-meshd-{network-id}.sock
+              Data:    $TMPDIR/omerta-meshd-{network-id}.data.sock
             """,
         subcommands: [Start.self, Stop.self, Status.self, Config.self],
         defaultSubcommand: nil

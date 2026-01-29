@@ -7,7 +7,7 @@ final class DataSocketTests: XCTestCase {
 
     // Test socket path
     var testSocketPath: String {
-        "/tmp/omerta-data-test-\(UUID().uuidString.prefix(8)).sock"
+        "\(NSTemporaryDirectory())omerta-data-test-\(UUID().uuidString.prefix(8)).sock"
     }
 
     // MARK: - Server Tests
@@ -154,7 +154,7 @@ final class DataSocketTests: XCTestCase {
     }
 
     func testDataClientConnectToNonexistent() async throws {
-        let nonExistentPath = "/tmp/omerta-data-nonexistent-\(UUID().uuidString).sock"
+        let nonExistentPath = "\(NSTemporaryDirectory())omerta-data-nonexistent-\(UUID().uuidString).sock"
         let client = DataSocketClient(socketPath: nonExistentPath)
 
         do {

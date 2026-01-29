@@ -30,7 +30,7 @@ actor TestNode {
 
         self.provider = TestChannelProvider(machineId: machineId)
         self.interface = MockNetworkInterface(localIP: ip)
-        self.virtualNetwork = VirtualNetwork(localMachineId: machineId)
+        self.virtualNetwork = VirtualNetwork(localMachineId: machineId, config: .testDefault)
         self.tunnelManager = TunnelManager(provider: provider)
     }
 
@@ -461,8 +461,19 @@ final class MultiNodeIntegrationTests: XCTestCase {
             }
         }
 
-        // Wait for all packets to be delivered
-        try await Task.sleep(for: .milliseconds(1000))
+        // Poll until all nodes have sent their packets (health probes add relay traffic)
+        for attempt in 0..<50 {
+            var allDone = true
+            for node in nodes {
+                let stats = await node.getStats()
+                if stats?.packetsToPeer != 4 {
+                    allDone = false
+                    break
+                }
+            }
+            if allDone { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
 
         // Each node should have sent 4 packets (to 4 other nodes)
         for (i, node) in nodes.enumerated() {

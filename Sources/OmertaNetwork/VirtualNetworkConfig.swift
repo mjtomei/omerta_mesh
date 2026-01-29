@@ -15,12 +15,8 @@ public struct VirtualNetworkConfig: Sendable {
     /// Last IP in the DHCP pool
     public var poolEnd: String
 
-    public static let `default` = VirtualNetworkConfig(
-        subnet: "10.0.0.0", netmask: "255.255.0.0", prefixLength: 16,
-        gatewayIP: "10.0.0.1", poolStart: "10.0.0.100", poolEnd: "10.0.255.254"
-    )
-
-    /// Dynamically generate a non-conflicting config at startup
+    /// Dynamically generate a non-conflicting config at startup.
+    /// Uses SubnetSelector to find a /16 that doesn't conflict with local interfaces.
     public static func autoDetect() throws -> VirtualNetworkConfig {
         let generated = try SubnetSelector.generateSubnet()
         return VirtualNetworkConfig(generated: generated)
@@ -35,9 +31,18 @@ public struct VirtualNetworkConfig: Sendable {
         self.poolEnd = generated.poolEnd
     }
 
-    public init(subnet: String = "10.0.0.0", netmask: String = "255.255.0.0",
-                prefixLength: Int = 16, gatewayIP: String = "10.0.0.1",
-                poolStart: String = "10.0.0.100", poolEnd: String = "10.0.255.254") {
+    /// Generate an internal IP for a netstack instance within this subnet.
+    /// Uses the third-octet offset (e.g. offset 200 yields X.Y.200.1).
+    /// Returns nil if the subnet address cannot be parsed.
+    public func internalIP(thirdOctet: UInt8 = 200, hostOctet: UInt8 = 1) -> String? {
+        guard let addr = SubnetSelector.parseIPv4(subnet) else { return nil }
+        let a = (addr >> 24) & 0xFF
+        let b = (addr >> 16) & 0xFF
+        return "\(a).\(b).\(thirdOctet).\(hostOctet)"
+    }
+
+    public init(subnet: String, netmask: String, prefixLength: Int,
+                gatewayIP: String, poolStart: String, poolEnd: String) {
         self.subnet = subnet
         self.netmask = netmask
         self.prefixLength = prefixLength
