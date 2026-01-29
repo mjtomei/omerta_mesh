@@ -197,8 +197,9 @@ NETWORK_PATTERNS=(
     '\bip route del\b'
     '\bifconfig\b.*\b(up|down|add|delete)\b'
 
-    # SSH to specific hosts (machine-specific orchestration)
-    '\bssh\s+\S+\s+"?sudo\b'
+    # SSH to hardcoded hosts with sudo (machine-specific orchestration)
+    # Allows ssh "$VAR" sudo (variable hosts) but blocks ssh myhost sudo (literal hosts)
+    '\bssh\s+[^"$][^[:space:]]*\s+"?sudo\b'
 
     # Machine-specific hostnames and paths
     '\b(en[opsx][0-9]+s[0-9]+|eth[0-9]+|wlan[0-9]+)\b'
