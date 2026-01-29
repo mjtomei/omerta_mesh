@@ -85,6 +85,7 @@ public actor TunnelHealthMonitor {
             // During grace period, send probes but don't count failures
             if graceRemaining > 0 {
                 try? await sendProbe(machineId)
+                try? await Task.sleep(for: interval / 4)
                 graceRemaining -= 1
                 continue
             }
@@ -100,6 +101,9 @@ public actor TunnelHealthMonitor {
             // Haven't heard from remote — send probe so it knows we're here
             let timeBeforeProbe = lastPacketTime
             try? await sendProbe(machineId)
+
+            // Wait for response (fraction of probe interval for network RTT)
+            try? await Task.sleep(for: interval / 4)
 
             // If a packet arrived during or right after the probe send, remote is alive
             if lastPacketTime > timeBeforeProbe {
