@@ -825,11 +825,16 @@ do {
     // Node B auto-unblocks after 15s from when it blocked.
     // Wait for Node B to self-unblock and mesh to reconnect.
     logger.info("Waiting for Node B auto-unblock and mesh reconnect...")
-    try await Task.sleep(for: .seconds(10))
+    try await Task.sleep(for: .seconds(20))
 
-    // Now try to reach Node B via control channel
-    await sendControl("phase6-check")
-    let phase6BMsg = await controlMailbox.receive(timeout: .seconds(30))
+    // Try to reach Node B - retry a few times since mesh may need keepalive cycle
+    var phase6BMsg: ControlMessage? = nil
+    for attempt in 1...3 {
+        logger.info("Sending phase6-check (attempt \(attempt))...")
+        await sendControl("phase6-check")
+        phase6BMsg = await controlMailbox.receive(timeout: .seconds(10))
+        if phase6BMsg != nil { break }
+    }
     let bSessionCount = phase6BMsg.flatMap { Int($0.detail ?? "") } ?? -1
 
     record("Phase 6: Bidirectional Block", passed: phase6Pass,
