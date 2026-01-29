@@ -16,7 +16,7 @@ public enum KernelNetworking {
     /// Call before enableForwarding/enableMasquerade to get clear errors.
     public static func preflight() throws {
         guard Glibc.access("/proc/sys/net/ipv4/ip_forward", F_OK) == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "/proc/sys/net/ipv4/ip_forward not found. "
                 + "procfs may not be mounted (required for kernel networking).")
         }
@@ -24,13 +24,13 @@ public enum KernelNetworking {
         let hasIptablesLegacy = Glibc.access("/sbin/iptables-legacy", X_OK) == 0
         let hasIptables = Glibc.access("/sbin/iptables", X_OK) == 0
         guard hasNft || hasIptablesLegacy || hasIptables else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "No firewall tool found. Need one of: /usr/sbin/nft, "
                 + "/sbin/iptables-legacy, /sbin/iptables. "
                 + "Install nftables (apt install nftables) or iptables (apt install iptables).")
         }
         guard Glibc.access("/sbin/ip", X_OK) == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "/sbin/ip not found. Install iproute2 (e.g. apt install iproute2).")
         }
     }
@@ -362,7 +362,7 @@ public enum KernelNetworking {
 
     private static func runFirewall(_ executable: String, _ args: [String], stdin stdinData: String? = nil) throws {
         guard Glibc.access(executable, X_OK) == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "\(executable) not found or not executable. "
                 + "Install the appropriate package (nftables or iptables).")
         }

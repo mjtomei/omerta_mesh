@@ -47,16 +47,16 @@ public actor TUNInterface: NetworkInterface {
     /// Call before start() to get clear error messages instead of opaque failures.
     public static func preflight() throws {
         guard Glibc.geteuid() == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "TUN interfaces require root. Run with sudo or as root.")
         }
         guard Glibc.access("/dev/net/tun", F_OK) == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "/dev/net/tun not found. The tun kernel module may not be loaded. "
                 + "Try: modprobe tun")
         }
         guard Glibc.access("/sbin/ip", X_OK) == 0 else {
-            throw InterfaceError.readFailed(
+            throw InterfaceError.preflightFailed(
                 "/sbin/ip not found. Install iproute2 (e.g. apt install iproute2).")
         }
     }
