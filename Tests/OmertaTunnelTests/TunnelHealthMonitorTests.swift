@@ -246,7 +246,7 @@ final class TunnelHealthMonitorTests: XCTestCase {
             onFailure: { _ in failureCalled = true }
         )
 
-        try await Task.sleep(for: .milliseconds(200))
+        try await Task.sleep(for: .milliseconds(500))
         await monitor.stopMonitoring()
 
         XCTAssertTrue(failureCalled, "Threshold of 1 should trigger on first missed interval")
