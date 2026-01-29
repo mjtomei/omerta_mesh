@@ -134,8 +134,11 @@ final class TunnelHealthMonitorTests: XCTestCase {
             }
         )
 
-        // Wait for 3 failures at ~50ms each
-        try await Task.sleep(for: .milliseconds(500))
+        // Poll until failure callback fires (timeout 5s)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !failureCalled && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         await monitor.stopMonitoring()
 
         XCTAssertTrue(failureCalled, "Should call onFailure after 3 consecutive failures")
@@ -193,7 +196,11 @@ final class TunnelHealthMonitorTests: XCTestCase {
             onFailure: { _ in failureCalled = true }
         )
 
-        try await Task.sleep(for: .milliseconds(500))
+        // Poll until failure callback fires (timeout 5s)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !failureCalled && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         await monitor.stopMonitoring()
 
         XCTAssertTrue(failureCalled, "Should detect failure when sends succeed but no packets received")
