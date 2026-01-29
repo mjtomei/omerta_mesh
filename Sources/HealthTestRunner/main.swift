@@ -258,11 +258,15 @@ let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
 if !pfRules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
     logger.info("  Active pfctl rules:\n\(pfRules)")
 }
-if pfRules.contains("port = \(port)") || pfRules.contains("port \(port)") || pfRules.contains("block") {
-    logger.info("  Disabling stale pfctl rules")
-    let _ = await shell("pfctl -d 2>/dev/null")
-    let _ = await shell("pfctl -F all 2>/dev/null")
-}
+// Always disable pfctl and flush rules to ensure clean state
+logger.info("  Disabling pfctl and flushing all rules...")
+let (d1Exit, d1Out) = await shell("pfctl -d 2>&1 || true")
+logger.info("  pfctl -d: exit=\(d1Exit) \(d1Out.trimmingCharacters(in: .whitespacesAndNewlines))")
+let (fExit, fOut) = await shell("pfctl -F all 2>&1 || true")
+logger.info("  pfctl -F all: exit=\(fExit) \(fOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+// Verify it's off
+let (_, verifyInfo) = await shell("pfctl -s info 2>&1 | grep -i 'status\\|enabled\\|disabled' || true")
+logger.info("  pfctl verify: \(verifyInfo.trimmingCharacters(in: .whitespacesAndNewlines))")
 // Check macOS application firewall
 let (_, fwState) = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true")
 logger.info("  macOS Application Firewall: \(fwState.trimmingCharacters(in: .whitespacesAndNewlines))")
