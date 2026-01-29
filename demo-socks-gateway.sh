@@ -58,7 +58,11 @@ trap cleanup EXIT
 
 # Build
 echo "Building DemoSOCKSGateway..."
-swift build --product DemoSOCKSGateway 2>&1 | grep -E '^\[|^Build '
+swift build --product DemoSOCKSGateway 2>&1 | grep -E '^\[|^Build |error:'
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    echo "Build failed."
+    exit 1
+fi
 
 print_kernel_state "before"
 

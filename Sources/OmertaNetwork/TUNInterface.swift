@@ -27,14 +27,8 @@ public actor TUNInterface: NetworkInterface {
     private var readSource: DispatchSourceRead?
     private let readQueue = DispatchQueue(label: "omerta.tun.read")
 
-    // Push path: direct callback for bridge mode.
-    // Uses a class box so the DispatchSource closure can read the latest value
-    // without re-capturing (callback may be set after start()).
-    private let callbackBox = CallbackBox()
-
-    private final class CallbackBox: @unchecked Sendable {
-        var onPacket: (@Sendable (Data) -> Void)?
-    }
+    // Push path: direct callback for bridge mode (must be set before start).
+    private var onPacket: (@Sendable (Data) -> Void)?
 
     // Pull path: AsyncStream for readPacket() in node mode
     private var packetStream: AsyncStream<Data>?
@@ -91,7 +85,7 @@ public actor TUNInterface: NetworkInterface {
 
         let tunFd = fd
         let bufSize = mtu + 64 // headroom
-        let box = callbackBox
+        let callback = onPacket  // capture immutable copy
         let cont = continuation
 
         let source = DispatchSource.makeReadSource(fileDescriptor: tunFd, queue: readQueue)
@@ -101,7 +95,7 @@ public actor TUNInterface: NetworkInterface {
                 let n = Glibc.read(tunFd, &buf, buf.count)
                 guard n > 0 else { break }
                 let packet = Data(buf[..<n])
-                if let cb = box.onPacket {
+                if let cb = callback {
                     cb(packet)
                 } else {
                     cont.yield(packet)
@@ -173,7 +167,8 @@ public actor TUNInterface: NetworkInterface {
     /// When set, packets go to this callback instead of the AsyncStream.
     /// Must be called before start().
     public func setPacketCallback(_ callback: @escaping @Sendable (Data) -> Void) {
-        callbackBox.onPacket = callback
+        precondition(!started, "setPacketCallback must be called before start()")
+        onPacket = callback
     }
 
     private func configureIP() throws {

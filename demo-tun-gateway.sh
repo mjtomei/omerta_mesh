@@ -53,7 +53,6 @@ save_sysctl() {
     fi
     cat > "$SYSCTL_SAVE" <<-EOF
 	ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
-	rp_filter_all=$(cat /proc/sys/net/ipv4/conf/all/rp_filter)
 	EOF
     echo "  Saved sysctl state to $SYSCTL_SAVE"
 }
@@ -67,7 +66,7 @@ restore_sysctl() {
     source "$SYSCTL_SAVE" 2>/dev/null || true
     sudo .build/debug/DemoTUNGateway --restore-sysctl "$SYSCTL_SAVE" 2>/dev/null || true
     rm -f "$SYSCTL_SAVE" 2>/dev/null || true
-    echo "  Restored sysctl state (ip_forward=${ip_forward:-?}, rp_filter=${rp_filter_all:-?})"
+    echo "  Restored sysctl state (ip_forward=${ip_forward:-?})"
 }
 
 cleanup() {
@@ -82,7 +81,11 @@ trap cleanup EXIT
 
 # Build (no root needed)
 echo "Building DemoTUNGateway..."
-swift build --product DemoTUNGateway 2>&1 | grep -E '^\[|^Build '
+swift build --product DemoTUNGateway 2>&1 | grep -E '^\[|^Build |error:'
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    echo "Build failed."
+    exit 1
+fi
 
 # Verify sudo access for this binary
 if ! sudo -n -l "$(pwd)/.build/debug/DemoTUNGateway" >/dev/null 2>&1; then

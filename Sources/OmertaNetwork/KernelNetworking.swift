@@ -33,8 +33,9 @@ public enum KernelNetworking {
     /// with source IPs arriving on the "wrong" interface (e.g. mesh peer IPs
     /// arriving on the gateway TUN).
     public static func looseRPFilter(tunName: String) {
+        // Only set the per-interface value. The kernel uses max(all, interface),
+        // so setting the TUN to 2 (loose) is sufficient regardless of the global setting.
         writeProcSys("/proc/sys/net/ipv4/conf/\(tunName)/rp_filter", value: "2")
-        writeProcSys("/proc/sys/net/ipv4/conf/all/rp_filter", value: "2")
         logger.info("Set rp_filter to loose mode (2)", metadata: ["tun": "\(tunName)"])
     }
 
@@ -233,11 +234,10 @@ public enum KernelNetworking {
             issues.append("ip_forward is '\(ipForward)' (should be '1'). Fix: sysctl net.ipv4.ip_forward=1")
         }
 
-        // Check rp_filter
-        let rpAll = readProcSys("/proc/sys/net/ipv4/conf/all/rp_filter")
+        // Check rp_filter — only the per-interface value matters since kernel uses max(all, iface)
         let rpTun = readProcSys("/proc/sys/net/ipv4/conf/\(tunName)/rp_filter")
-        if (rpAll != "0" && rpAll != "2") || (rpTun != "0" && rpTun != "2") {
-            issues.append("rp_filter too strict: all=\(rpAll) \(tunName)=\(rpTun). Need loose mode (2). Fix: sysctl net.ipv4.conf.all.rp_filter=2")
+        if rpTun != "0" && rpTun != "2" {
+            issues.append("rp_filter too strict: \(tunName)=\(rpTun). Need loose mode (2). Fix: sysctl net.ipv4.conf.\(tunName).rp_filter=2")
         }
 
         // Check if Docker is interfering (DOCKER-USER/DOCKER-FORWARD chains)
