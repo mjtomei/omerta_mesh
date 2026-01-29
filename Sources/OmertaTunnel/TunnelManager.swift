@@ -109,7 +109,9 @@ public actor TunnelManager {
             guard let self else { return }
             if data.first == 0x01 {
                 // Incoming probe: remote is actively checking us. Update liveness and echo back.
-                await self.notifyPacketReceived(from: machineId)
+                // Use probe response handler (liveness only) — probes should not reset the
+                // probe interval, only application data should.
+                await self.notifyProbeResponseReceived(from: machineId)
                 try? await self.provider.sendOnChannel(Data([0x02]), toMachine: machineId, channel: self.healthProbeChannel)
             } else if data.first == 0x02 {
                 // Probe response: only update lastPacketTime for liveness, don't reset probe interval
