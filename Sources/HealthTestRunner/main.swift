@@ -10,6 +10,8 @@ import Foundation
 import OmertaMesh
 import OmertaTunnel
 import Logging
+import NIOCore
+import NIOPosix
 #if canImport(Glibc)
 import Glibc
 #endif
@@ -302,13 +304,77 @@ let peerId = mesh.peerId
 let machineId = await mesh.machineId
 logger.info("Mesh started - peerId: \(peerId) machineId: \(machineId)")
 
-// Auto-bootstrap: ping the remote host so the mesh discovers the other node
-// Use a dummy peerId — the real one will be learned from the ping response
+// Auto-bootstrap: exchange peer IDs via direct UDP before mesh discovery.
+// Each node sends its peerId to the remote host on a side-channel UDP port (mesh port + 1).
+// Once both nodes know each other's peerId, they can use mesh.addPeer() to connect.
+let bootstrapPort = port + 1
 let remoteEndpoint = "\(remoteHost):\(port)"
-let dummyPeerId = "0000000000000000"
-logger.info("Auto-bootstrap: pinging \(remoteEndpoint)...")
-await mesh.addPeer(dummyPeerId, endpoint: remoteEndpoint)
-let _ = await mesh.ping(dummyPeerId, timeout: 3.0)
+logger.info("Auto-bootstrap: exchanging peer IDs via UDP port \(bootstrapPort)...")
+
+do {
+    let bootstrapGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var remotePeerIdResult: String? = nil
+    let remotePeerLock = NSLock()
+
+    final class BootstrapHandler: ChannelInboundHandler, @unchecked Sendable {
+        typealias InboundIn = AddressedEnvelope<ByteBuffer>
+        var onReceive: ((String) -> Void)?
+
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            let envelope = unwrapInboundIn(data)
+            var buf = envelope.data
+            if let bytes = buf.readBytes(length: buf.readableBytes) {
+                let msg = String(decoding: Data(bytes), as: UTF8.self)
+                onReceive?(msg)
+            }
+        }
+    }
+
+    let handler = BootstrapHandler()
+    let bootstrapChannel = try await DatagramBootstrap(group: bootstrapGroup)
+        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+        .channelInitializer { ch in ch.pipeline.addHandler(handler) }
+        .bind(host: "0.0.0.0", port: bootstrapPort)
+        .get()
+
+    handler.onReceive = { msg in
+        if msg.hasPrefix("peerId:") {
+            let rid = String(msg.dropFirst("peerId:".count))
+            remotePeerLock.lock()
+            remotePeerIdResult = rid
+            remotePeerLock.unlock()
+        }
+    }
+
+    let myMsg = "peerId:\(peerId)"
+    let remoteBootstrapAddr = try SocketAddress(ipAddress: remoteHost, port: bootstrapPort)
+    for i in 1...30 {
+        let buf = bootstrapChannel.allocator.buffer(string: myMsg)
+        let envelope = AddressedEnvelope(remoteAddress: remoteBootstrapAddr, data: buf)
+        try await bootstrapChannel.writeAndFlush(envelope)
+        try await Task.sleep(for: .milliseconds(500))
+        remotePeerLock.lock()
+        let rid = remotePeerIdResult
+        remotePeerLock.unlock()
+        if let rid {
+            logger.info("Auto-bootstrap: discovered remote peerId \(rid) after \(i) attempts")
+            await mesh.addPeer(rid, endpoint: remoteEndpoint)
+            let _ = await mesh.ping(rid, timeout: 3.0)
+            break
+        }
+        if i % 10 == 0 { logger.info("Auto-bootstrap: still waiting for remote peerId... (\(i * 500)ms)") }
+    }
+
+    try await bootstrapChannel.close()
+    try await bootstrapGroup.shutdownGracefully()
+
+    remotePeerLock.lock()
+    let finalResult = remotePeerIdResult
+    remotePeerLock.unlock()
+    if finalResult == nil {
+        logger.error("Auto-bootstrap: failed to discover remote peerId after 15s")
+    }
+}
 
 await cleanup.register {
     logger.info("Cleanup: stopping mesh")
