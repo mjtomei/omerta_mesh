@@ -130,7 +130,10 @@ public actor HolePunchManager {
     /// Set the unified services reference (preferred over individual callbacks)
     public func setServices(_ services: any MeshNodeServices) {
         self.services = services
-        // Also set services on coordinator if available
+        // Also set services on hole puncher and coordinator
+        Task {
+            await holePuncher.setServices(services)
+        }
         if let coordinator = coordinator {
             Task {
                 await coordinator.setServices(services)

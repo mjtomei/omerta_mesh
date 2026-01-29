@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# run-health-test.sh — Build and run the cross-machine health monitoring test
+# demo-health-test.sh — Build and run the cross-machine health monitoring test
 #
 # Usage:
-#   ./scripts/run-health-test.sh <ssh-host> <remote-path>
+#   ./demo-health-test.sh <ssh-host> <remote-path>
 #
 # Arguments:
 #   ssh-host     SSH destination for the remote machine (e.g. "mac", "user@host")
