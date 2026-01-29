@@ -11,16 +11,19 @@ import Glibc
 
 final class TUNInterfaceTests: XCTestCase {
 
-    private func skipUnlessRoot() throws {
+    private func skipUnlessTUNAvailable() throws {
         guard Glibc.geteuid() == 0 else {
             throw XCTSkip("Requires root")
+        }
+        guard Glibc.access("/dev/net/tun", F_OK) == 0 else {
+            throw XCTSkip("/dev/net/tun not available (container or VM without TUN support)")
         }
     }
 
     // MARK: - Lifecycle
 
     func testTUNCreation() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t0", ip: "10.99.0.1")
         try await tun.start()
@@ -34,7 +37,7 @@ final class TUNInterfaceTests: XCTestCase {
     }
 
     func testTUNStartStop() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t1", ip: "10.99.1.1")
         try await tun.start()
@@ -46,7 +49,7 @@ final class TUNInterfaceTests: XCTestCase {
     }
 
     func testTUNDoubleStartThrows() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t2", ip: "10.99.2.1")
         try await tun.start()
@@ -63,7 +66,7 @@ final class TUNInterfaceTests: XCTestCase {
     // MARK: - Packet I/O
 
     func testTUNWriteAndReadLoopback() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t3", ip: "10.99.3.1")
         try await tun.start()
@@ -96,7 +99,7 @@ final class TUNInterfaceTests: XCTestCase {
     // MARK: - DispatchSource (event-driven)
 
     func testTUNDispatchSourceNotBlocking() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t4", ip: "10.99.4.1")
         try await tun.start()
@@ -115,7 +118,7 @@ final class TUNInterfaceTests: XCTestCase {
     }
 
     func testTUNCallbackMode() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t5", ip: "10.99.5.1")
 
@@ -142,7 +145,7 @@ final class TUNInterfaceTests: XCTestCase {
     // MARK: - TUNBridgeAdapter
 
     func testTUNBridgeAdapterConforms() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t6", ip: "10.99.6.1")
         let bridge = TUNBridgeAdapter(tun: tun)
@@ -163,7 +166,7 @@ final class TUNInterfaceTests: XCTestCase {
     }
 
     func testTUNBridgeInjectPacket() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t7", ip: "10.99.7.1")
         let bridge = TUNBridgeAdapter(tun: tun)
@@ -186,7 +189,7 @@ final class TUNInterfaceTests: XCTestCase {
     }
 
     func testTUNBridgeDialTCPThrows() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let tun = TUNInterface(name: "omerta-t8", ip: "10.99.8.1")
         let bridge = TUNBridgeAdapter(tun: tun)
@@ -204,7 +207,7 @@ final class TUNInterfaceTests: XCTestCase {
     // MARK: - KernelNetworking
 
     func testKernelForwardingToggle() async throws {
-        try skipUnlessRoot()
+        try skipUnlessTUNAvailable()
 
         let path = "/proc/sys/net/ipv4/ip_forward"
 
