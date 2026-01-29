@@ -55,6 +55,7 @@ final class EncryptionEnforcementTests: XCTestCase {
     /// Verify that all packets sent through UDPSocket have the BinaryEnvelopeV2 prefix.
     func testAllTrafficIsEncrypted() async throws {
         let testKey = Data(repeating: 0x42, count: 32)
+        GlobalEncryptionObserver.registerNetworkKey(testKey)
         let keypair = IdentityKeypair()
 
         // Create a SealedEnvelope using the encryption path
@@ -111,7 +112,7 @@ final class EncryptionEnforcementTests: XCTestCase {
             !expectedDemoTests.contains(where: { v.testName.contains($0) })
         }
         if !unexpectedViolations.isEmpty {
-            let summary = unexpectedViolations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
+            let summary = unexpectedViolations.map { "\($0.testName): \($0.reason) [\($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)]" }
             XCTFail("Unexpected unencrypted packets in \(unexpectedViolations.count) send(s):\n\(summary.joined(separator: "\n"))")
         }
     }
