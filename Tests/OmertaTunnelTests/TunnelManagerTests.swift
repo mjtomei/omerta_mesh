@@ -545,23 +545,20 @@ final class TunnelSessionTests: XCTestCase {
 
     func testSessionActivation() async throws {
         let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
 
-        let session = TunnelSession(
-            remoteMachineId: "machine-123",
-            channel: "data",
-            provider: provider
-        )
+        // Creating a session via TunnelManager should register the wire channel
+        let session = try await manager.getSession(machineId: "machine-123", channel: "data")
 
-        // Activate the session
-        await session.activate()
-
-        // Check state is now active
         let state = await session.state
         XCTAssertEqual(state, .active)
 
-        // Check that channel handler was registered
+        // Wire channel should be registered by the manager
         let channels = await provider.getRegisteredChannels()
         XCTAssertTrue(channels.contains("tunnel-data"))
+
+        await manager.stop()
     }
 
     func testSendRequiresActiveState() async throws {
@@ -618,28 +615,21 @@ final class TunnelSessionTests: XCTestCase {
         // State should be disconnected
         let state = await session.state
         XCTAssertEqual(state, .disconnected)
-
-        // Channel handler should be deregistered
-        let channels = await provider.getRegisteredChannels()
-        XCTAssertFalse(channels.contains("tunnel-data"))
     }
 
     func testReceiveCallback() async throws {
         let provider = MockChannelProvider()
-        let session = TunnelSession(
-            remoteMachineId: "machine-1",
-            channel: "data",
-            provider: provider
-        )
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
 
         var receivedData: Data?
         await session.onReceive { data in
             receivedData = data
         }
 
-        await session.activate()
-
-        // Simulate incoming message
+        // Simulate incoming message — TunnelManager dispatches to the correct session
         await provider.simulateMessage(
             from: "machine-1",
             on: "tunnel-data",
@@ -647,24 +637,23 @@ final class TunnelSessionTests: XCTestCase {
         )
 
         XCTAssertEqual(receivedData, Data([1, 2, 3, 4]))
+
+        await manager.stop()
     }
 
     func testReceiveFiltersByMachine() async throws {
         let provider = MockChannelProvider()
-        let session = TunnelSession(
-            remoteMachineId: "machine-1",
-            channel: "data",
-            provider: provider
-        )
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
 
         var receivedData: Data?
         await session.onReceive { data in
             receivedData = data
         }
 
-        await session.activate()
-
-        // Simulate message from wrong machine - should be ignored
+        // Simulate message from wrong machine - no session exists for it, so dispatch drops it
         await provider.simulateMessage(
             from: "wrong-machine",
             on: "tunnel-data",
@@ -681,6 +670,8 @@ final class TunnelSessionTests: XCTestCase {
         )
 
         XCTAssertEqual(receivedData, Data([1, 2, 3]))
+
+        await manager.stop()
     }
 
     func testSessionStatistics() async throws {
@@ -725,23 +716,13 @@ final class TunnelSessionTests: XCTestCase {
 
     func testMultipleChannelsSameMachine() async throws {
         let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
 
-        let controlSession = TunnelSession(
-            remoteMachineId: "machine-1",
-            channel: "control",
-            provider: provider
-        )
+        let controlSession = try await manager.getSession(machineId: "machine-1", channel: "control")
+        let dataSession = try await manager.getSession(machineId: "machine-1", channel: "data")
 
-        let dataSession = TunnelSession(
-            remoteMachineId: "machine-1",
-            channel: "data",
-            provider: provider
-        )
-
-        await controlSession.activate()
-        await dataSession.activate()
-
-        // Different channels should register different handlers
+        // TunnelManager should register wire channels for both
         let channels = await provider.getRegisteredChannels()
         XCTAssertTrue(channels.contains("tunnel-control"))
         XCTAssertTrue(channels.contains("tunnel-data"))
@@ -750,6 +731,8 @@ final class TunnelSessionTests: XCTestCase {
         let controlKey = await controlSession.key
         let dataKey = await dataSession.key
         XCTAssertNotEqual(controlKey, dataKey)
+
+        await manager.stop()
     }
 }
 

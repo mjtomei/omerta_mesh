@@ -95,21 +95,11 @@ public actor TunnelSession {
             "machine": "\(remoteMachineId.prefix(16))...",
             "channel": "\(channel)"
         ])
-
-        // Register handler on the mesh channel
-        do {
-            try await provider.onChannel(wireChannel) { [weak self] senderMachine, data in
-                await self?.handleIncoming(from: senderMachine, data: data)
-            }
-        } catch {
-            logger.warning("Failed to register channel handler: \(error)")
-        }
     }
 
     /// Close the session and clean up resources
     public func close() async {
         state = .disconnected
-        await provider.offChannel(wireChannel)
         receiveHandler = nil
 
         logger.info("Session closed", metadata: [
@@ -118,29 +108,13 @@ public actor TunnelSession {
         ])
     }
 
-    // MARK: - Private
+    // MARK: - Incoming Data
 
-    private func handleIncoming(from senderMachine: MachineId, data: Data) async {
-        // Verify sender matches expected machine
-        guard senderMachine == remoteMachineId else {
-            logger.trace("Ignoring packet from unexpected machine", metadata: [
-                "expected": "\(remoteMachineId.prefix(16))...",
-                "actual": "\(senderMachine.prefix(16))..."
-            ])
-            return
-        }
-
+    /// Deliver incoming data to this session (called by TunnelManager dispatch)
+    public func deliverIncoming(_ data: Data) async {
         stats.packetsReceived += 1
         stats.bytesReceived += UInt64(data.count)
         stats.lastActivity = Date()
-
-        logger.trace("Received packet", metadata: [
-            "size": "\(data.count)",
-            "channel": "\(channel)",
-            "from": "\(senderMachine.prefix(16))..."
-        ])
-
-        // Invoke receive handler
         await receiveHandler?(data)
     }
 }
