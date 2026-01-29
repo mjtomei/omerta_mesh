@@ -3,8 +3,22 @@ name: Tests
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'LICENSE'
+      - 'licenses/**'
+      - 'plans/**'
+      - '.gitignore'
   pull_request:
     branches: [master, main]
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - 'LICENSE'
+      - 'licenses/**'
+      - 'plans/**'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
