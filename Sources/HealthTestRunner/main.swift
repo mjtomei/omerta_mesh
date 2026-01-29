@@ -445,14 +445,22 @@ struct ControlMessage: Codable, Sendable {
 /// Received control messages (for Node B)
 actor ControlMailbox {
     private var messages: [ControlMessage] = []
-    private var waiters: [CheckedContinuation<ControlMessage, Never>] = []
+    private var waiters: [(id: Int, continuation: CheckedContinuation<ControlMessage?, Never>)] = []
+    private var nextId = 0
 
     func post(_ msg: ControlMessage) {
         if let waiter = waiters.first {
             waiters.removeFirst()
-            waiter.resume(returning: msg)
+            waiter.continuation.resume(returning: msg)
         } else {
             messages.append(msg)
+        }
+    }
+
+    func cancelWaiter(id: Int) {
+        if let idx = waiters.firstIndex(where: { $0.id == id }) {
+            let waiter = waiters.remove(at: idx)
+            waiter.continuation.resume(returning: nil)
         }
     }
 
@@ -461,26 +469,23 @@ actor ControlMailbox {
         if !messages.isEmpty {
             return messages.removeFirst()
         }
-        // Wait
-        return await withTaskGroup(of: ControlMessage?.self) { group in
-            group.addTask {
-                await withCheckedContinuation { cont in
-                    Task { await self.addWaiter(cont) }
-                }
-            }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return nil
-            }
-            let first = await group.next()!
-            group.cancelAll()
-            return first
+        // Wait with timeout
+        let waiterId = nextId
+        nextId += 1
+
+        let timeoutTask = Task {
+            try? await Task.sleep(for: timeout)
+            await self.cancelWaiter(id: waiterId)
         }
+
+        let result: ControlMessage? = await withCheckedContinuation { cont in
+            waiters.append((id: waiterId, continuation: cont))
+        }
+
+        timeoutTask.cancel()
+        return result
     }
 
-    private func addWaiter(_ cont: CheckedContinuation<ControlMessage, Never>) {
-        waiters.append(cont)
-    }
 }
 
 let controlMailbox = ControlMailbox()
