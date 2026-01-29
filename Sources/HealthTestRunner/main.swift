@@ -550,6 +550,10 @@ if !isNodeA {
         }
     }
 
+    // Signal to Node A that we're ready to receive sessions
+    await sendControl("nodeB-ready")
+    logger.info("Node B: sent ready signal")
+
     // Main loop: respond to control commands
     while true {
         guard let cmd = await controlMailbox.receive(timeout: .seconds(120)) else {
@@ -692,6 +696,11 @@ var session1: TunnelSession? = nil
 var monitor: TunnelHealthMonitor? = nil
 
 do {
+    // Wait for Node B to signal it's ready (handler set up)
+    logger.info("Waiting for Node B ready signal...")
+    let ready = await waitForAck("nodeB-ready", timeout: .seconds(30))
+    if !ready { logger.warning("Node B ready signal not received, proceeding anyway") }
+
     // Tell Node B to start phase 1 (it will wait for our session)
     await sendControl("phase1-start")
 
