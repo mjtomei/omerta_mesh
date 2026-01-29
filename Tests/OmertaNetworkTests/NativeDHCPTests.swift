@@ -567,17 +567,13 @@ final class NativeDHCPIntegrationTests: XCTestCase {
 
         let relayTask = Task {
             while !Task.isCancelled {
-                let clientMsgs = await clientProvider.sentMessages
-                for msg in clientMsgs where msg.target == "gateway" {
+                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
                     await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
-                await clientProvider.clearMessages()
 
-                let serviceMsgs = await serviceProvider.sentMessages
-                for msg in serviceMsgs where msg.target == "m1" {
+                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
                     await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                 }
-                await serviceProvider.clearMessages()
 
                 try? await Task.sleep(for: .milliseconds(10))
             }
@@ -618,17 +614,13 @@ final class NativeDHCPIntegrationTests: XCTestCase {
 
         let relayTask = Task {
             while !Task.isCancelled {
-                let clientMsgs = await clientProvider.sentMessages
-                for msg in clientMsgs where msg.target == "gateway" {
+                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
                     await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
-                await clientProvider.clearMessages()
 
-                let serviceMsgs = await serviceProvider.sentMessages
-                for msg in serviceMsgs where msg.target == "m1" {
+                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
                     await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
                 }
-                await serviceProvider.clearMessages()
 
                 try? await Task.sleep(for: .milliseconds(10))
             }

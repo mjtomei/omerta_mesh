@@ -80,6 +80,13 @@ public actor MockChannelProvider: ChannelProvider {
         Array(handlers.keys)
     }
 
+    /// Atomically drain and return all sent messages
+    public func drainSentMessages() -> [(data: Data, target: String, channel: String)] {
+        let msgs = sentMessages
+        sentMessages.removeAll()
+        return msgs
+    }
+
     /// Reset all recorded data
     public func reset() {
         sentMessages.removeAll()
@@ -119,11 +126,8 @@ extension MockChannelProvider {
             Task {
                 // Poll for messages periodically (simple approach for testing)
                 while !Task.isCancelled {
-                    let messages = await self.sentMessages
-                    for (index, msg) in messages.enumerated() {
-                        if msg.target == otherMachineId {
-                            await other.simulateReceive(msg.data, from: self._machineId, on: msg.channel)
-                        }
+                    for msg in await self.drainSentMessages() where msg.target == otherMachineId {
+                        await other.simulateReceive(msg.data, from: self._machineId, on: msg.channel)
                     }
                     try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
                 }
