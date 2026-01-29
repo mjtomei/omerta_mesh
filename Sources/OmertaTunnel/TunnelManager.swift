@@ -101,8 +101,14 @@ public actor TunnelManager {
         }
 
         // Register health probe handler — receiving a probe means remote is alive
-        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
-            await self?.notifyPacketReceived(from: machineId)
+        // Echo back a response so the sender knows we're alive too
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
+            guard let self else { return }
+            await self.notifyPacketReceived(from: machineId)
+            // Echo probe back (0x01 = probe, 0x02 = response)
+            if data.first == 0x01 {
+                try? await self.provider.sendOnChannel(Data([0x02]), toMachine: machineId, channel: self.healthProbeChannel)
+            }
         }
 
         isRunning = true
