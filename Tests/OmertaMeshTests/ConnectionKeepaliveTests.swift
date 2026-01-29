@@ -262,7 +262,7 @@ final class ConnectionKeepaliveTests: XCTestCase {
         let config = ConnectionKeepalive.Config(
             interval: 0.05,
             missedThreshold: 2,
-            responseTimeout: 1.0
+            responseTimeout: 0.05
         )
         let keepalive = ConnectionKeepalive(config: config)
 
@@ -297,8 +297,8 @@ final class ConnectionKeepaliveTests: XCTestCase {
 
         await keepalive.start()
 
-        // Wait for peer2 to fail
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // Wait for peer2 to fail (500ms gives margin for 2 cycles at 50ms interval + 50ms timeout)
+        try await Task.sleep(nanoseconds: 500_000_000)
 
         await keepalive.stop()
 

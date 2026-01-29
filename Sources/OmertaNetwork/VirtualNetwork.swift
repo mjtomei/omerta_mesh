@@ -120,4 +120,14 @@ public actor VirtualNetwork {
     public func getConfig() -> VirtualNetworkConfig {
         config
     }
+
+    /// Get our local machine ID
+    public func getLocalMachineId() -> MachineId {
+        localMachineId
+    }
+
+    /// Get the gateway machine ID (if set)
+    public func getGatewayMachineId() -> MachineId? {
+        gatewayMachineId
+    }
 }

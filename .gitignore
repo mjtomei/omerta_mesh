@@ -7,9 +7,11 @@ DerivedData/
 .DS_Store
 ._*
 
-# Go build products (rebuilt with 'make' in Sources/OmertaTunnel/Netstack/)
+# Go build products (rebuilt with 'make')
 Sources/OmertaTunnel/Netstack/libnetstack.a
 Sources/OmertaTunnel/Netstack/libnetstack.h
+Sources/CNetstack/libnetstack.a
+Sources/CNetstack/libnetstack.h
 
 # Infrastructure documentation with sensitive details
 **/MANUAL_TESTING.md

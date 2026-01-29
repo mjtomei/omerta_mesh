@@ -15,5 +15,5 @@
 // ## Phase 4 (Planned)
 // Resilience with auto-reconnect on mesh disconnection.
 
-@_exported import class OmertaTunnel.NetstackBridge
-@_exported import class OmertaTunnel.NetstackTCPConnection
+@_exported import class OmertaNetwork.NetstackBridge
+@_exported import class OmertaNetwork.NetstackTCPConnection
