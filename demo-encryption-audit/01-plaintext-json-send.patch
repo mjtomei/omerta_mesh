@@ -1,0 +1,29 @@
+diff --git a/Tests/OmertaMeshTests/DemoAttackTests.swift b/Tests/OmertaMeshTests/DemoAttackTests.swift
+index 3474e9e..e38f126 100644
+--- a/Tests/OmertaMeshTests/DemoAttackTests.swift
++++ b/Tests/OmertaMeshTests/DemoAttackTests.swift
+@@ -35,6 +35,24 @@ final class DemoAttackTests: XCTestCase {
+         try? group.syncShutdownGracefully()
+         try await super.tearDown()
+     }
++    // Scenario 1: Developer accidentally sends unencrypted JSON
++    func testPlaintextJSONSend() async throws {
++        let beforeCount = GlobalEncryptionObserver.shared.violations.count
++        let keypair = IdentityKeypair()
++        let envelope = try MeshEnvelope.signed(
++            from: keypair,
++            machineId: UUID().uuidString,
++            to: nil,
++            payload: .data(Data("secret message".utf8))
++        )
++        // BUG: sends plaintext JSON instead of encrypted envelope
++        let data = try JSONEncoder().encode(envelope)
++        try await socket.sendRaw(data, to: dest)
++        try await Task.sleep(nanoseconds: 10_000_000)
++        XCTAssertGreaterThan(GlobalEncryptionObserver.shared.violations.count, beforeCount,
++            "Audit should catch plaintext JSON send")
++    }
++
+ }
+ 
+ #endif

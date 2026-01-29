@@ -102,6 +102,10 @@ public actor IdentityStore {
         )
 
         try data.write(to: storePath)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: storePath.path
+        )
         logger.debug("Saved \(identities.count) identities to store")
     }
 }

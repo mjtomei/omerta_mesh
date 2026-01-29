@@ -1,8 +1,6 @@
-// HolePuncher.swift - UDP hole punch execution
+// HolePuncher.swift - UDP hole punch execution using encrypted pings
 
 import Foundation
-import NIOCore
-import NIOPosix
 import Logging
 
 /// Result of a hole punch attempt
@@ -37,6 +35,7 @@ public enum HolePunchFailure: Error, Sendable, Equatable, CustomStringConvertibl
     case invalidEndpoint(String)
     case cancelled
     case socketError(String)
+    case noServices
 
     public var description: String {
         switch self {
@@ -52,25 +51,27 @@ public enum HolePunchFailure: Error, Sendable, Equatable, CustomStringConvertibl
             return "Hole punch was cancelled"
         case .socketError(let msg):
             return "Socket error: \(msg)"
+        case .noServices:
+            return "No mesh services available for sending pings"
         }
     }
 }
 
 /// Configuration for hole punching
 public struct HolePunchConfig: Sendable {
-    /// Number of probe packets to send
+    /// Number of ping packets to send during hole punch
     public let probeCount: Int
 
-    /// Interval between probes
+    /// Interval between pings
     public let probeInterval: TimeInterval
 
     /// Timeout for hole punch attempt
     public let timeout: TimeInterval
 
-    /// Whether to send response probes when receiving
+    /// Whether to send response pings when receiving
     public let sendResponseProbes: Bool
 
-    /// Number of response probes to send
+    /// Number of response pings to send
     public let responseProbeCount: Int
 
     public init(
@@ -90,7 +91,10 @@ public struct HolePunchConfig: Sendable {
     public static let `default` = HolePunchConfig()
 }
 
-/// UDP hole puncher for establishing direct connections through NAT
+/// UDP hole puncher for establishing direct connections through NAT.
+///
+/// Uses encrypted mesh pings (via BinaryEnvelopeV2) instead of raw UDP probes.
+/// All packets go through the standard encryption layer.
 public actor HolePuncher {
     private let peerId: String
     private let config: HolePunchConfig
@@ -99,10 +103,18 @@ public actor HolePuncher {
     /// Active hole punch sessions
     private var activeSessions: [String: HolePunchSession] = [:]
 
+    /// Mesh services for sending encrypted pings
+    private weak var services: (any MeshNodeServices)?
+
     public init(peerId: String, config: HolePunchConfig = .default) {
         self.peerId = peerId
         self.config = config
         self.logger = Logger(label: "io.omerta.mesh.holepunch")
+    }
+
+    /// Set mesh services for encrypted communication
+    public func setServices(_ services: any MeshNodeServices) {
+        self.services = services
     }
 
     // MARK: - Public API
@@ -119,6 +131,10 @@ public actor HolePuncher {
             return .failed(reason: .bothSymmetric)
         }
 
+        guard let services = services else {
+            return .failed(reason: .noServices)
+        }
+
         logger.info("Starting hole punch", metadata: [
             "target": "\(targetPeerId)",
             "endpoint": "\(targetEndpoint)",
@@ -133,7 +149,8 @@ public actor HolePuncher {
             remotePeerId: targetPeerId,
             targetEndpoint: targetEndpoint,
             strategy: strategy,
-            config: config
+            config: config,
+            services: services
         )
         activeSessions[sessionId] = session
 
@@ -145,13 +162,13 @@ public actor HolePuncher {
         let result: HolePunchResult
         switch strategy {
         case .simultaneous:
-            result = await session.executeSimultaneous(localPort: localPort)
+            result = await session.executeSimultaneous()
 
         case .initiatorFirst:
-            result = await session.executeInitiatorFirst(localPort: localPort)
+            result = await session.executeInitiatorFirst()
 
         case .responderFirst:
-            result = await session.executeResponderFirst(localPort: localPort)
+            result = await session.executeResponderFirst()
 
         case .impossible:
             result = .failed(reason: .bothSymmetric)
@@ -182,49 +199,12 @@ public actor HolePuncher {
         }
     }
 
-    /// Handle incoming probe (called when we receive a probe from another peer)
-    public func handleIncomingProbe(
-        from endpoint: String,
-        probe: ProbePacket,
-        respondWith socket: UDPSocket?
-    ) async {
-        // Find matching session
-        let senderId = String(data: probe.senderIdPrefix.prefix(while: { $0 != 0 }), encoding: .utf8) ?? ""
-
+    /// Notify that a pong was received from an endpoint (called by MeshNode on pong receipt)
+    public func handlePongReceived(from endpoint: String, peerId: PeerId) async {
         for (_, session) in activeSessions {
-            if session.remotePeerId == senderId || session.targetEndpoint == endpoint {
-                await session.handleProbe(from: endpoint, probe: probe)
-
-                // Send response probes if configured and this isn't already a response
-                if config.sendResponseProbes && !probe.isResponse, let socket = socket {
-                    await sendResponseProbes(to: endpoint, socket: socket)
-                }
+            if session.remotePeerId == peerId || session.targetEndpoint == endpoint {
+                await session.handlePongReceived(from: endpoint)
                 return
-            }
-        }
-
-        // No matching session - might be unsolicited probe
-        logger.debug("Received probe with no matching session", metadata: [
-            "from": "\(endpoint)",
-            "sender": "\(senderId)"
-        ])
-    }
-
-    /// Send response probes to an endpoint
-    private func sendResponseProbes(to endpoint: String, socket: UDPSocket) async {
-        for i in 0..<config.responseProbeCount {
-            let probe = ProbePacket(
-                sequence: UInt32(100 + i),
-                senderId: peerId,
-                isResponse: true
-            )
-            do {
-                try await socket.send(probe.serialize(), to: endpoint)
-                if i < config.responseProbeCount - 1 {
-                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                }
-            } catch {
-                logger.debug("Failed to send response probe: \(error)")
             }
         }
     }
@@ -237,7 +217,11 @@ public actor HolePuncher {
 
 // MARK: - HolePunchSession
 
-/// A single hole punch attempt session
+/// A single hole punch attempt session.
+///
+/// Instead of creating a raw UDP socket and sending unencrypted probe packets,
+/// this sends encrypted pings through the mesh node's standard send path
+/// (BinaryEnvelopeV2 with ChaCha20-Poly1305).
 actor HolePunchSession {
     let sessionId: String
     let localPeerId: String
@@ -246,10 +230,10 @@ actor HolePunchSession {
     let strategy: HolePunchStrategy
     let config: HolePunchConfig
 
-    private var receivedProbe: (endpoint: String, probe: ProbePacket)?
-    private var probeContinuation: CheckedContinuation<(String, ProbePacket)?, Never>?
+    private var receivedPong: String?  // endpoint from which pong was received
+    private var pongContinuation: CheckedContinuation<String?, Never>?
     private var isCancelled = false
-    private var socket: UDPSocket?
+    private let services: any MeshNodeServices
     private let logger: Logger
 
     init(
@@ -258,7 +242,8 @@ actor HolePunchSession {
         remotePeerId: String,
         targetEndpoint: String,
         strategy: HolePunchStrategy,
-        config: HolePunchConfig
+        config: HolePunchConfig,
+        services: any MeshNodeServices
     ) {
         self.sessionId = sessionId
         self.localPeerId = localPeerId
@@ -266,203 +251,124 @@ actor HolePunchSession {
         self.targetEndpoint = targetEndpoint
         self.strategy = strategy
         self.config = config
+        self.services = services
         self.logger = Logger(label: "io.omerta.mesh.holepunch.session.\(sessionId.prefix(8))")
     }
 
     /// Execute simultaneous hole punch strategy
-    func executeSimultaneous(localPort: UInt16) async -> HolePunchResult {
+    func executeSimultaneous() async -> HolePunchResult {
         guard !isCancelled else { return .failed(reason: .cancelled) }
 
-        do {
-            let socket = try await createSocket(port: localPort)
-            self.socket = socket
-            defer { cleanup() }
+        let startTime = Date()
 
-            let startTime = Date()
+        // Send pings to target endpoint
+        await sendPings(to: targetEndpoint)
 
-            // Send probes
-            await sendProbes(to: targetEndpoint, socket: socket)
-
-            // Wait for response
-            guard let (endpoint, probe) = await waitForProbe(timeout: config.timeout) else {
-                return .failed(reason: .timeout)
-            }
-
-            let rtt = Date().timeIntervalSince(startTime)
-            return .success(endpoint: endpoint, rtt: rtt)
-
-        } catch let error as HolePunchFailure {
-            return .failed(reason: error)
-        } catch {
-            return .failed(reason: .socketError(error.localizedDescription))
+        // Wait for pong response
+        guard let endpoint = await waitForPong(timeout: config.timeout) else {
+            return .failed(reason: .timeout)
         }
+
+        let rtt = Date().timeIntervalSince(startTime)
+        return .success(endpoint: endpoint, rtt: rtt)
     }
 
-    /// Execute initiator-first strategy (we're symmetric, send first)
-    func executeInitiatorFirst(localPort: UInt16) async -> HolePunchResult {
+    /// Execute initiator-first strategy (we send first to create NAT mapping)
+    func executeInitiatorFirst() async -> HolePunchResult {
         guard !isCancelled else { return .failed(reason: .cancelled) }
 
-        do {
-            let socket = try await createSocket(port: localPort)
-            self.socket = socket
-            defer { cleanup() }
+        let startTime = Date()
 
-            let startTime = Date()
+        // Send pings first to create NAT mapping
+        await sendPings(to: targetEndpoint)
 
-            // Send probes first to create NAT mapping
-            await sendProbes(to: targetEndpoint, socket: socket)
-
-            // Wait for response with longer timeout
-            guard let (endpoint, _) = await waitForProbe(timeout: config.timeout * 1.5) else {
-                return .failed(reason: .timeout)
-            }
-
-            let rtt = Date().timeIntervalSince(startTime)
-            return .success(endpoint: endpoint, rtt: rtt)
-
-        } catch let error as HolePunchFailure {
-            return .failed(reason: error)
-        } catch {
-            return .failed(reason: .socketError(error.localizedDescription))
+        // Wait for pong with longer timeout
+        guard let endpoint = await waitForPong(timeout: config.timeout * 1.5) else {
+            return .failed(reason: .timeout)
         }
+
+        let rtt = Date().timeIntervalSince(startTime)
+        return .success(endpoint: endpoint, rtt: rtt)
     }
 
     /// Execute responder-first strategy (we wait, then respond)
-    func executeResponderFirst(localPort: UInt16) async -> HolePunchResult {
+    func executeResponderFirst() async -> HolePunchResult {
         guard !isCancelled else { return .failed(reason: .cancelled) }
 
-        do {
-            let socket = try await createSocket(port: localPort)
-            self.socket = socket
-            defer { cleanup() }
+        let startTime = Date()
 
-            let startTime = Date()
-
-            // Wait for incoming probe first
-            guard let (endpoint, _) = await waitForProbe(timeout: config.timeout) else {
-                return .failed(reason: .timeout)
-            }
-
-            // Send response probes to complete the hole
-            await sendProbes(to: endpoint, socket: socket, isResponse: true)
-
-            let rtt = Date().timeIntervalSince(startTime)
-            return .success(endpoint: endpoint, rtt: rtt)
-
-        } catch let error as HolePunchFailure {
-            return .failed(reason: error)
-        } catch {
-            return .failed(reason: .socketError(error.localizedDescription))
+        // Wait for incoming pong first (the other side is sending pings)
+        guard let endpoint = await waitForPong(timeout: config.timeout) else {
+            return .failed(reason: .timeout)
         }
+
+        // Send response pings to complete the hole
+        await sendPings(to: endpoint)
+
+        let rtt = Date().timeIntervalSince(startTime)
+        return .success(endpoint: endpoint, rtt: rtt)
     }
 
-    /// Handle an incoming probe
-    func handleProbe(from endpoint: String, probe: ProbePacket) {
-        receivedProbe = (endpoint, probe)
+    /// Handle a pong received from the target
+    func handlePongReceived(from endpoint: String) {
+        receivedPong = endpoint
 
-        if let continuation = probeContinuation {
-            probeContinuation = nil
-            continuation.resume(returning: (endpoint, probe))
+        if let continuation = pongContinuation {
+            pongContinuation = nil
+            continuation.resume(returning: endpoint)
         }
     }
 
     /// Cancel the session
     func cancel() {
         isCancelled = true
-        if let continuation = probeContinuation {
-            probeContinuation = nil
+        if let continuation = pongContinuation {
+            pongContinuation = nil
             continuation.resume(returning: nil)
         }
-        cleanup()
     }
 
     // MARK: - Private Methods
 
-    private func createSocket(port: UInt16) async throws -> UDPSocket {
-        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        let socket = UDPSocket(eventLoopGroup: eventLoopGroup)
+    /// Send encrypted pings to the target endpoint to punch through NAT.
+    /// Uses the standard mesh send path (BinaryEnvelopeV2 encryption).
+    private func sendPings(to endpoint: String) async {
+        let natType = await services.getNATType(for: localPeerId) ?? .unknown
 
-        do {
-            try await socket.bind(port: Int(port))
-        } catch {
-            try? await eventLoopGroup.shutdownGracefully()
-            throw HolePunchFailure.bindFailed
-        }
-
-        // Set up probe handler
-        await socket.onReceive { [weak self] data, address in
-            guard let self = self else { return }
-            if let probe = ProbePacket.parse(data) {
-                let endpoint = self.formatEndpoint(address)
-                await self.handleProbe(from: endpoint, probe: probe)
-            }
-        }
-
-        return socket
-    }
-
-    private func sendProbes(to endpoint: String, socket: UDPSocket, isResponse: Bool = false) async {
         for i in 0..<config.probeCount {
             guard !isCancelled else { break }
 
-            let probe = ProbePacket(
-                sequence: UInt32(i),
-                senderId: localPeerId,
-                isResponse: isResponse
-            )
-
             do {
-                try await socket.send(probe.serialize(), to: endpoint)
-                logger.debug("Sent probe \(i) to \(endpoint)")
+                let ping = MeshMessage.ping(recentPeers: [], myNATType: natType, requestFullList: false)
+                try await services.send(ping, to: remotePeerId, strategy: .direct(endpoint: endpoint))
+                logger.debug("Sent hole punch ping \(i) to \(endpoint)")
 
                 if i < config.probeCount - 1 {
                     try await Task.sleep(nanoseconds: UInt64(config.probeInterval * 1_000_000_000))
                 }
             } catch {
-                logger.debug("Failed to send probe: \(error)")
+                logger.debug("Failed to send hole punch ping: \(error)")
             }
         }
     }
 
-    private func waitForProbe(timeout: TimeInterval) async -> (String, ProbePacket)? {
-        // Check if we already received a probe
-        if let received = receivedProbe {
+    private func waitForPong(timeout: TimeInterval) async -> String? {
+        // Check if we already received a pong
+        if let received = receivedPong {
             return received
         }
 
         return await withCheckedContinuation { continuation in
-            probeContinuation = continuation
+            pongContinuation = continuation
 
             // Set up timeout
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                if let cont = self.probeContinuation {
-                    self.probeContinuation = nil
+                if let cont = self.pongContinuation {
+                    self.pongContinuation = nil
                     cont.resume(returning: nil)
                 }
             }
-        }
-    }
-
-    private func cleanup() {
-        if let socket = socket {
-            Task { await socket.close() }
-        }
-        socket = nil
-    }
-
-    private nonisolated func formatEndpoint(_ address: NIOCore.SocketAddress) -> String {
-        guard let port = address.port else {
-            return address.description
-        }
-
-        switch address {
-        case .v4(let addr):
-            return "\(addr.host):\(port)"
-        case .v6(let addr):
-            return "[\(addr.host)]:\(port)"
-        default:
-            return address.description
         }
     }
 }

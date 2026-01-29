@@ -36,6 +36,10 @@ public func getOrCreateMachineId() throws -> MachineId {
 
     // Write machine ID
     try newId.write(to: machineIdPath, atomically: true, encoding: .utf8)
+    try fileManager.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: machineIdPath.path
+    )
 
     return newId
 }

@@ -19,6 +19,24 @@
 import Foundation
 import Crypto
 
+/// Encrypted data ready for network transmission.
+/// Can only be constructed by BinaryEnvelopeV2 encryption methods.
+public struct SealedEnvelope: Sendable {
+    /// The encrypted bytes. Read-only for sending.
+    public let data: Data
+
+    /// Only constructible from within this file (encryption methods).
+    fileprivate init(data: Data) {
+        self.data = data
+    }
+
+    /// Wrap data that is already encrypted (e.g., relay forwarding).
+    /// Internal-only: callers within the module can vouch for already-encrypted data.
+    internal init(trustedData: Data) {
+        self.data = trustedData
+    }
+}
+
 /// Wire format v2 implementation with layered encryption
 public enum BinaryEnvelopeV2 {
     /// Magic bytes identifying Omerta packets
@@ -80,7 +98,7 @@ public enum BinaryEnvelopeV2 {
         header: EnvelopeHeader,
         payload: Data,
         networkKey: Data
-    ) throws -> Data {
+    ) throws -> SealedEnvelope {
         // Generate random nonce using ChaChaPoly's nonce generator
         let headerNonceValue = ChaChaPoly.Nonce()
         let headerNonce = Array(headerNonceValue)
@@ -122,7 +140,7 @@ public enum BinaryEnvelopeV2 {
         writer.writeBytes(payloadSealedBox.ciphertext)
         writer.writeBytes(payloadSealedBox.tag)  // Full 16-byte tag
 
-        return writer.data
+        return SealedEnvelope(data: writer.data)
     }
 
     // MARK: - Fast Path Rejection
@@ -244,7 +262,7 @@ extension BinaryEnvelopeV2 {
         header: EnvelopeHeader,
         payload: Data,
         networkKey: Data
-    ) throws -> Data {
+    ) throws -> SealedEnvelope {
         // Generate random nonce using ChaChaPoly's nonce generator
         let headerNonceValue = ChaChaPoly.Nonce()
         let headerNonce = Array(headerNonceValue)
@@ -286,7 +304,7 @@ extension BinaryEnvelopeV2 {
         writer.writeBytes(payloadSealedBox.ciphertext)
         writer.writeBytes(payloadSealedBox.tag)  // Full 16-byte tag
 
-        return writer.data
+        return SealedEnvelope(data: writer.data)
     }
 }
 
@@ -294,7 +312,7 @@ extension BinaryEnvelopeV2 {
 
 extension MeshEnvelope {
     /// Encode envelope using v2 wire format
-    public func encodeV2(networkKey: Data) throws -> Data {
+    public func encodeV2(networkKey: Data) throws -> SealedEnvelope {
         // Create header from envelope fields
         let networkHash = BinaryEnvelopeV2.computeNetworkHash(networkKey)
 

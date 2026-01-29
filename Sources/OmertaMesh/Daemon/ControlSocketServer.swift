@@ -85,6 +85,18 @@ public actor ControlSocketServer {
             serverChannel = channel
             state = .running
 
+            // Set socket permissions: owner + omerta group (0o660), fallback to owner-only (0o600)
+            var attrs: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
+            if let group = getgrnam("omerta") {
+                let groupId = group.pointee.gr_gid
+                attrs[.groupOwnerAccountID] = NSNumber(value: groupId)
+                attrs[.posixPermissions] = 0o660
+                logger.info("Control socket using 'omerta' group (gid: \(groupId))")
+            } else {
+                logger.notice("'omerta' group not found, control socket restricted to owner only")
+            }
+            try? FileManager.default.setAttributes(attrs, ofItemAtPath: socketPath)
+
             logger.info("Control socket server started", metadata: ["path": "\(socketPath)"])
 
         } catch {

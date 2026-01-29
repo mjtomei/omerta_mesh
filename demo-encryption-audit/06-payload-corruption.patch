@@ -1,0 +1,32 @@
+diff --git a/Tests/OmertaMeshTests/DemoAttackTests.swift b/Tests/OmertaMeshTests/DemoAttackTests.swift
+index 3474e9e..5d2095d 100644
+--- a/Tests/OmertaMeshTests/DemoAttackTests.swift
++++ b/Tests/OmertaMeshTests/DemoAttackTests.swift
+@@ -35,6 +35,27 @@ final class DemoAttackTests: XCTestCase {
+         try? group.syncShutdownGracefully()
+         try await super.tearDown()
+     }
++    // Scenario 6: Bug corrupts the payload after encryption
++    func testPayloadCorruption() async throws {
++        let keypair = IdentityKeypair()
++        let testKey = Data(repeating: 0x42, count: 32)
++        let envelope = try MeshEnvelope.signed(
++            from: keypair,
++            machineId: UUID().uuidString,
++            to: nil,
++            payload: .data(Data("corrupt me".utf8))
++        )
++        let sealed = try envelope.encodeV2(networkKey: testKey)
++        var mangled = sealed.data
++        let start = max(mangled.count - 32, 17)
++        for i in start..<mangled.count { mangled[i] = 0x00 }
++        try await socket.sendRaw(mangled, to: dest)
++        try await Task.sleep(nanoseconds: 10_000_000)
++        // Prefix is valid -- caught by daemon decryption audit, not prefix check
++        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(mangled),
++            "Corrupted packet passes prefix -- needs decryption audit")
++    }
++
+ }
+ 
+ #endif

@@ -185,6 +185,10 @@ public actor NetworkStore {
         )
 
         try data.write(to: storePath)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: storePath.path
+        )
         logger.debug("Saved \(networks.count) networks to store")
     }
 }
