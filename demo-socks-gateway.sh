@@ -39,7 +39,7 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-TMPLOG=$(mktemp /tmp/demo-socks-gw.XXXXXX)
+TMPLOG=$(mktemp "${TMPDIR:-/tmp}/demo-socks-gw.XXXXXX")
 SERVER_PID=""
 
 print_kernel_state() {

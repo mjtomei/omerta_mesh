@@ -36,7 +36,7 @@ final class RealNetstackIntegrationTests: XCTestCase {
 
         let peerProvider = E2EChannelProvider(machineId: "peer")
         let peerInterface = MockNetworkInterface(localIP: "10.0.0.100")
-        let peerVNet = VirtualNetwork(localMachineId: "peer")
+        let peerVNet = VirtualNetwork(localMachineId: "peer", config: .testDefault)
         await peerVNet.setLocalAddress("10.0.0.100")
         await peerVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
 
@@ -53,7 +53,7 @@ final class RealNetstackIntegrationTests: XCTestCase {
 
         let gwProvider = E2EChannelProvider(machineId: "gw")
         let gwInterface = MockNetworkInterface(localIP: "10.0.0.1")
-        let gwVNet = VirtualNetwork(localMachineId: "gw")
+        let gwVNet = VirtualNetwork(localMachineId: "gw", config: .testDefault)
         await gwVNet.setLocalAddress("10.0.0.1")
         await gwVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
         await gwVNet.registerAddress(ip: "10.0.0.100", machineId: "peer")

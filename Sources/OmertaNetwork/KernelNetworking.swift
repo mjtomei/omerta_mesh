@@ -48,17 +48,17 @@ public enum KernelNetworking {
     ///
     /// Note: call looseRPFilter(tunName:) separately after the TUN device is created,
     /// since the per-interface procfs entry only exists after creation.
-    public static func enableMasquerade(tunName: String, outInterface: String) throws {
+    public static func enableMasquerade(tunName: String, outInterface: String, sourceSubnet: String) throws {
         let backend = detectFirewallBackend()
         logger.info("Using firewall backend: \(backend)")
 
         switch backend {
         case .iptablesLegacy:
-            try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables-legacy")
+            try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables-legacy")
         case .nft:
-            try enableMasqueradeNft(tunName: tunName, outInterface: outInterface)
+            try enableMasqueradeNft(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet)
         case .iptablesNft:
-            try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables")
+            try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables")
         }
 
         // Verify rules were actually applied (use the same backend for checking)
@@ -70,11 +70,11 @@ public enum KernelNetworking {
                 do {
                     switch fallback {
                     case .iptablesLegacy:
-                        try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables-legacy")
+                        try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables-legacy")
                     case .nft:
-                        try enableMasqueradeNft(tunName: tunName, outInterface: outInterface)
+                        try enableMasqueradeNft(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet)
                     case .iptablesNft:
-                        try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables")
+                        try enableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables")
                     }
                     if verifyMasquerade(tunName: tunName, outInterface: outInterface, backend: fallback) {
                         logger.info("Masquerade applied via fallback: \(fallback)")
@@ -91,15 +91,15 @@ public enum KernelNetworking {
     }
 
     /// Clean up firewall rules
-    public static func disableMasquerade(tunName: String, outInterface: String) {
+    public static func disableMasquerade(tunName: String, outInterface: String, sourceSubnet: String) {
         let backend = detectFirewallBackend()
         switch backend {
         case .iptablesLegacy:
-            disableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables-legacy")
+            disableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables-legacy")
         case .nft:
             disableMasqueradeNft(tunName: tunName, outInterface: outInterface)
         case .iptablesNft:
-            disableMasqueradeIptables(tunName: tunName, outInterface: outInterface, binary: "/sbin/iptables")
+            disableMasqueradeIptables(tunName: tunName, outInterface: outInterface, sourceSubnet: sourceSubnet, binary: "/sbin/iptables")
         }
         // Also try nft cleanup in case we used nft as fallback
         if backend != .nft {
@@ -135,10 +135,10 @@ public enum KernelNetworking {
 
     // MARK: - iptables backend (works for both legacy and nft)
 
-    private static func enableMasqueradeIptables(tunName: String, outInterface: String, binary: String) throws {
+    private static func enableMasqueradeIptables(tunName: String, outInterface: String, sourceSubnet: String, binary: String) throws {
         try runFirewall(binary, [
             "-t", "nat", "-A", "POSTROUTING",
-            "-s", "10.0.0.0/8", "-o", outInterface,
+            "-s", sourceSubnet, "-o", outInterface,
             "-j", "MASQUERADE"
         ])
         try runFirewall(binary, [
@@ -152,10 +152,10 @@ public enum KernelNetworking {
         ])
     }
 
-    private static func disableMasqueradeIptables(tunName: String, outInterface: String, binary: String) {
+    private static func disableMasqueradeIptables(tunName: String, outInterface: String, sourceSubnet: String, binary: String) {
         try? runFirewall(binary, [
             "-t", "nat", "-D", "POSTROUTING",
-            "-s", "10.0.0.0/8", "-o", outInterface,
+            "-s", sourceSubnet, "-o", outInterface,
             "-j", "MASQUERADE"
         ])
         try? runFirewall(binary, [
@@ -171,7 +171,7 @@ public enum KernelNetworking {
 
     // MARK: - nft backend
 
-    private static func enableMasqueradeNft(tunName: String, outInterface: String) throws {
+    private static func enableMasqueradeNft(tunName: String, outInterface: String, sourceSubnet: String) throws {
         // Create our own nft table with chains that run before Docker's.
         // Docker's filter FORWARD chain is at priority 0; we use -1 to go first.
         // For NAT, Docker uses priority srcnat (100); we use 99.
@@ -181,7 +181,7 @@ public enum KernelNetworking {
         add chain ip omerta forward { type filter hook forward priority -1 ; policy accept ; }
         flush chain ip omerta postrouting
         flush chain ip omerta forward
-        add rule ip omerta postrouting ip saddr 10.0.0.0/8 oifname "\(outInterface)" masquerade
+        add rule ip omerta postrouting ip saddr \(sourceSubnet) oifname "\(outInterface)" masquerade
         add rule ip omerta forward iifname "\(tunName)" oifname "\(outInterface)" accept
         add rule ip omerta forward iifname "\(outInterface)" oifname "\(tunName)" ct state related,established accept
         """
@@ -225,7 +225,7 @@ public enum KernelNetworking {
 
     /// Run diagnostics and print results. Call after TUN devices are created and
     /// kernel networking is configured.
-    public static func printDiagnostics(tunName: String, outInterface: String) {
+    public static func printDiagnostics(tunName: String, outInterface: String, sourceSubnet: String) {
         var issues: [String] = []
 
         // Check ip_forward
@@ -262,7 +262,7 @@ public enum KernelNetworking {
         let hasMasq = (nftRules.contains("masquerade") && nftRules.contains(outInterface))
             || (natRules.contains("MASQUERADE") && natRules.contains(outInterface))
         if !hasMasq {
-            issues.append("No MASQUERADE rule for \(outInterface). Fix: nft add rule ip omerta postrouting ip saddr 10.0.0.0/8 oifname \(outInterface) masquerade")
+            issues.append("No MASQUERADE rule for \(outInterface). Fix: nft add rule ip omerta postrouting ip saddr \(sourceSubnet) oifname \(outInterface) masquerade")
         }
 
         // Check route to internet exists

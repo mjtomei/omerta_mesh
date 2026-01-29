@@ -1378,7 +1378,7 @@ final class IngressEndpointTests: XCTestCase {
 
     func testIngressEndpointExpiry() {
         let endpoint = IngressEndpoint(
-            endpoint: "192.168.1.100:51900",
+            endpoint: "192.0.2.100:51900",
             method: .direct,
             ttlSeconds: 0
         )
@@ -1528,8 +1528,8 @@ final class IngressManagerTests: XCTestCase {
     }
 
     func testNegotiateSameLAN() async throws {
-        mockNode.mockBestEndpoint = "192.168.1.50:8001"
-        mockNode.mockLocalIP = "192.168.1.100"
+        mockNode.mockBestEndpoint = "192.0.2.50:8001"
+        mockNode.mockLocalIP = "192.0.2.100"
 
         let endpoint = try await manager.negotiate(
             for: "target-peer",
@@ -1538,7 +1538,7 @@ final class IngressManagerTests: XCTestCase {
         )
 
         XCTAssertEqual(endpoint.method, .direct)
-        XCTAssertEqual(endpoint.endpoint, "192.168.1.100:51900")
+        XCTAssertEqual(endpoint.endpoint, "192.0.2.100:51900")
         XCTAssertNil(endpoint.tunnelId)
     }
 

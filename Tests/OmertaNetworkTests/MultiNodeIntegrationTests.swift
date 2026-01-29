@@ -30,7 +30,7 @@ actor TestNode {
 
         self.provider = TestChannelProvider(machineId: machineId)
         self.interface = MockNetworkInterface(localIP: ip)
-        self.virtualNetwork = VirtualNetwork(localMachineId: machineId)
+        self.virtualNetwork = VirtualNetwork(localMachineId: machineId, config: .testDefault)
         self.tunnelManager = TunnelManager(provider: provider)
     }
 

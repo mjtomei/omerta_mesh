@@ -7,7 +7,7 @@ final class ControlSocketTests: XCTestCase {
 
     // Test socket path
     var testSocketPath: String {
-        "/tmp/omerta-test-\(UUID().uuidString.prefix(8)).sock"
+        "\(NSTemporaryDirectory())omerta-test-\(UUID().uuidString.prefix(8)).sock"
     }
 
     // MARK: - Server Tests
@@ -84,7 +84,7 @@ final class ControlSocketTests: XCTestCase {
     // MARK: - Client Tests
 
     func testClientConnectToNonexistent() async throws {
-        let nonExistentPath = "/tmp/omerta-nonexistent-\(UUID().uuidString).sock"
+        let nonExistentPath = "\(NSTemporaryDirectory())omerta-nonexistent-\(UUID().uuidString).sock"
         let client = ControlSocketClient(socketPath: nonExistentPath)
 
         do {
