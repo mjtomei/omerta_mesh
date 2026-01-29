@@ -388,15 +388,10 @@ let myMsg = "peerId:\(peerId)"
 let remoteBootstrapAddr = try SocketAddress(ipAddress: remoteHost, port: bootstrapPort)
 
 for i in 1...60 {
-    // Send bootstrap peerId exchange
-    bootstrapLock.lock()
-    let done = bootstrapDone
-    bootstrapLock.unlock()
-    if !done {
-        let buf = bootstrapChannel.allocator.buffer(string: myMsg)
-        let envelope = AddressedEnvelope(remoteAddress: remoteBootstrapAddr, data: buf)
-        try? await bootstrapChannel.writeAndFlush(envelope)
-    }
+    // Always send our peerId so the remote can discover us too
+    let buf = bootstrapChannel.allocator.buffer(string: myMsg)
+    let envelope = AddressedEnvelope(remoteAddress: remoteBootstrapAddr, data: buf)
+    try? await bootstrapChannel.writeAndFlush(envelope)
 
     try await Task.sleep(for: .seconds(1))
     if remoteMachineId != nil { break }
