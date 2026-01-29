@@ -61,6 +61,8 @@ public struct TunnelManagerConfig: Sendable {
     public var healthProbeMinInterval: Duration = .milliseconds(500)
     public var healthProbeMaxInterval: Duration = .seconds(15)
     public var healthFailureThreshold: Int = 3
+    /// Number of initial probe intervals to skip failure counting (grace period for remote to start probing)
+    public var healthGraceIntervals: Int = 3
 
     public static let `default` = TunnelManagerConfig()
 
@@ -69,12 +71,14 @@ public struct TunnelManagerConfig: Sendable {
         maxTotalSessions: Int = 1000,
         healthProbeMinInterval: Duration = .milliseconds(500),
         healthProbeMaxInterval: Duration = .seconds(15),
-        healthFailureThreshold: Int = 3
+        healthFailureThreshold: Int = 3,
+        healthGraceIntervals: Int = 3
     ) {
         self.maxSessionsPerMachine = maxSessionsPerMachine
         self.maxTotalSessions = maxTotalSessions
         self.healthProbeMinInterval = healthProbeMinInterval
         self.healthProbeMaxInterval = healthProbeMaxInterval
         self.healthFailureThreshold = healthFailureThreshold
+        self.healthGraceIntervals = healthGraceIntervals
     }
 }

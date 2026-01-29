@@ -22,15 +22,18 @@ public actor TunnelHealthMonitor {
     private let minProbeInterval: Duration
     private let maxProbeInterval: Duration
     private let failureThreshold: Int
+    private let graceIntervals: Int
 
     public init(
         minProbeInterval: Duration = .milliseconds(500),
         maxProbeInterval: Duration = .seconds(15),
-        failureThreshold: Int = 3
+        failureThreshold: Int = 3,
+        graceIntervals: Int = 0
     ) {
         self.minProbeInterval = minProbeInterval
         self.maxProbeInterval = maxProbeInterval
         self.failureThreshold = failureThreshold
+        self.graceIntervals = graceIntervals
         self.currentProbeInterval = minProbeInterval
         self.lastPacketTime = ContinuousClock.now
     }
@@ -72,10 +75,19 @@ public actor TunnelHealthMonitor {
         sendProbe: @escaping (MachineId) async throws -> Void,
         onFailure: @escaping (MachineId) async -> Void
     ) async {
+        var graceRemaining = graceIntervals
+
         while !Task.isCancelled {
             let interval = currentProbeInterval
             try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { break }
+
+            // During grace period, send probes but don't count failures
+            if graceRemaining > 0 {
+                try? await sendProbe(machineId)
+                graceRemaining -= 1
+                continue
+            }
 
             let elapsed = ContinuousClock.now - lastPacketTime
             if elapsed < interval {
