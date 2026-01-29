@@ -351,8 +351,8 @@ logger.info("Remote machine discovered: \(remoteMachineId)")
 // MARK: - TunnelManager Setup
 
 let tunnelConfig = TunnelManagerConfig(
-    healthProbeMinInterval: .seconds(2),
-    healthProbeMaxInterval: .seconds(10),
+    healthProbeMinInterval: .milliseconds(500),
+    healthProbeMaxInterval: .seconds(15),
     healthFailureThreshold: 3
 )
 let manager = TunnelManager(provider: mesh, config: tunnelConfig)
@@ -661,17 +661,17 @@ do {
     var probeIntervals: [Duration] = []
 
     if let monitor {
-        // Log probe interval every 2s for 30s
-        for _ in 0..<15 {
-            try await Task.sleep(for: .seconds(2))
+        // Log probe interval every 500ms for 10s
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(500))
             let interval = await monitor._currentProbeInterval
             probeIntervals.append(interval)
             logger.info("  Probe interval: \(interval)")
         }
 
-        // Check that interval increased from min (2s) toward max (10s)
-        let firstInterval = probeIntervals.first ?? .seconds(2)
-        let lastInterval = probeIntervals.last ?? .seconds(2)
+        // Check that interval increased from min (500ms) toward max (15s)
+        let firstInterval = probeIntervals.first ?? .milliseconds(500)
+        let lastInterval = probeIntervals.last ?? .milliseconds(500)
         let phase2Pass = lastInterval > firstInterval
         record("Phase 2: Idle Probe Backoff", passed: phase2Pass,
                detail: "interval went from \(firstInterval) to \(lastInterval)")
@@ -705,7 +705,7 @@ do {
     if let monitor {
         let intervalAfterTraffic = await monitor._currentProbeInterval
         let failuresAfterTraffic = await monitor._consecutiveFailures
-        let phase3Pass = intervalAfterTraffic <= .seconds(2) && failuresAfterTraffic == 0
+        let phase3Pass = intervalAfterTraffic <= .milliseconds(500) && failuresAfterTraffic == 0
         record("Phase 3: Traffic Resets Probes", passed: phase3Pass,
                detail: "interval=\(intervalAfterTraffic), failures=\(failuresAfterTraffic)")
     } else {
@@ -859,14 +859,14 @@ do {
 
     await cleanup.register { let _ = await shell(unblockCmd) }
 
-    // Block for ~3s (less than 3 failures at 2s intervals)
+    // Block for ~1s (less than 3 failures at 500ms intervals)
     let (_, _) = await shell(blockCmd)
-    logger.info("Transient block applied for ~3s")
-    try await Task.sleep(for: .seconds(3))
+    logger.info("Transient block applied for ~1s")
+    try await Task.sleep(for: .seconds(1))
     let (_, _) = await shell(unblockCmd)
     logger.info("Transient block removed")
 
-    try await Task.sleep(for: .seconds(3))
+    try await Task.sleep(for: .seconds(2))
 
     let count = await manager.sessionCount
     let state = await session7.state
