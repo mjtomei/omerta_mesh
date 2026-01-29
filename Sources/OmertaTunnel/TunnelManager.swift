@@ -38,6 +38,9 @@ public actor TunnelManager {
     /// Session pool keyed by (machineId, channel)
     private var sessions: [TunnelSessionKey: TunnelSession] = [:]
 
+    /// Session IDs for verifying close handshakes
+    private var sessionIds: [TunnelSessionKey: String] = [:]
+
     /// Per-machine health monitors
     private var healthMonitors: [MachineId: TunnelHealthMonitor] = [:]
 
@@ -146,6 +149,7 @@ public actor TunnelManager {
             await session.close()
         }
         sessions.removeAll()
+        sessionIds.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
@@ -191,8 +195,11 @@ public actor TunnelManager {
 
         logger.info("Creating session", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
 
+        // Generate session ID for this session
+        let sid = UUID().uuidString.prefix(8).lowercased()
+
         // Send handshake with channel info
-        let handshake = SessionHandshake(type: .request, channel: channel)
+        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid))
         let data = try JSONEncoder().encode(handshake)
         try await provider.sendOnChannel(data, toMachine: machineId, channel: handshakeChannel)
 
@@ -205,6 +212,7 @@ public actor TunnelManager {
 
         await newSession.activate()
         sessions[key] = newSession
+        sessionIds[key] = String(sid)
 
         // Start health monitor for this machine if first session
         if healthMonitors[machineId] == nil {
@@ -249,11 +257,12 @@ public actor TunnelManager {
     /// Close a specific session by key
     public func closeSession(key: TunnelSessionKey) async {
         guard let session = sessions.removeValue(forKey: key) else { return }
+        let sid = sessionIds.removeValue(forKey: key)
 
         logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
         // Notify remote machine
-        let handshake = SessionHandshake(type: .close, channel: key.channel)
+        let handshake = SessionHandshake(type: .close, channel: key.channel, sessionId: sid)
         if let data = try? JSONEncoder().encode(handshake) {
             try? await provider.sendOnChannel(data, toMachine: key.remoteMachineId, channel: handshakeChannel)
         }
@@ -351,9 +360,10 @@ public actor TunnelManager {
                 )
                 await newSession.activate()
                 sessions[key] = newSession
+                sessionIds[key] = handshake.sessionId
 
                 // Send ack
-                let ack = SessionHandshake(type: .ack, channel: channel)
+                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
                 if let ackData = try? JSONEncoder().encode(ack) {
                     try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
                 }
@@ -400,7 +410,13 @@ public actor TunnelManager {
 
         case .close:
             let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            // Verify sessionId matches to reject stale close from old sessions
+            if let closeSid = handshake.sessionId, let currentSid = sessionIds[key], closeSid != currentSid {
+                logger.info("Ignoring stale close handshake (sid \(closeSid) != \(currentSid))", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                return
+            }
             if let session = sessions.removeValue(forKey: key) {
+                sessionIds.removeValue(forKey: key)
                 await session.close()
                 logger.info("Session closed by machine", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
             }
@@ -420,9 +436,11 @@ struct SessionHandshake: Codable, Sendable {
 
     let type: HandshakeType
     let channel: String?
+    let sessionId: String?
 
-    init(type: HandshakeType, channel: String? = nil) {
+    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil) {
         self.type = type
         self.channel = channel
+        self.sessionId = sessionId
     }
 }
