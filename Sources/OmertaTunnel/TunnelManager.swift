@@ -361,7 +361,8 @@ public actor TunnelManager {
                     let monitor = TunnelHealthMonitor(
                         minProbeInterval: config.healthProbeMinInterval,
                         maxProbeInterval: config.healthProbeMaxInterval,
-                        failureThreshold: config.healthFailureThreshold
+                        failureThreshold: config.healthFailureThreshold,
+                        graceIntervals: config.healthGraceIntervals
                     )
                     healthMonitors[machineId] = monitor
                     await monitor.startMonitoring(
