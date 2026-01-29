@@ -88,12 +88,21 @@ final class EncryptionEnforcementTests: XCTestCase {
                      "Encrypted sends should not produce violations, got: \(myViolations.count)")
     }
 
-    /// Runs last (alphabetically) — asserts that no test in the entire suite sent unencrypted data.
+    /// Runs last (alphabetically) — asserts that no non-demo test sent unencrypted data,
+    /// and that the demo tests did trigger the expected violations.
     func testZZ_noUnencryptedPacketsAcrossAllTests() {
-        let violations = GlobalEncryptionObserver.shared.violations
-        if !violations.isEmpty {
-            let summary = violations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
-            XCTFail("Unencrypted packets detected in \(violations.count) send(s):\n\(summary.joined(separator: "\n"))")
+        let allViolations = GlobalEncryptionObserver.shared.violations
+        let demoViolations = allViolations.filter { $0.testName.contains("EncryptionAuditDemo") }
+        let realViolations = allViolations.filter { !$0.testName.contains("EncryptionAuditDemo") }
+
+        // The demo tests must have triggered their expected violations
+        XCTAssertGreaterThanOrEqual(demoViolations.count, 3,
+            "EncryptionAuditDemoTests should trigger at least 3 violations (plaintext JSON, raw bytes, legacy encryption), got \(demoViolations.count)")
+
+        // No real test should have sent unencrypted data
+        if !realViolations.isEmpty {
+            let summary = realViolations.map { "\($0.testName): \($0.data.prefix(8).map { String(format: "%02x", $0) }.joined()) → \($0.destination)" }
+            XCTFail("Unencrypted packets detected in \(realViolations.count) non-demo send(s):\n\(summary.joined(separator: "\n"))")
         }
     }
     #endif
