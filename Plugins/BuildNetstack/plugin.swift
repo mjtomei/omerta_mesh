@@ -22,7 +22,7 @@ struct BuildNetstackPlugin: BuildToolPlugin {
         // tool access or Go module cache location
         let home = ProcessInfo.processInfo.environment["HOME"] ?? "/tmp"
         let script = """
-            export PATH=/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+            export PATH=\(home)/go-install/go/bin:\(home)/sdk/go/bin:/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
             export HOME="\(home)"
             make -C "\(netstackDir.string)" install
             """
