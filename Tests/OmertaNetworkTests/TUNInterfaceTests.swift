@@ -205,8 +205,6 @@ final class TUNInterfaceTests: XCTestCase {
 
         let tun = TUNInterface(name: "omerta-t7", ip: "10.99.7.1")
         let bridge = TUNBridgeAdapter(tun: tun)
-        try await bridge.start()
-        defer { Task { await bridge.stop() } }
 
         let expectation = XCTestExpectation(description: "ICMP reply via callback")
         await bridge.setReturnCallback { packet in
@@ -215,6 +213,9 @@ final class TUNInterfaceTests: XCTestCase {
                 expectation.fulfill()
             }
         }
+
+        try await bridge.start()
+        defer { Task { await bridge.stop() } }
 
         // Build and inject a minimal ICMP echo request
         let icmpPacket = Self.buildICMPEchoRequest(src: "10.99.7.2", dst: "10.99.7.1")
