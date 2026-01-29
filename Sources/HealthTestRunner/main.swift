@@ -238,38 +238,55 @@ for rule in existingRules.split(separator: "\n") {
         let _ = await shell("iptables \(deleteRule)")
     }
 }
-// Remove any leftover temp IPs on 192.168.12.0/24
-let (_, existingTempIPs) = await shell("ip -4 addr show | grep 'inet 192.168.12' | grep -v '\(remoteHost)' | awk '{print $2, $NF}' || true")
+// Remove only temp IPs from the 192.168.12.122-254 range that the test may have added.
+// Don't touch .121 (our host), .209 (remote host), or anything below .122.
+let (_, existingTempIPs) = await shell("ip -4 addr show | grep 'inet 192.168.12' | awk '{print $2, $NF}' || true")
 for line in existingTempIPs.split(separator: "\n") {
     let parts = String(line).trimmingCharacters(in: .whitespaces).split(separator: " ")
     if parts.count == 2 {
-        let addr = String(parts[0])
+        let addr = String(parts[0]) // e.g. "192.168.12.122/24"
         let iface = String(parts[1])
-        // Don't remove the machine's own primary address
-        let (_, primaryIP) = await shell("hostname -I | awk '{print $1}'")
-        if !addr.hasPrefix(primaryIP.trimmingCharacters(in: .whitespaces)) {
-            logger.info("  Removing stale IP: \(addr) dev \(iface)")
+        let ipOnly = addr.split(separator: "/").first.map(String.init) ?? addr
+        // Only remove IPs in the test's temp range (122-254)
+        let octets = ipOnly.split(separator: ".")
+        if octets.count == 4, let lastOctet = Int(octets[3]), lastOctet >= 122 {
+            logger.info("  Removing stale test IP: \(addr) dev \(iface)")
             let _ = await shell("ip addr del \(addr) dev \(iface)")
         }
     }
 }
 #else
-// macOS: disable pfctl unconditionally (in case rules exist from a previous run)
+// macOS: only remove test-specific pfctl rules (don't destroy pre-existing rules)
 let (_, pfEnabled) = await shell("pfctl -s info 2>&1 | head -1 || true")
 logger.info("  pfctl status: \(pfEnabled.trimmingCharacters(in: .whitespacesAndNewlines))")
 let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
-if !pfRules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+let pfRulesTrimmed = pfRules.trimmingCharacters(in: .whitespacesAndNewlines)
+if !pfRulesTrimmed.isEmpty {
     logger.info("  Active pfctl rules:\n\(pfRules)")
 }
-// Always disable pfctl and flush rules to ensure clean state
-logger.info("  Disabling pfctl and flushing all rules...")
-let (d1Exit, d1Out) = await shell("pfctl -d 2>&1 || true")
-logger.info("  pfctl -d: exit=\(d1Exit) \(d1Out.trimmingCharacters(in: .whitespacesAndNewlines))")
-let (fExit, fOut) = await shell("pfctl -F all 2>&1 || true")
-logger.info("  pfctl -F all: exit=\(fExit) \(fOut.trimmingCharacters(in: .whitespacesAndNewlines))")
-// Verify it's off
-let (_, verifyInfo) = await shell("pfctl -s info 2>&1 | grep -i 'status\\|enabled\\|disabled' || true")
-logger.info("  pfctl verify: \(verifyInfo.trimmingCharacters(in: .whitespacesAndNewlines))")
+// Only remove rules that reference our test port — leave other rules intact
+let testPortStr = "port \(port)"
+let hasTestRules = pfRulesTrimmed.split(separator: "\n").contains { $0.contains(testPortStr) }
+if hasTestRules {
+    logger.info("  Found test-specific pfctl rules (port \(port)), removing...")
+    // Reload rules without the test-specific ones
+    let cleanedRules = pfRulesTrimmed.split(separator: "\n")
+        .filter { !$0.contains(testPortStr) }
+        .joined(separator: "\n")
+    if cleanedRules.isEmpty {
+        // All rules were ours — disable pfctl
+        let (d1Exit, d1Out) = await shell("pfctl -d 2>&1 || true")
+        logger.info("  pfctl -d (all rules were test rules): exit=\(d1Exit) \(d1Out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        let (fExit, fOut) = await shell("pfctl -F rules 2>&1 || true")
+        logger.info("  pfctl -F rules: exit=\(fExit) \(fOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+    } else {
+        // Reload with non-test rules preserved
+        let (rExit, rOut) = await shell("echo '\(cleanedRules)' | pfctl -f - 2>&1 || true")
+        logger.info("  Reloaded pfctl without test rules: exit=\(rExit) \(rOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+} else {
+    logger.info("  No test-specific pfctl rules found, leaving pfctl as-is")
+}
 // Check macOS application firewall
 let (_, fwState) = await shell("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || true")
 logger.info("  macOS Application Firewall: \(fwState.trimmingCharacters(in: .whitespacesAndNewlines))")
@@ -613,6 +630,12 @@ if !isNodeA {
             await sendControl("phase6-ack")
             try await Task.sleep(for: .milliseconds(500))  // ensure ack is sent
             #if os(macOS)
+            // Save pfctl state before we modify it
+            let (_, pfctlWasEnabled) = await shell("pfctl -s info 2>&1 | grep -q 'Status: Enabled' && echo yes || echo no")
+            let pfctlPreviouslyEnabled = pfctlWasEnabled.trimmingCharacters(in: .whitespacesAndNewlines) == "yes"
+            let (_, previousRules) = await shell("pfctl -sr 2>/dev/null || true")
+            logger.info("Node B pfctl pre-block state: enabled=\(pfctlPreviouslyEnabled), rules=\(previousRules.count) chars")
+
             let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
             logger.info("Node B pfctl block: exit=\(exitCode) \(out)")
             #else
@@ -624,8 +647,21 @@ if !isNodeA {
             Task {
                 try? await Task.sleep(for: .seconds(15))
                 #if os(macOS)
-                let (ec, o) = await shell("pfctl -d")
-                logger.info("Node B pfctl auto-unblock: exit=\(ec) \(o)")
+                // Restore previous pfctl state instead of blindly disabling
+                if pfctlPreviouslyEnabled {
+                    // Re-load previous rules
+                    let trimmed = previousRules.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        let (ec, o) = await shell("echo '\(trimmed)' | pfctl -ef -")
+                        logger.info("Node B pfctl restored previous rules: exit=\(ec) \(o)")
+                    } else {
+                        let (ec, o) = await shell("pfctl -e 2>&1 || true")
+                        logger.info("Node B pfctl re-enabled (no rules): exit=\(ec) \(o)")
+                    }
+                } else {
+                    let (ec, o) = await shell("pfctl -d 2>&1 || true")
+                    logger.info("Node B pfctl disabled (was not enabled before): exit=\(ec) \(o)")
+                }
                 #else
                 let (ec, o) = await shell("iptables -D INPUT -p udp --dport \(blockPort) -j DROP")
                 logger.info("Node B iptables auto-unblock: exit=\(ec) \(o)")
