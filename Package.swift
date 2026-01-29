@@ -100,6 +100,13 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
             ]
         ),
+        .executableTarget(
+            name: "DemoTUNGateway",
+            dependencies: [
+                "OmertaNetwork", "OmertaTunnel", "OmertaMesh",
+                .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
         .testTarget(name: "OmertaNetworkTests", dependencies: [
             "OmertaNetwork", "OmertaMesh",
             .product(name: "NIOCore", package: "swift-nio"),
