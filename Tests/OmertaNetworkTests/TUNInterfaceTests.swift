@@ -20,6 +20,41 @@ final class TUNInterfaceTests: XCTestCase {
         }
     }
 
+    // MARK: - Preflight
+
+    func testPreflightRejectsNonRoot() throws {
+        guard Glibc.geteuid() != 0 else {
+            throw XCTSkip("Test only runs as non-root")
+        }
+        do {
+            try TUNInterface.preflight()
+            XCTFail("preflight should throw for non-root")
+        } catch let error as InterfaceError {
+            guard case .preflightFailed(let msg) = error else {
+                XCTFail("Expected preflightFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(msg.contains("root"), "Message should mention root: \(msg)")
+        }
+    }
+
+    func testPreflightRejectsMissingTUN() throws {
+        guard Glibc.access("/dev/net/tun", F_OK) != 0 else {
+            throw XCTSkip("/dev/net/tun is available — cannot test missing device")
+        }
+        // If we're also non-root, the root check fires first.
+        // That's fine — we just verify preflight throws preflightFailed.
+        do {
+            try TUNInterface.preflight()
+            XCTFail("preflight should throw when /dev/net/tun is missing")
+        } catch let error as InterfaceError {
+            guard case .preflightFailed = error else {
+                XCTFail("Expected preflightFailed, got \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - Lifecycle
 
     func testTUNCreation() async throws {
