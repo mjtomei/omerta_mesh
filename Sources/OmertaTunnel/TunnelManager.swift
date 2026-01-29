@@ -106,20 +106,12 @@ public actor TunnelManager {
             await self?.handleHandshake(from: machineId, data: data)
         }
 
-        // Register health probe handler — receiving a probe means remote is alive
-        // Echo back a response so the sender knows we're alive too
-        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
+        // Register health probe handler — receiving a probe means remote is alive.
+        // No response needed: both sides run monitors and send their own probes,
+        // so each side's outgoing probe serves as the liveness signal for the other.
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
             guard let self else { return }
-            if data.first == 0x01 {
-                // Incoming probe: remote is actively checking us. Update liveness and echo back.
-                // Use probe response handler (liveness only) — probes should not reset the
-                // probe interval, only application data should.
-                await self.notifyProbeResponseReceived(from: machineId)
-                try? await self.provider.sendOnChannel(Data([0x02]), toMachine: machineId, channel: self.healthProbeChannel)
-            } else if data.first == 0x02 {
-                // Probe response: only update lastPacketTime for liveness, don't reset probe interval
-                await self.notifyProbeResponseReceived(from: machineId)
-            }
+            await self.notifyProbeReceived(from: machineId)
         }
 
         isRunning = true
@@ -315,10 +307,10 @@ public actor TunnelManager {
         }
     }
 
-    /// Notify health monitor that a probe response arrived (liveness only, no interval reset)
-    private func notifyProbeResponseReceived(from machineId: MachineId) async {
+    /// Notify health monitor that a probe arrived (liveness only, no interval reset)
+    private func notifyProbeReceived(from machineId: MachineId) async {
         if let monitor = healthMonitors[machineId] {
-            await monitor.onProbeResponseReceived()
+            await monitor.onProbeReceived()
         }
     }
 

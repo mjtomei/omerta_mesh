@@ -1,835 +1,545 @@
 # Tunnel Infrastructure
 
-> **Architecture Alignment Note:** This plan supplements VIRTUAL_NETWORK_REWORK.md.
-> It covers functionality NOT in that plan:
-> - VM packet capture and network isolation
-> - Relay discovery and gossip infrastructure
-> - Tunnel health monitoring and endpoint change detection
-> - Failure backoff and user messaging
-> - Peer expiry and rejoin
-> - WireGuard legacy cleanup
+> **Architecture Alignment Note:** This plan covers tunnel infrastructure
+> that supplements VIRTUAL_NETWORK_REWORK.md and GOSSIP_RELAY_PLAN.md.
 >
-> **Source of truth for tunnel APIs:** VIRTUAL_NETWORK_REWORK.md
-> - TunnelSession: thin bidirectional pipe (MachineId, channel, send, onReceive)
-> - TunnelManager: session pool + proactive health monitoring
-> - PacketRouter: routes packets between NetworkInterface and TunnelSessions
-> - GatewayService: internet exit via netstack (in OmertaNetwork, not OmertaTunnel)
+> **Scope:**
+> - Health monitoring and endpoint change detection (implemented)
+> - Failure backoff and user messaging (planned)
+> - Peer expiry and rejoin (planned)
+> - WireGuard legacy cleanup (planned)
+>
+> **Out of scope (covered elsewhere):**
+> - TunnelSession/TunnelManager core APIs → VIRTUAL_NETWORK_REWORK.md
+> - Gossip infrastructure and relay discovery → GOSSIP_RELAY_PLAN.md
+> - VM integration → VMs join the mesh VPN directly as first-class peers
 
 ## Overview
 
-This document covers tunnel infrastructure beyond the core virtual network
-architecture. It focuses on VM integration, relay coordination, health
-monitoring, failure handling, and legacy cleanup.
+This document covers tunnel resilience infrastructure: detecting failures,
+recovering from them, communicating state to users, managing peer lifecycles,
+and cleaning up legacy code.
 
 **Key Design Principles**:
-1. **Both sides monitor** — consumer and provider independently track connection health
-2. **Transport-agnostic** — tunnel layer doesn't care what's inside the packets
-3. **Extensible gossip** — OmertaMesh provides generic gossip; utilities register their own channel types
-4. **Usage-based priority** — nodes prioritize gossip they use, forward everything else best-effort
-5. **Tunnel is agnostic** — no awareness of cloister or how networks are established
+1. **Both sides monitor** — each end independently tracks connection health
+2. **Adaptive probing** — probe frequency adjusts based on traffic patterns
+3. **Graceful degradation** — transient failures tolerated, sustained failures trigger recovery
+4. **Clear user feedback** — connection state changes reported without spam
+5. **Tunnel is agnostic** — no awareness of cloister, VMs, or how networks are established
 
 ---
 
-## Traffic Flow Summary
+## Current Architecture
 
 ```
-VM App
-   │ (normal socket call)
-   ▼
-VM eth0 (veth in namespace)
-   │ (raw IP packet)
-   ▼
-Provider: VMPacketCapture (implements NetworkInterface)
-   │
-   ▼
-Provider: PacketRouter (routes via VirtualNetwork)
-   │
-   ▼
-Provider: TunnelSession.send() — thin bidirectional pipe
-   │ (OmertaMesh handles encryption/routing)
-   ▼
-Mesh Network (encrypted, UDP-based)
-   │ (OmertaMesh handles decryption)
-   ▼
-Consumer: TunnelSession.onReceive() callback
-   │
-   ▼
-Consumer: PacketRouter (receives packet, routes to GatewayService)
-   │
-   ▼
-Consumer: GatewayService (internet exit via netstack)
-   │ (netstack is in OmertaNetwork, not OmertaTunnel)
-   ▼
-Netstack (gVisor) — inside GatewayService
-   │ (TCP/UDP/ICMP processing)
-   ▼
-Real socket connection
-   │
-   ▼
-Consumer's Local Network → Internet
-```
+TunnelManager
+├── sessions: [TunnelSessionKey: TunnelSession]
+│   └── Keyed by (machineId, channel)
+├── healthMonitors: [MachineId: TunnelHealthMonitor]
+│   └── Per-machine, shared across all sessions to same machine
+├── endpointChangeDetector: EndpointChangeDetector
+│   └── OS-level network change events
+├── getSession(machineId:channel:) → TunnelSession
+├── closeSession(key:)
+├── closeAllSessions(to:)
+├── notifyPacketReceived(from:)
+└── getHealthMonitor(for:) → TunnelHealthMonitor?
 
-**Key:** TunnelSession is a thin bidirectional pipe — it just sends/receives Data.
-Netstack lives in GatewayService (OmertaNetwork module), not in OmertaTunnel.
+Wire Channels:
+  "tunnel-handshake"     — session setup/teardown (request, ack, reject, close)
+  "tunnel-health-probe"  — health probes (0x01 request, 0x02 response)
+  "tunnel-{channel}"     — session data transport
+
+Handshake Protocol:
+  SessionHandshake { type, machineId, channel, sessionId }
+  Types: request → ack/reject, close (with sessionId to prevent stale closes)
+
+Health Monitoring Flow:
+  1. New session → create/reuse TunnelHealthMonitor for machine
+  2. Probes sent every 500ms–15s depending on traffic
+  3. Application data → onPacketReceived() → reset interval to min
+  4. Probe responses → onProbeResponseReceived() → update liveness (no interval reset)
+  5. 3 consecutive failures → close all sessions to machine, remove monitor
+```
 
 ---
 
 ## Implementation Phases
 
-### Phase 1: VM Integration
+### Phase 4: Health Monitoring and Endpoint Change Detection ✅ COMPLETE
 
-**Goal:** Connect VM network interface to PacketRouter via NetworkInterface.
-Provider captures VM packets, PacketRouter routes them through TunnelSessions
-to the consumer's GatewayService.
+**Status:** Fully implemented and validated with 11-phase cross-machine test suite.
 
-#### Architecture
+#### What Was Built
 
-VMPacketCapture implements the NetworkInterface protocol (defined in
-VIRTUAL_NETWORK_REWORK Phase 5), abstracting Linux namespaces vs macOS
-file handles.
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  VMPacketCapture: NetworkInterface                                 │
-│  ├── readPacket() → Data       (packet from VM)                   │
-│  ├── writePacket(Data)         (packet to VM)                     │
-│  ├── Platform-specific:                                           │
-│  │   ├── Linux: veth in network namespace                         │
-│  │   └── macOS: VZFileHandleNetworkDeviceAttachment               │
-│  └── Plugs into PacketRouter                                      │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-#### Files to Create
-
-| File | Description |
-|------|-------------|
-| `Sources/OmertaProvider/VMPacketCapture.swift` | Implements NetworkInterface for VM traffic |
-| `Sources/OmertaProvider/VMNetworkNamespace.swift` | Linux namespace setup |
-| `Sources/OmertaProvider/VMNetworkFileHandle.swift` | macOS file handle setup |
-| `Tests/OmertaProviderTests/VMPacketCaptureTests.swift` | Integration tests |
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `Sources/OmertaProvider/MeshProviderDaemon.swift` | Wire up VMPacketCapture → PacketRouter |
-| `Sources/OmertaVM/VMManager.swift` | Configure VM for packet capture |
-
-#### API
-
+**TunnelHealthMonitor** (`Sources/OmertaTunnel/TunnelHealthMonitor.swift`):
 ```swift
-/// VMPacketCapture implements NetworkInterface (from OmertaNetwork).
-/// Abstracts platform-specific VM packet capture.
-public actor VMPacketCapture: NetworkInterface {
-    public let localIP: String
-
-    /// Platform-specific packet source
-    private let packetSource: any PacketSource
-
-    public init(vmId: UUID, localIP: String, packetSource: any PacketSource) {
-        self.localIP = localIP
-        self.packetSource = packetSource
-    }
-
-    public func readPacket() async throws -> Data {
-        try await packetSource.read()
-    }
-
-    public func writePacket(_ packet: Data) async throws {
-        try await packetSource.write(packet)
-    }
-
-    public func start() async throws {
-        try await packetSource.start()
-    }
-
-    public func stop() async {
-        await packetSource.stop()
-    }
-}
-
-/// Platform-specific packet source
-public protocol PacketSource: Sendable {
-    func read() async throws -> Data
-    func write(_ packet: Data) async throws
-    func start() async throws
-    func stop() async
-}
-```
-
-**Usage (provider side):**
-```swift
-// 1. Create VM with network namespace/file handle
-let packetSource = try await VMNetworkNamespace.create(vmId: vmId)
-
-// 2. Create VMPacketCapture as NetworkInterface
-let vmCapture = VMPacketCapture(
-    vmId: vmId,
-    localIP: "10.0.0.2",
-    packetSource: packetSource
-)
-
-// 3. Wire into PacketRouter (from VIRTUAL_NETWORK_REWORK Phase 6)
-let router = PacketRouter(
-    networkInterface: vmCapture,
-    virtualNetwork: vnet,
-    tunnelManager: tunnelManager
-)
-try await router.start()
-
-// PacketRouter handles:
-// - Reading packets from VMPacketCapture
-// - Looking up destination via VirtualNetwork
-// - Sending via TunnelSession to the right machine
-// - Writing return packets back to VMPacketCapture
-```
-
-#### Unit Tests
-
-| Test | Description |
-|------|-------------|
-| `testCaptureVMPacket` | VM sends packet, verify capture via readPacket() |
-| `testInjectToVM` | writePacket(), verify VM receives |
-| `testDHCPResponse` | VM requests DHCP, verify response via gateway |
-| `testARPResponse` | VM sends ARP, verify response |
-| `testMTUHandling` | Large packet, verify fragmentation |
-| `testStartStop` | Start/stop lifecycle, verify cleanup |
-
-#### Manual Testing
-
-```bash
-# Terminal 1: Start consumer (will be traffic exit point)
-omertad start --port 18002
-
-# Terminal 2: Start provider
-omertad start --port 18003 --bootstrap localhost:18002
-
-# Request VM from provider
-omerta vm request --provider <provider-machine-id> --consumer <consumer-machine-id>
-
-# In VM console:
-ping 1.1.1.1
-# Packets flow: VM → VMPacketCapture → PacketRouter → TunnelSession
-#   → mesh → consumer PacketRouter → GatewayService → internet
-
-curl https://example.com
-# Should return HTML
-
-# Verify isolation: no traffic on provider's network
-tcpdump -i eth0 host 1.1.1.1
-# Should show NO packets (all go through mesh to consumer)
-```
-
----
-
-### Phase 2: Relay Discovery and Gossip Integration
-
-**Goal:** Track and propagate which peers are willing to act as relays. Use
-extensible gossip infrastructure. Request relay nodes to join ephemeral networks.
-
-**Key Design:**
-- **Extensible gossip** — OmertaMesh provides generic gossip infrastructure;
-  relay-specific messages are registered by OmertaTunnel, not hardcoded
-- **Usage-based priority** — Nodes prioritize gossip for channels they use,
-  but still forward all other gossip with spare bandwidth
-- **Relay capacity is per-machine**, not per-endpoint
-
-#### Files to Create
-
-| File | Description |
-|------|-------------|
-| `Sources/OmertaTunnel/RelayCoordinator.swift` | Relay selection/request |
-| `Sources/OmertaMesh/Gossip/GossipRouter.swift` | Channel registration + priority routing |
-| `Sources/OmertaMesh/Gossip/PeerMetadataStore.swift` | Generic key-value metadata per peer |
-| `Tests/OmertaTunnelTests/RelayCoordinatorTests.swift` | Relay tests |
-| `Tests/OmertaMeshTests/GossipRouterTests.swift` | Gossip routing tests |
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `Sources/OmertaMesh/Discovery/PeerStore.swift` | Add generic metadata storage hooks |
-| `Sources/OmertaMesh/MeshNode.swift` | Integrate GossipRouter |
-| `Sources/OmertaMesh/Public/MeshNetwork.swift` | Expose gossip registration API |
-| `Sources/OmertaMesh/Public/MeshConfig.swift` | Add GossipConfig (budget, recency half-life) |
-
-#### API
-
-```swift
-// === OmertaMesh: Generic Gossip Infrastructure ===
-
-/// Gossip entry - opaque to OmertaMesh except for channel ID
-public struct GossipEntry: Codable, Sendable {
-    let channelId: String
-    let peerId: PeerId
-    let payload: Data
-    let timestamp: Date
-}
-
-/// Gossip router - handles registration and priority-based propagation
-public actor GossipRouter {
-    /// Channels this node has registered handlers for (high priority)
-    private var activeChannels: Set<String>
-
-    /// Register a handler for a channel - marks it as active (high priority)
-    func register<T: Codable>(
-        channel: String,
-        handler: @escaping (PeerId, T) async -> Void
+public actor TunnelHealthMonitor {
+    public init(
+        minProbeInterval: Duration = .milliseconds(500),
+        maxProbeInterval: Duration = .seconds(15),
+        failureThreshold: Int = 3,
+        graceIntervals: Int = 0
     )
 
-    /// Publish data on a channel
-    func publish<T: Codable>(channel: String, data: T) async throws
+    public func onPacketReceived()
+    public func onProbeResponseReceived()
 
-    /// Stream of updates for a channel (must be registered)
-    func updates<T: Codable>(channel: String) -> AsyncStream<(PeerId, T)>
-
-    /// Prioritize gossip for propagation
-    func prioritize(_ entries: [GossipEntry], bandwidth: Int) -> [GossipEntry]
-}
-
-/// Generic per-peer metadata storage
-public actor PeerMetadataStore {
-    func set<T: Codable>(_ key: String, value: T, for peer: PeerId) async
-    func get<T: Codable>(_ key: String, for peer: PeerId) async -> T?
-    func peers<T: Codable>(with key: String) async -> [(PeerId, T)]
-    func updates<T: Codable>(for key: String) -> AsyncStream<(PeerId, T)>
-}
-
-// === OmertaTunnel: Relay-Specific Types ===
-
-/// Relay announcement - published via GossipRouter
-public struct RelayAnnouncement: Codable, Sendable {
-    static let channelId = "relay"
-
-    let peerId: PeerId
-    let capacity: Int           // 0 = not a relay, >0 = available slots
-    let currentLoad: Int
-    let timestamp: Date
-}
-
-/// Per-machine relay config (stored on disk)
-public struct RelayConfig: Codable {
-    var enabled: Bool = false
-    var maxCapacity: Int = 10
-    var currentLoad: Int = 0
-    // Stored at: ~/.omerta/mesh/relay-config.json
-}
-
-/// Relay coordinator (in OmertaTunnel)
-public actor RelayCoordinator {
-    init(gossipRouter: GossipRouter, metadataStore: PeerMetadataStore)
-
-    func start() async
-    func stop() async
-
-    func availableRelays() async -> [PeerId]
-    func requestRelay(for machineId: MachineId) async throws -> PeerId
-    func releaseRelay(_ relayPeerId: PeerId, for machineId: MachineId) async
-}
-```
-
-**Gossip Priority:**
-```
-Node A (uses relay)          Node B (uses relay + vm-status)    Node C (uses nothing extra)
-───────────────────          ───────────────────────────────    ────────────────────────────
- - relay: process + high pri  - relay: process + high pri        - relay: forward, low pri
- - vm-status: forward, low    - vm-status: process + high pri    - vm-status: forward, low
-
-All gossip flows everywhere, but nodes prioritize what they use.
-```
-
-**Gossip Config:**
-```swift
-public struct GossipConfig {
-    var budgetBytesPerSecond: Int = 10_000  // 10 KB/s default
-    var recencyHalfLifeSeconds: Double = 60
-}
-```
-
-#### Unit Tests
-
-| Test | Description |
-|------|-------------|
-| `testGossipChannelRegistration` | Register channel, verify handler called |
-| `testGossipPriorityActiveChannels` | Active channels prioritized over inactive |
-| `testGossipBestEffortForwarding` | Unregistered channels still forwarded |
-| `testPeerMetadataStorage` | Store/retrieve metadata for peers |
-| `testRelayAnnouncementGossiped` | Relay announces capacity, peers receive it |
-| `testAvailableRelays` | Query available relays, correct list returned |
-| `testRequestRelay` | Request relay, verify accepted |
-| `testRelayAtCapacity` | Request when full, verify fallback |
-
----
-
-### Phase 3: Network Isolation
-
-**Goal:** Ensure absolutely no internet traffic goes through the provider host,
-including DNS. All traffic must flow through the mesh to the consumer.
-
-**Note:** Isolation is built into the network namespace/file handle setup from
-Phase 1. This phase validates that isolation through tests.
-
-#### Files to Create
-
-| File | Description |
-|------|-------------|
-| `Tests/OmertaProviderTests/IsolationTests.swift` | Isolation validation tests |
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `Sources/OmertaVM/VMManager.swift` | Ensure DNS points to mesh gateway |
-
-#### Unit Tests
-
-| Test | Description |
-|------|-------------|
-| `testVMCannotReachHost` | VM pings host IP, verify failure |
-| `testVMCannotReachLAN` | VM pings LAN IPs, verify failure |
-| `testVMCannotReachInternetDirect` | Block mesh, VM has no connectivity |
-| `testDNSGoesToMeshGateway` | Check VM resolv.conf points to gateway |
-| `testNoHostDNSLeak` | tcpdump on host, verify no DNS traffic |
-| `testAllTrafficViaMesh` | Monitor host, verify no non-mesh traffic |
-
-#### Manual Testing
-
-```bash
-# Start provider and VM
-omertad start --port 18002
-omerta vm create --name isolated-vm --image ubuntu-22.04
-omerta vm start isolated-vm
-
-# On provider host, monitor all traffic
-sudo tcpdump -i any -n 'not port 18002'
-# Should show NO traffic from VM
-
-# In VM:
-ping 192.168.1.1          # Provider's LAN IP — should fail
-cat /etc/resolv.conf       # Should show mesh gateway IP
-dig google.com             # Should work (via mesh to consumer)
-
-# Disconnect consumer, retry
-dig google.com             # Should fail (proves DNS goes through mesh)
-```
-
----
-
-### Phase 4: Health Monitoring and Endpoint Change Detection
-
-**Goal:** Implement tunnel health monitoring with proactive probing and
-OS-level endpoint change detection. This extends the health monitoring
-described in VIRTUAL_NETWORK_REWORK Phase 2 with detailed implementation.
-
-> **Note:** VIRTUAL_NETWORK_REWORK Phase 2 defines the health monitoring
-> interface within TunnelManager (EndpointHealth, establishConnection,
-> runHealthProbes). This phase covers the implementation details and adds
-> OS-level network change detection.
-
-#### Architecture
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  TunnelManager (from VIRTUAL_NETWORK_REWORK)                      │
-│  ├── healthState: [MachineId: EndpointHealth]                     │
-│  ├── healthMonitors: [MachineId: Task]                            │
-│  │                                                                │
-│  │  Uses:                                                         │
-│  │  ├── TunnelHealthMonitor — probe logic, adaptive intervals     │
-│  │  └── EndpointChangeDetector — OS network change events         │
-│  │                                                                │
-│  │  On failure:                                                   │
-│  │  └── Requests mesh to try alternative endpoints                │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-#### Files to Create
-
-| File | Description |
-|------|-------------|
-| `Sources/OmertaTunnel/TunnelHealthMonitor.swift` | Probe logic with adaptive intervals |
-| `Sources/OmertaTunnel/EndpointChangeDetector.swift` | OS network change events |
-| `Tests/OmertaTunnelTests/TunnelHealthTests.swift` | Health monitoring tests |
-| `Tests/OmertaTunnelTests/EndpointChangeTests.swift` | Change detection tests |
-
-#### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `Sources/OmertaTunnel/TunnelManager.swift` | Integrate health monitor and change detector |
-
-#### API
-
-```swift
-/// Probe logic with adaptive intervals.
-/// Used internally by TunnelManager's health monitoring.
-public actor TunnelHealthMonitor {
-    var lastPacketTime: ContinuousClock.Instant = .now
-    var currentProbeInterval: Duration = .milliseconds(500)
-
-    let minProbeInterval: Duration = .milliseconds(500)
-    let maxProbeInterval: Duration = .seconds(15)
-
-    /// Reset interval when traffic is received
-    func onPacketReceived() {
-        lastPacketTime = .now
-        currentProbeInterval = minProbeInterval
-    }
-
-    /// Run probe loop for a machine
-    func startMonitoring(
+    public func startMonitoring(
         machineId: MachineId,
         sendProbe: @escaping (MachineId) async throws -> Void,
         onFailure: @escaping (MachineId) async -> Void
-    ) async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: currentProbeInterval)
+    )
 
-            if (ContinuousClock.now - lastPacketTime) >= currentProbeInterval {
-                do {
-                    try await sendProbe(machineId)
-                    // Probe succeeded, back off interval
-                    currentProbeInterval = min(
-                        currentProbeInterval * 2,
-                        maxProbeInterval
-                    )
-                } catch {
-                    await onFailure(machineId)
-                    return
-                }
-            }
-        }
-    }
+    public func stopMonitoring()
+
+    // Test accessors
+    public var _consecutiveFailures: Int
+    public var _currentProbeInterval: Duration
 }
+```
 
-/// OS-level network change detection
+**EndpointChangeDetector** (`Sources/OmertaTunnel/EndpointChangeDetector.swift`):
+```swift
 public actor EndpointChangeDetector {
-    func startMonitoring() async
-    var endpointChanges: AsyncStream<EndpointChange> { get }
+    public init()
+
+    public var changes: AsyncStream<EndpointChange> { get }
+
+    public func start() async
+    public func stop() async
 }
 
 public struct EndpointChange: Sendable {
-    let oldEndpoint: Endpoint?
-    let newEndpoint: Endpoint
-    let reason: ChangeReason  // networkSwitch, ipChange, interfaceDown
+    public let oldEndpoint: String?
+    public let newEndpoint: String?
+    public let reason: ChangeReason
+    public let timestamp: ContinuousClock.Instant
+}
+
+public enum ChangeReason: Sendable {
+    case networkSwitch
+    case ipChange
+    case interfaceDown
+    case interfaceUp
 }
 ```
 
-**Detection mechanisms:**
+**Platform-specific detection:**
+- **Darwin/macOS:** `NWPathMonitor` with dispatch queue
+- **Linux:** Polls primary IPv4 address via `getifaddrs()` every 2 seconds
 
-| Method | Latency | When It Triggers |
-|--------|---------|------------------|
-| OS network change events | ~0ms | Local IP/interface changes |
-| Traffic-triggered probe timeout | 500ms + RTT | No incoming packet for 500ms |
+**TunnelManager integration:**
+- Per-machine `TunnelHealthMonitor` instances, shared across all sessions to same machine
+- Subscribes to `EndpointChangeDetector` and re-probes all machines on network changes
+- Health probes on separate channel (`tunnel-health-probe`) to avoid creating sessions
+- Grace period for remote startup (configurable intervals before failure counting)
 
-```swift
-// Darwin/iOS
-let monitor = NWPathMonitor()
-monitor.pathUpdateHandler = { path in
-    if path.status != .satisfied || addressChanged(path) {
-        // Notify TunnelManager to re-probe
-    }
-}
+#### Validated By
 
-// Linux: Monitor netlink socket for RTM_NEWADDR/RTM_DELADDR
-```
+Cross-machine test suite (`Sources/HealthTestRunner/main.swift`) — 11 phases, all passing:
 
-#### Unit Tests
+| Phase | What It Tests |
+|-------|---------------|
+| 1. Baseline Traffic | Bidirectional messaging over real mesh |
+| 2. Idle Probe Backoff | Probe interval doubles during idle (500ms → 8s) |
+| 3. Traffic Resets Probes | Application data resets interval to minimum |
+| 4. Failure Detection | Firewall block → 3 failures → sessions closed |
+| 5. Recovery After Block | New session after network restored |
+| 6. Bidirectional Block | Both sides independently detect failure |
+| 7. Transient Failure | Block < threshold → sessions survive |
+| 8. Rapid Flapping | Block/unblock every 2s for 20s |
+| 9. Endpoint Change | IP add/del detected, mesh still functional |
+| 10. Latency & Jitter | 6 traffic shaping profiles (50ms–500ms latency, 1%–10% loss) |
+| 11. Network State Cleanup | No test-specific artifacts remain |
 
-| Test | Description |
-|------|-------------|
-| `testKeepaliveProbe` | No traffic, verify probe sent |
-| `testKeepaliveBackoff` | Idle connection, verify interval grows |
-| `testKeepaliveReset` | Traffic received, verify interval resets |
-| `testEndpointChangeDetected` | Simulate IP change, verify detection |
-| `testConnectionHeals` | Change endpoint, verify traffic resumes |
-| `testBothSidesMonitor` | Either side detects, both recover |
+Run with: `./demo-health-test.sh <ssh-host> <remote-path>`
 
 ---
 
 ### Phase 5: Failure Backoff and User Messaging
 
-**Goal:** Implement backoff for failed reconnection attempts. Provide clear user
-messages about connection state without spamming.
+**Goal:** When health monitoring detects a failure and closes sessions,
+automatically attempt reconnection with exponential backoff. Report
+connection state changes to the application layer without spamming.
+
+Currently, health failure closes all sessions to a machine and removes
+the monitor. There is no automatic reconnection — the next `getSession()`
+call starts fresh. This phase adds persistent reconnection attempts and
+user-facing state reporting.
 
 #### Files to Create
 
 | File | Description |
 |------|-------------|
-| `Sources/OmertaTunnel/ReconnectionManager.swift` | Backoff logic |
-| `Sources/OmertaTunnel/ConnectionStateReporter.swift` | User messaging |
-| `Tests/OmertaTunnelTests/ReconnectionTests.swift` | Backoff tests |
+| `Sources/OmertaTunnel/ReconnectionManager.swift` | Exponential backoff logic per machine |
+| `Sources/OmertaTunnel/ConnectionStateReporter.swift` | Throttled user-facing state updates |
+| `Tests/OmertaTunnelTests/ReconnectionManagerTests.swift` | Backoff behavior tests |
+| `Tests/OmertaTunnelTests/ConnectionStateReporterTests.swift` | State reporting tests |
 
 #### Files to Modify
 
 | File | Changes |
 |------|---------|
-| `Sources/OmertaTunnel/TunnelManager.swift` | Integrate backoff and state reporting |
+| `Sources/OmertaTunnel/TunnelManager.swift` | Integrate ReconnectionManager into health failure handler; add ConnectionStateReporter |
+| `Sources/OmertaTunnel/TunnelConfig.swift` | Add reconnection and state reporting config to `TunnelManagerConfig` |
 
 #### API
 
 ```swift
-/// Connection state for user awareness
-public enum TunnelConnectionState: Sendable {
+/// Exponential backoff for reconnection attempts per machine.
+///
+/// Used by TunnelManager when health monitoring detects failure.
+/// After closing sessions, TunnelManager hands off to ReconnectionManager
+/// which retries with increasing delays.
+public actor ReconnectionManager {
+    public struct Config: Sendable {
+        public var initialBackoff: Duration = .seconds(1)
+        public var maxBackoff: Duration = .seconds(60)
+        public var backoffMultiplier: Double = 2.0
+
+        public static let `default` = Config()
+    }
+
+    public init(config: Config = .default)
+
+    /// Record a failure for a machine. Returns the delay before next retry.
+    public func recordFailure(for machineId: MachineId) -> Duration
+
+    /// Record a successful reconnection. Resets backoff to initial.
+    public func recordSuccess(for machineId: MachineId)
+
+    /// Current backoff delay for a machine (nil if no active backoff).
+    public func currentBackoff(for machineId: MachineId) -> Duration?
+
+    /// Number of consecutive failures for a machine.
+    public func failureCount(for machineId: MachineId) -> Int
+
+    /// Clear state for a machine (e.g., when manually disconnecting).
+    public func clear(machineId: MachineId)
+}
+```
+
+```swift
+/// Connection state visible to the application layer.
+public enum TunnelConnectionState: Sendable, Equatable {
     case connected
-    case reconnecting(attempt: Int, nextRetryMs: Int)
+    case reconnecting(attempt: Int, nextRetry: Duration)
+    case failed(reason: String)
     case degraded(reason: String)
 }
 
-/// Reconnection manager with exponential backoff
-public actor ReconnectionManager {
-    var currentBackoffMs: Int { get }
-    func recordFailure() -> Int  // Returns next retry delay
-    func recordSuccess()         // Resets backoff
-}
+/// Reports connection state changes with throttling to avoid spam.
+///
+/// At most one state change per machine per `minInterval` (default 5s).
+/// Identical consecutive states are suppressed.
+public actor ConnectionStateReporter {
+    public struct Config: Sendable {
+        public var minInterval: Duration = .seconds(5)
+        public var maxReconnectingMessages: Int = 5
 
-/// Handler for state changes
-public typealias ConnectionStateHandler = (MachineId, TunnelConnectionState) async -> Void
+        public static let `default` = Config()
+    }
+
+    public init(config: Config = .default)
+
+    /// Set handler for state changes.
+    public func onStateChange(
+        _ handler: @escaping (MachineId, TunnelConnectionState) async -> Void
+    )
+
+    /// Report a state change (throttled internally).
+    public func report(machineId: MachineId, state: TunnelConnectionState) async
+
+    /// Stream of state changes for a specific machine.
+    public func stateChanges(for machineId: MachineId) -> AsyncStream<TunnelConnectionState>
+}
 ```
 
-**Behavior:**
-- Never give up — keep retrying with exponential backoff
-- Max backoff: 60 seconds
-- Success resets backoff to minimum
-- User sees at most ~5 messages during sustained outage
+#### TunnelManager Integration
+
+```swift
+// Current handleHealthFailure (TunnelManager.swift:325):
+//   1. Logs warning
+//   2. Calls closeAllSessions(to:) — which closes sessions, sends close handshakes,
+//      stops health monitor, and removes it from healthMonitors dict
+//   3. Removes monitor from healthMonitors (redundant — closeAllSessions already does this)
+//
+// New handleHealthFailure with reconnection:
+private func handleHealthFailure(machineId: MachineId) async {
+    logger.warning("Health check FAILED for machine — closing all sessions",
+                   metadata: ["machine": "\(machineId)"])
+    await closeAllSessions(to: machineId)
+    // Note: closeAllSessions() already stops and removes the health monitor
+
+    // Report state change
+    let delay = await reconnectionManager.recordFailure(for: machineId)
+    let attempt = await reconnectionManager.failureCount(for: machineId)
+    await stateReporter.report(
+        machineId: machineId,
+        state: .reconnecting(attempt: attempt, nextRetry: delay)
+    )
+
+    // Cancel any existing reconnection task for this machine
+    reconnectionTasks[machineId]?.cancel()
+
+    // Schedule reconnection attempt
+    reconnectionTasks[machineId] = Task { [weak self] in
+        try? await Task.sleep(for: delay)
+        guard !Task.isCancelled, let self else { return }
+        await self.attemptReconnection(to: machineId)
+    }
+}
+
+private func attemptReconnection(to machineId: MachineId) async {
+    do {
+        // createSession → getSession → creates new session + new health monitor
+        let session = try await createSession(withMachine: machineId)
+        await reconnectionManager.recordSuccess(for: machineId)
+        await stateReporter.report(machineId: machineId, state: .connected)
+        reconnectionTasks.removeValue(forKey: machineId)
+    } catch {
+        // Failed again — handleHealthFailure will schedule next retry with increased backoff
+        await handleHealthFailure(machineId: machineId)
+    }
+}
+```
+
+**New properties to add to TunnelManager:**
+```swift
+private let reconnectionManager: ReconnectionManager
+private let stateReporter: ConnectionStateReporter
+private var reconnectionTasks: [MachineId: Task<Void, Never>] = [:]
+```
+
+These should be initialized in `TunnelManager.init()` using config values from
+`TunnelManagerConfig`.
+
+#### Behavior
+
+- Never gives up — keeps retrying with exponential backoff
+- Backoff: 1s → 2s → 4s → 8s → 16s → 32s → 60s (capped)
+- Success resets backoff to 1s
+- User sees at most 5 "reconnecting" messages during sustained outage
+- Identical consecutive states suppressed
+- Manual `closeAllSessions()` clears reconnection state (no auto-retry)
 
 #### Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `testBackoffIncreases` | Each failure doubles delay |
-| `testBackoffCaps` | Verify max backoff (60s) |
-| `testBackoffResets` | Success resets to minimum |
+| `testBackoffDoubles` | Each failure doubles delay: 1s, 2s, 4s, 8s |
+| `testBackoffCapsAt60s` | Delay never exceeds 60s |
+| `testSuccessResetsBackoff` | Success after failures resets to 1s |
+| `testClearStopsReconnection` | Manual clear stops retry loop |
+| `testStateReporterThrottles` | Rapid state changes throttled to minInterval |
+| `testIdenticalStatesSuppressed` | Same state twice → only one report |
+| `testMaxReconnectingMessages` | At most 5 "reconnecting" messages during outage |
 | `testStateTransitions` | connected → reconnecting → connected |
-| `testNoMessageSpam` | 10 failures, verify ≤3 user messages |
-| `testDegradedState` | High latency, verify degraded reported |
+| `testDegradedOnHighLatency` | High probe latency → degraded state |
+| `testFailedAfterMaxAttempts` | Optional: report .failed after N attempts (configurable, default: never) |
+
+#### Cross-Machine Validation
+
+Add to HealthTestRunner after Phase 5 is implemented:
+
+| Phase | What It Tests |
+|-------|---------------|
+| New: Auto-Recovery | Block network, verify reconnection after unblock |
+| New: Backoff Timing | Block network, verify retry delays increase |
+| New: State Reporting | Verify state callback fires during block/unblock cycle |
 
 ---
 
 ### Phase 6: Peer Expiry and Rejoin
 
-**Goal:** Implement backoff and dropoff for peers that stop responding.
-Support successful rejoin after being dropped from peer lists.
+**Goal:** Implement peer lifecycle management in core OmertaMesh. Peers that
+stop responding transition through stale → expired states. Expired peers are
+dropped from peer lists. Peers can rejoin after being dropped.
 
-**Note:** This code belongs in core **OmertaMesh**, not OmertaTunnel.
-Peer expiry is fundamental mesh behavior.
+**Note:** This code belongs in **OmertaMesh**, not OmertaTunnel. Peer expiry
+is fundamental mesh behavior. TunnelManager's health monitoring detects
+tunnel-level failures; PeerExpiryManager detects mesh-level peer dropout.
 
 #### Files to Create
 
 | File | Description |
 |------|-------------|
-| `Sources/OmertaMesh/Peers/PeerExpiryManager.swift` | Expiry tracking |
-| `Tests/OmertaMeshTests/PeerExpiryTests.swift` | Expiry tests |
+| `Sources/OmertaMesh/Discovery/PeerExpiryManager.swift` | Peer state tracking and expiry |
+| `Tests/OmertaMeshTests/PeerExpiryManagerTests.swift` | Expiry behavior tests |
 
 #### Files to Modify
 
 | File | Changes |
 |------|---------|
-| `Sources/OmertaMesh/MeshNode.swift` | Integrate expiry manager |
-| `Sources/OmertaMesh/Discovery/PeerStore.swift` | Add stale/expired states |
-| `Sources/OmertaMesh/Public/MeshConfig.swift` | Add expiry thresholds |
+| `Sources/OmertaMesh/Public/MeshNetwork.swift` | Integrate PeerExpiryManager into mesh lifecycle |
+| `Sources/OmertaMesh/Discovery/PeerStore.swift` | Add stale/expired states to stored peer records (currently persistence-only) |
+| `Sources/OmertaMesh/Public/MeshConfig.swift` | Add `PeerExpiryConfig` to mesh configuration |
 
 #### API
 
 ```swift
-/// Peer state (in OmertaMesh)
-public enum PeerState: Sendable {
+/// Peer lifecycle state.
+public enum PeerState: Sendable, Equatable {
     case active
     case stale(missedPings: Int)
     case expired
 }
 
-/// Expiry manager
-public actor PeerExpiryManager {
-    func recordPing(peerId: PeerId, success: Bool)
-    func peerState(_ peerId: PeerId) -> PeerState
-    var expiredPeers: AsyncStream<PeerId> { get }
+/// Configuration for peer expiry.
+public struct PeerExpiryConfig: Sendable {
+    /// Missed pings before marking as stale (default: 3)
+    public var staleThreshold: Int = 3
+
+    /// Missed pings before marking as expired (default: 8)
+    public var expiryThreshold: Int = 8
+
+    /// Grace period for rejoining after expiry (default: 300s)
+    public var rejoinGracePeriod: Duration = .seconds(300)
+
+    /// Interval between peer liveness checks (default: 10s)
+    public var checkInterval: Duration = .seconds(10)
+
+    public static let `default` = PeerExpiryConfig()
 }
 
-/// Config additions
-extension MeshConfig {
-    var staleThresholdMissedPings: Int  // default: 3
-    var expiryThresholdMissedPings: Int // default: 8
-    var rejoinGracePeriodSeconds: Int   // default: 300
+/// Tracks peer liveness and manages stale/expired transitions.
+///
+/// Runs in OmertaMesh, not OmertaTunnel. Integrated with the mesh
+/// node's ping/pong cycle.
+public actor PeerExpiryManager {
+    public init(config: PeerExpiryConfig = .default)
+
+    /// Record a ping result for a peer.
+    public func recordPing(peerId: PeerId, success: Bool)
+
+    /// Current state of a peer.
+    public func peerState(_ peerId: PeerId) -> PeerState
+
+    /// Stream of peers that have expired (should be removed from peer lists).
+    public var expiredPeers: AsyncStream<PeerId> { get }
+
+    /// Stream of peers that have become stale (reduce gossip priority).
+    public var stalePeers: AsyncStream<PeerId> { get }
+
+    /// Handle a peer rejoining after expiry.
+    /// Accepts if within grace period, rejects otherwise.
+    public func handleRejoin(peerId: PeerId) -> Bool
+
+    /// Start periodic liveness checks.
+    public func start() async
+
+    /// Stop checks and clear state.
+    public func stop() async
 }
 ```
+
+#### MeshNode Integration
+
+```swift
+// In MeshNetwork, during periodic ping cycle:
+for peer in peerStore.allPeers() {
+    let success = await ping(peer)
+    await expiryManager.recordPing(peerId: peer.id, success: success)
+}
+
+// Listen for expiry events:
+for await expiredPeerId in expiryManager.expiredPeers {
+    await peerStore.removePeer(expiredPeerId)
+    // Notify TunnelManager to clean up sessions
+    await tunnelManager?.closeAllSessions(to: expiredPeerId.machineId)
+}
+
+// Listen for stale events:
+for await stalePeerId in expiryManager.stalePeers {
+    await gossipRouter?.deprioritize(peerId: stalePeerId)
+}
+```
+
+#### State Transitions
+
+```
+active ──(3 missed pings)──→ stale ──(8 missed pings)──→ expired
+  ↑                            │                            │
+  └──(any successful ping)─────┘                            │
+  ↑                                                         │
+  └──(rejoin within grace period)───────────────────────────┘
+```
+
+#### Interaction with Tunnel Health Monitoring
+
+These are complementary systems at different layers:
+
+| Concern | TunnelHealthMonitor | PeerExpiryManager |
+|---------|--------------------|--------------------|
+| Layer | OmertaTunnel | OmertaMesh |
+| Monitors | Individual tunnel connections | Peer presence in mesh |
+| Probe type | Health probe on tunnel channel | Mesh-level ping/pong |
+| Failure action | Close sessions, trigger reconnection | Remove from peer list |
+| Timescale | 500ms–15s probe intervals | 10s check intervals |
+| Recovery | ReconnectionManager retries | Rejoin via discovery |
+
+A peer can have healthy tunnel connections but be marked stale at the mesh level
+(e.g., if mesh pings are lost but tunnel probes succeed on an existing session).
+Conversely, a tunnel can fail while the peer remains active in the mesh.
 
 #### Unit Tests
 
 | Test | Description |
 |------|-------------|
-| `testPeerBecomesStale` | 3 missed pings → stale |
-| `testPeerExpires` | 8 missed pings → expired |
-| `testStaleRecovery` | Stale peer responds, becomes active |
-| `testExpiredPeerDropped` | Expired peer removed from list |
-| `testRejoinAfterExpiry` | Expired peer rejoins, accepted |
-| `testGossipReducedForStale` | Stale peers not actively gossiped |
+| `testPeerBecomesStale` | 3 missed pings → `.stale(missedPings: 3)` |
+| `testPeerExpires` | 8 missed pings → `.expired` |
+| `testStaleRecovery` | Stale peer responds → back to `.active` |
+| `testExpiredPeerEmitted` | Expired peer appears in `expiredPeers` stream |
+| `testStalePeerEmitted` | Stale peer appears in `stalePeers` stream |
+| `testRejoinWithinGrace` | Expired peer rejoins within 300s → accepted |
+| `testRejoinAfterGrace` | Expired peer rejoins after 300s → rejected |
+| `testSuccessResetsState` | Any successful ping from stale → active |
+| `testMultiplePeersIndependent` | Peer A stale doesn't affect peer B |
+| `testStopClearsState` | Stop clears all tracking |
 
 ---
 
 ### Phase 7: WireGuard and Legacy VPN Cleanup
 
 **Goal:** Remove all WireGuard-related code and unnecessary VPN infrastructure.
-The mesh with netstack replaces WireGuard for VM networking.
+The mesh with netstack replaces WireGuard for networking.
 
-#### Files to Delete
+**Status:** The omerta_mesh_tunnel repo has no OmertaVPN module — all tunnel
+infrastructure uses the netstack-based architecture. The remaining WireGuard
+references in this repo are minimal. The parent omerta repo and other
+submodules (omerta_node, omerta_provider) may have more extensive legacy code.
 
-| File | Reason |
-|------|--------|
-| `Sources/OmertaVPN/LinuxWireGuardManager.swift` | WireGuard no longer used |
-| `Sources/OmertaVPN/LinuxWireGuardNetlink.swift` | WireGuard no longer used |
-| `Sources/OmertaVPN/LinuxNetlink.swift` | WireGuard no longer used |
-| `Sources/OmertaVPN/MacOSWireGuard.swift` | WireGuard no longer used |
-| `Sources/OmertaVPN/MacOSRouting.swift` | WireGuard routing no longer used |
-| `Sources/OmertaVPN/MacOSUtun.swift` | WireGuard utun no longer used |
-| `Sources/OmertaVPN/MacOSPacketFilter.swift` | WireGuard filtering no longer used |
-| `Sources/OmertaVPN/VPNManager.swift` | Replaced by TunnelManager |
-| `Sources/OmertaVPN/VPNTunnelService.swift` | Replaced by mesh tunnels |
-| `Sources/OmertaVPN/EphemeralVPN.swift` | Replaced by OmertaTunnel |
-| `Sources/OmertaVPN/NetworkExtensionVPN.swift` | Not needed with netstack |
-| `Sources/OmertaVPN/VPNProvider.swift` | Replaced by TunnelManager |
-| `Sources/OmertaVPN/EthernetFrame.swift` | Packet handling in netstack |
-| `Sources/OmertaVPN/IPv4Packet.swift` | Packet handling in netstack |
-| `Sources/OmertaVPN/EndpointAllowlist.swift` | No longer needed |
-| `Sources/OmertaVPN/FramePacketBridge.swift` | Replaced by netstack bridge |
-| `Sources/OmertaVPN/FilteredNAT.swift` | Replaced by netstack |
-| `Sources/OmertaVPN/FilteringStrategy.swift` | Replaced by netstack |
-| `Sources/OmertaVPN/VMNetworkManager.swift` | Replaced by VMPacketCapture |
-| `Sources/OmertaVPN/UDPForwarder.swift` | Replaced by netstack |
-| `Sources/OmertaProvider/ProviderVPNManager.swift` | Replaced by TunnelManager |
-| `Sources/OmertaProvider/VPNHealthMonitor.swift` | Replaced by TunnelHealthMonitor |
-| `Sources/OmertaVPNExtension/` (entire directory) | Network extension not needed |
+#### This Repo (omerta_mesh_tunnel)
 
-#### Files to Modify
+**Files to modify:**
 
 | File | Changes |
 |------|---------|
-| `Sources/OmertaDaemon/OmertaDaemon.swift` | Remove WireGuard references |
-| `Sources/OmertaCLI/main.swift` | Remove VPN commands, add tunnel commands |
-| `Sources/OmertaConsumer/MeshConsumerClient.swift` | Remove WireGuard setup |
-| `Sources/OmertaProvider/MeshProviderDaemon.swift` | Remove VPN manager |
-| `Sources/OmertaVM/VMManager.swift` | Remove WireGuard config |
-| `Sources/OmertaVM/CloudInitGenerator.swift` | Remove WireGuard setup |
-| `Sources/OmertaCore/Domain/Resource.swift` | Remove VPN resource types |
-| `Sources/OmertaCore/System/DependencyChecker.swift` | Remove wg-quick check |
-| `Package.swift` | Remove OmertaVPN, OmertaVPNExtension targets |
+| `Sources/OmertaMesh/Public/DirectConnection.swift` | Remove WireGuard config generation methods and comments. The `DirectConnection` struct itself may still be useful for representing direct connections, but the WireGuard-specific parts should go. |
+| `Sources/OmertaMesh/Public/nat-traversal-review.rtf` | Delete or archive — contains outdated WireGuard cleanup notes |
 
-#### Tests to Delete
+**Cleanup checklist for this repo:**
 
-| Test File | Reason |
-|-----------|--------|
-| `Tests/OmertaVPNTests/` (entire directory) | All VPN tests replaced |
-| `Tests/OmertaProviderTests/VPNHealthMonitorTests.swift` | Replaced |
+- [ ] Remove WireGuard config generation from `DirectConnection.swift`
+- [ ] Remove or archive `nat-traversal-review.rtf`
+- [ ] Grep for any remaining `WireGuard` / `wireguard` / `wg-quick` references
+- [ ] Verify `swift build` and `swift test` pass after cleanup
 
-#### Sudo/Root Check Removals
+#### Parent Repo and Other Submodules
 
-The netstack approach runs entirely in userspace — no root required on consumer.
+The parent omerta repo and submodules (omerta_node, omerta_provider) likely
+contain the bulk of legacy VPN code (OmertaVPN module, VPNManager,
+EphemeralVPN, WireGuard managers, etc.). That cleanup should be tracked
+separately in those repos. Key modules to remove:
 
-| File | Code to Remove |
-|------|----------------|
-| `Sources/OmertaCore/System/ProcessRunner.swift` | `isRoot` property and `getuid() == 0` check |
-| `Sources/OmertaCLI/main.swift` | `getuid() == 0` check and sudo hints |
-| `Sources/OmertaVPN/EphemeralVPN.swift` | `getuid() != 0` root requirement check |
-| `Sources/OmertaDaemon/OmertaDaemon.swift` | "run with sudo" messages |
-| `Sources/OmertaCore/System/DependencyChecker.swift` | `wireguard` dependencies |
+- `OmertaVPN` — entire module (WireGuard managers, VPN tunnel service, packet filters)
+- `OmertaVPNExtension` — network extension (replaced by netstack)
+- VPN-related CLI commands and daemon startup code
+- Root/sudo requirement checks (netstack runs in userspace)
 
 **Note:** Keep SUDO_USER handling in home directory resolution — still useful
-when daemon runs as root.
-
-#### Cleanup Checklist
-
-- [ ] Remove all `import WireGuard` statements
-- [ ] Remove all `wg-quick` process spawning
-- [ ] Remove WireGuard key generation code
-- [ ] Remove WireGuard config file generation
-- [ ] Remove Network Extension entitlements (if no longer needed)
-- [ ] Update documentation to remove WireGuard references
-- [ ] Remove `wireguard-go` submodule if present
-- [ ] Update CI/CD to not build WireGuard dependencies
-- [ ] Remove `ProcessRunner.isRoot` and sudo prepending logic
-- [ ] Remove `checkSudoAccess()` from CLI
-- [ ] Remove "requires sudo" error messages
-
----
-
-## Reference: VM Networking Architecture
-
-### Strict Isolation Guarantees
-
-Isolation is provided by the platform, not firewall rules:
-
-**macOS (Virtualization.framework):**
-- `VZFileHandleNetworkDeviceAttachment` — VM's only network is the file handle
-- No bridge to host network exists
-- VM literally cannot reach anything except through VMPacketCapture
-
-**Linux (network namespaces):**
-- VM is in isolated namespace, cannot see host interfaces
-- Only interface is veth with route to gateway (our bridge)
-- Packets have nowhere to go except through VMPacketCapture
-
-### Provider-Side Setup
-
-**Linux (network namespace + veth):**
-
-```bash
-# Create isolated namespace for VM
-ip netns add vm-${VM_ID}
-
-# Create veth pair
-ip link add veth-vm-${VM_ID} type veth peer name veth-host-${VM_ID}
-
-# Move one end into VM namespace
-ip link set veth-vm-${VM_ID} netns vm-${VM_ID}
-
-# Configure VM side
-ip netns exec vm-${VM_ID} ip addr add 10.0.${VM_NUM}.2/24 dev veth-vm-${VM_ID}
-ip netns exec vm-${VM_ID} ip link set veth-vm-${VM_ID} up
-ip netns exec vm-${VM_ID} ip link set lo up
-ip netns exec vm-${VM_ID} ip route add default via 10.0.${VM_NUM}.1
-
-# Configure host side
-ip addr add 10.0.${VM_NUM}.1/24 dev veth-host-${VM_ID}
-ip link set veth-host-${VM_ID} up
-```
-
-**macOS (Virtualization.framework):**
-
-```swift
-let (vmRead, hostWrite) = Pipe().fileHandles
-let (hostRead, vmWrite) = Pipe().fileHandles
-
-let networkAttachment = VZFileHandleNetworkDeviceAttachment(
-    fileHandleForReading: vmRead,
-    fileHandleForWriting: vmWrite
-)
-
-// VMPacketCapture reads from hostRead, writes to hostWrite
-```
-
-### Edge Cases
-
-**DHCP:** Gateway responds via unicast DHCP (see VIRTUAL_NETWORK_REWORK Phase 4)
-
-**DNS:** VM's DNS points to mesh gateway IP, forwarded through mesh to consumer
-
-**ARP:** Host responds to ARP for gateway (automatic with veth setup)
-
-**MTU:** Set VM's interface MTU to 1400 to account for mesh overhead
-
-**Consumer Offline:** VM traffic fails (connection refused/timeout) — expected
-
-### Endpoint Negotiation and Migration
-
-When either side's endpoint stops working:
-
-1. **Detection** — OS network change event or probe timeout
-2. **Re-probe** — TunnelManager sends probes to trigger mesh reconnection
-3. **Notify peer** — Mesh handles endpoint update propagation
-4. **Resume** — Active connections continue (just mesh messages, no app-layer reconnect)
-
-Both consumer and provider run health monitoring. Either can initiate recovery.
+when daemon runs as root for TUN mode.
 
 ---
 

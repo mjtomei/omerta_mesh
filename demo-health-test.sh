@@ -46,7 +46,7 @@ if ssh "$REMOTE_HOST" "test -e '$REMOTE_PATH'" 2>/dev/null; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$SCRIPT_DIR"
 PRODUCT="HealthTestRunner"
 LOCAL_BIN="$HOME/.local/bin/$PRODUCT"
 PORT=18020
