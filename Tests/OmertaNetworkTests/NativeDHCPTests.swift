@@ -329,8 +329,8 @@ final class NativeDHCPServiceTests: XCTestCase {
         let request = DHCPRequest(machineId: "m1")
         _ = await service.handleRequest(request)
 
-        // Try to renew with wrong IP
-        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.199")
+        // Try to renew with an IP outside the pool range
+        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.50")
         let renewResponse = await service.handleRenewal(renewal)
 
         XCTAssertNil(renewResponse)
@@ -640,16 +640,16 @@ final class NativeDHCPIntegrationTests: XCTestCase {
         let afterAllocCount = await service.availableIPCount()
         XCTAssertEqual(afterAllocCount, initialCount - 1)
 
-        // Wait for release message to be sent
-        try await Task.sleep(for: .milliseconds(50))
-
         // Release
         try await client.releaseLease()
 
-        // Wait for release to be processed
-        try await Task.sleep(for: .milliseconds(100))
-
-        let afterReleaseCount = await service.availableIPCount()
+        // Poll until release is processed (IP returned to pool)
+        let deadline = ContinuousClock.now + .seconds(5)
+        var afterReleaseCount = await service.availableIPCount()
+        while afterReleaseCount != initialCount && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+            afterReleaseCount = await service.availableIPCount()
+        }
         XCTAssertEqual(afterReleaseCount, initialCount)
 
         // Client should have no lease

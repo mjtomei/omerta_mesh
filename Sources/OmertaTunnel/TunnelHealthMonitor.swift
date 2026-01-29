@@ -35,7 +35,7 @@ public actor TunnelHealthMonitor {
         self.failureThreshold = failureThreshold
         self.graceIntervals = graceIntervals
         self.currentProbeInterval = minProbeInterval
-        self.lastPacketTime = ContinuousClock.now
+        self.lastPacketTime = ContinuousClock.now - minProbeInterval
     }
 
     /// Called by TunnelManager when any packet arrives from this machine (application data or incoming probes)
