@@ -26,11 +26,11 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         let encoded = try envelope.encodeV2(networkKey: testKey)
 
         // Verify it starts with magic and version
-        XCTAssertEqual(encoded.prefix(4), BinaryEnvelopeV2.magic)
-        XCTAssertEqual(encoded[4], BinaryEnvelopeV2.version)
+        XCTAssertEqual(encoded.data.prefix(4), BinaryEnvelopeV2.magic)
+        XCTAssertEqual(encoded.data[4], BinaryEnvelopeV2.version)
 
         // Decode from v2 format with hash
-        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: testKey)
+        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
 
         // Verify all fields match (except channel which is hashed)
         XCTAssertEqual(decoded.messageId, envelope.messageId)
@@ -63,7 +63,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: testKey)
+        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
 
         XCTAssertNil(decoded.toPeerId)
         // Empty channel hashes to 0
@@ -134,7 +134,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         // Try to decode with different key
         let wrongKey = Data(repeating: 0x99, count: 32)
 
-        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded, networkKey: wrongKey)) { error in
+        XCTAssertThrowsError(try MeshEnvelope.decodeV2(encoded.data, networkKey: wrongKey)) { error in
             // Should fail with some crypto error (authentication failure or network mismatch)
             // The exact error depends on whether decryption fails first or network hash check fails
             // Just verify that it throws - the specific error type depends on implementation
@@ -198,7 +198,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let decoded = try MeshEnvelope.decodeV2(encoded, networkKey: testKey)
+        let decoded = try MeshEnvelope.decodeV2(encoded.data, networkKey: testKey)
 
         if case .data(let decodedData) = decoded.payload {
             XCTAssertEqual(decodedData.count, 10000)
@@ -223,7 +223,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: testKey)
+        let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
 
         // Channel hash should match the hash of the original channel
         XCTAssertEqual(channelHash, ChannelHash.hash(channel))
@@ -249,7 +249,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let (_, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: testKey)
+        let (_, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
 
         // Empty channel hashes to 0
         XCTAssertEqual(channelHash, 0)
@@ -268,7 +268,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let (_, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded, networkKey: testKey)
+        let (_, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
 
         // Channel hash should match the hash of the original long channel
         XCTAssertEqual(channelHash, ChannelHash.hash(maxChannel))
@@ -299,7 +299,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let decoded = try MeshEnvelope.decodeV2(encoded, networkKey: testKey)
+        let decoded = try MeshEnvelope.decodeV2(encoded.data, networkKey: testKey)
 
         XCTAssertEqual(decoded.hopCount, 42)
     }
@@ -329,7 +329,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: testKey)
-        let decoded = try MeshEnvelope.decodeV2(encoded, networkKey: testKey)
+        let decoded = try MeshEnvelope.decodeV2(encoded.data, networkKey: testKey)
 
         // Should be clamped to 255
         XCTAssertEqual(decoded.hopCount, 255)
@@ -353,13 +353,13 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
 
         // The nonces should be different (random)
         // Nonce is at bytes 5-16
-        let nonce1 = encoded1[5..<17]
-        let nonce2 = encoded2[5..<17]
+        let nonce1 = encoded1.data[5..<17]
+        let nonce2 = encoded2.data[5..<17]
         XCTAssertNotEqual(nonce1, nonce2)
 
         // Both should still decode correctly
-        let decoded1 = try MeshEnvelope.decodeV2(encoded1, networkKey: testKey)
-        let decoded2 = try MeshEnvelope.decodeV2(encoded2, networkKey: testKey)
+        let decoded1 = try MeshEnvelope.decodeV2(encoded1.data, networkKey: testKey)
+        let decoded2 = try MeshEnvelope.decodeV2(encoded2.data, networkKey: testKey)
 
         XCTAssertEqual(decoded1.messageId, decoded2.messageId)
     }
@@ -374,7 +374,8 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
             payload: .data(Data([1, 2, 3, 4, 5]))
         )
 
-        var encoded = try envelope.encodeV2(networkKey: testKey)
+        let sealed = try envelope.encodeV2(networkKey: testKey)
+        var encoded = sealed.data
 
         // Tamper with a byte in the encrypted payload area
         let tamperedIndex = encoded.count - 20  // Near the end, in the payload

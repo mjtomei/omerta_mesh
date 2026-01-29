@@ -178,6 +178,8 @@ extension HolePunchFailure {
             return .holePunchFailed(peerId: peerId, reason: "cancelled")
         case .socketError(let msg):
             return .holePunchFailed(peerId: peerId, reason: msg)
+        case .noServices:
+            return .holePunchFailed(peerId: peerId, reason: "no services available")
         }
     }
 }

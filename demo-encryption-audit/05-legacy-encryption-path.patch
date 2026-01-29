@@ -1,0 +1,31 @@
+diff --git a/Tests/OmertaMeshTests/DemoAttackTests.swift b/Tests/OmertaMeshTests/DemoAttackTests.swift
+index 3474e9e..aee2906 100644
+--- a/Tests/OmertaMeshTests/DemoAttackTests.swift
++++ b/Tests/OmertaMeshTests/DemoAttackTests.swift
+@@ -35,6 +35,26 @@ final class DemoAttackTests: XCTestCase {
+         try? group.syncShutdownGracefully()
+         try await super.tearDown()
+     }
++    // Scenario 5: Code uses old MessageEncryption instead of BinaryEnvelopeV2
++    func testLegacyEncryptionPath() async throws {
++        let beforeCount = GlobalEncryptionObserver.shared.violations.count
++        let keypair = IdentityKeypair()
++        let envelope = try MeshEnvelope.signed(
++            from: keypair,
++            machineId: UUID().uuidString,
++            to: nil,
++            payload: .data(Data("legacy path".utf8))
++        )
++        let testKey = Data(repeating: 0x42, count: 32)
++        // BUG: uses legacy encryption -- no OMRT prefix
++        let jsonData = try JSONCoding.encoder.encode(envelope)
++        let encrypted = try MessageEncryption.encrypt(jsonData, key: testKey)
++        try await socket.sendRaw(encrypted, to: dest)
++        try await Task.sleep(nanoseconds: 10_000_000)
++        XCTAssertGreaterThan(GlobalEncryptionObserver.shared.violations.count, beforeCount,
++            "Audit should catch legacy encryption format")
++    }
++
+ }
+ 
+ #endif

@@ -241,9 +241,13 @@ final class Phase1Tests: XCTestCase {
             receivedExpectation.fulfill()
         }
 
-        // Send data
+        // Send data (raw socket test — suppress encryption check)
         let testData = "Hello UDP!".data(using: .utf8)!
-        try await socket1.send(testData, to: "127.0.0.1:\(port2)")
+        #if DEBUG
+        GlobalEncryptionObserver.suppressHook = true
+        defer { GlobalEncryptionObserver.suppressHook = false }
+        #endif
+        try await socket1.sendRaw(testData, to: "127.0.0.1:\(port2)")
 
         await fulfillment(of: [receivedExpectation], timeout: 5.0)
 
@@ -349,14 +353,22 @@ final class Phase1Tests: XCTestCase {
         try await socket.bind(port: 0)
         defer { Task { await socket.close() } }
 
-        // Send first message
-        try await socket.send(encryptedData, to: "127.0.0.1:\(portB)")
+        // Send raw legacy-encrypted data — suppress encryption check
+        #if DEBUG
+        GlobalEncryptionObserver.suppressHook = true
+        #endif
+        defer {
+            #if DEBUG
+            GlobalEncryptionObserver.suppressHook = false
+            #endif
+        }
+        try await socket.sendRaw(encryptedData, to: "127.0.0.1:\(portB)")
 
         // Wait for first message to be processed
         try await Task.sleep(nanoseconds: 300_000_000) // 300ms
 
         // Send duplicate
-        try await socket.send(encryptedData, to: "127.0.0.1:\(portB)")
+        try await socket.sendRaw(encryptedData, to: "127.0.0.1:\(portB)")
 
         // Wait for potential second processing
         try await Task.sleep(nanoseconds: 300_000_000) // 300ms

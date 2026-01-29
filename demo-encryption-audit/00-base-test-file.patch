@@ -1,0 +1,46 @@
+diff --git a/Tests/OmertaMeshTests/DemoAttackTests.swift b/Tests/OmertaMeshTests/DemoAttackTests.swift
+new file mode 100644
+index 0000000..3474e9e
+--- /dev/null
++++ b/Tests/OmertaMeshTests/DemoAttackTests.swift
+@@ -0,0 +1,40 @@
++// DemoAttackTests.swift - Simulates a bad code change to verify audit detection
++// This file is applied by encryption-audit-demo patches. It should NOT be
++// committed to the repository.
++
++import XCTest
++import NIOPosix
++import NIOCore
++import Crypto
++@testable import OmertaMesh
++
++#if DEBUG
++
++final class DemoAttackTests: XCTestCase {
++
++    private var group: MultiThreadedEventLoopGroup!
++    private var socket: UDPSocket!
++    private var dest: SocketAddress!
++
++    override class func setUp() {
++        super.setUp()
++        GlobalEncryptionObserver.install()
++    }
++
++    override func setUp() async throws {
++        try await super.setUp()
++        group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
++        socket = UDPSocket(eventLoopGroup: group)
++        try await socket.bind(port: 0)
++        let port = await socket.port!
++        dest = try SocketAddress(ipAddress: "127.0.0.1", port: port)
++    }
++
++    override func tearDown() async throws {
++        await socket.close()
++        try? group.syncShutdownGracefully()
++        try await super.tearDown()
++    }
++}
++
++#endif
