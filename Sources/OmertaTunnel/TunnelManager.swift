@@ -250,6 +250,8 @@ public actor TunnelManager {
     public func closeSession(key: TunnelSessionKey) async {
         guard let session = sessions.removeValue(forKey: key) else { return }
 
+        logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
+
         // Notify remote machine
         let handshake = SessionHandshake(type: .close, channel: key.channel)
         if let data = try? JSONEncoder().encode(handshake) {
@@ -291,7 +293,7 @@ public actor TunnelManager {
     }
 
     private func handleHealthFailure(machineId: MachineId) async {
-        logger.warning("Health check failed for machine", metadata: ["machine": "\(machineId)"])
+        logger.warning("Health check FAILED for machine — closing all sessions", metadata: ["machine": "\(machineId)"])
         await closeAllSessions(to: machineId)
         // Remove dead monitor so new sessions get a fresh one
         healthMonitors.removeValue(forKey: machineId)
