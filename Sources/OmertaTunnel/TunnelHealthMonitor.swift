@@ -38,10 +38,16 @@ public actor TunnelHealthMonitor {
         self.lastPacketTime = ContinuousClock.now
     }
 
-    /// Called by TunnelManager when any packet arrives from this machine
+    /// Called by TunnelManager when any packet arrives from this machine (application data or incoming probes)
     public func onPacketReceived() {
         lastPacketTime = ContinuousClock.now
         currentProbeInterval = minProbeInterval
+        consecutiveFailures = 0
+    }
+
+    /// Called when a probe response (echo) arrives — updates liveness without resetting probe interval
+    public func onProbeResponseReceived() {
+        lastPacketTime = ContinuousClock.now
         consecutiveFailures = 0
     }
 

@@ -107,10 +107,13 @@ public actor TunnelManager {
         // Echo back a response so the sender knows we're alive too
         try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
             guard let self else { return }
-            await self.notifyPacketReceived(from: machineId)
-            // Echo probe back (0x01 = probe, 0x02 = response)
             if data.first == 0x01 {
+                // Incoming probe: remote is actively checking us. Update liveness and echo back.
+                await self.notifyPacketReceived(from: machineId)
                 try? await self.provider.sendOnChannel(Data([0x02]), toMachine: machineId, channel: self.healthProbeChannel)
+            } else if data.first == 0x02 {
+                // Probe response: only update lastPacketTime for liveness, don't reset probe interval
+                await self.notifyProbeResponseReceived(from: machineId)
             }
         }
 
@@ -298,6 +301,13 @@ public actor TunnelManager {
     public func notifyPacketReceived(from machineId: MachineId) async {
         if let monitor = healthMonitors[machineId] {
             await monitor.onPacketReceived()
+        }
+    }
+
+    /// Notify health monitor that a probe response arrived (liveness only, no interval reset)
+    private func notifyProbeResponseReceived(from machineId: MachineId) async {
+        if let monitor = healthMonitors[machineId] {
+            await monitor.onProbeResponseReceived()
         }
     }
 
