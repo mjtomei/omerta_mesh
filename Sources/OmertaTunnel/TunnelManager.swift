@@ -424,9 +424,8 @@ public actor TunnelManager {
             let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
             // Verify sessionId matches to reject stale close from old sessions
             if let currentSid = sessionIds[key] {
-                let closeSid = handshake.sessionId
-                if closeSid != currentSid {
-                    logger.info("Ignoring stale close handshake (sid \(closeSid ?? "nil") != \(currentSid))", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                if let closeSid = handshake.sessionId, closeSid != currentSid {
+                    logger.info("Ignoring stale close handshake (sid \(closeSid) != \(currentSid))", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
                     return
                 }
             }
