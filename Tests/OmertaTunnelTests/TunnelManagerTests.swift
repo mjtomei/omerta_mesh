@@ -92,11 +92,10 @@ final class TunnelManagerTests: XCTestCase {
         let remoteMachineId = await session.remoteMachineId
         XCTAssertEqual(remoteMachineId, "remote-machine-123")
 
-        // Verify handshake was sent
-        let messages = await provider.getSentMessages()
-        XCTAssertEqual(messages.count, 1)
-        XCTAssertEqual(messages[0].to, "remote-machine-123")
-        XCTAssertEqual(messages[0].channel, "tunnel-handshake")
+        // Verify handshake was sent (filter to handshake channel — health probes may also be sent)
+        let handshakeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-handshake" }
+        XCTAssertEqual(handshakeMessages.count, 1)
+        XCTAssertEqual(handshakeMessages[0].to, "remote-machine-123")
 
         await manager.stop()
     }
@@ -132,10 +131,9 @@ final class TunnelManagerTests: XCTestCase {
         // Close all sessions
         await manager.closeSession()
 
-        // Verify close handshake was sent
-        let messages = await provider.getSentMessages()
-        XCTAssertEqual(messages.count, 1)
-        XCTAssertEqual(messages[0].channel, "tunnel-handshake")
+        // Verify close handshake was sent (filter — health probes may also appear)
+        let handshakeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-handshake" }
+        XCTAssertEqual(handshakeMessages.count, 1)
 
         // Session count should be 0
         let count = await manager.sessionCount
