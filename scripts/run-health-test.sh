@@ -27,6 +27,8 @@ PORT=18020
 LOGDIR="$(mktemp -d /tmp/health-test-XXXXXX)"
 NODE_A_LOG="$LOGDIR/nodeA.out"
 NODE_B_LOG="$LOGDIR/nodeB.out"
+NODE_A_PID=""
+NODE_B_PID=""
 
 echo "=== Health Test Runner ==="
 echo "Logs: $LOGDIR"
@@ -36,10 +38,10 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     # Kill background jobs
-    kill "$NODE_B_PID" 2>/dev/null || true
-    kill "$NODE_A_PID" 2>/dev/null || true
-    wait "$NODE_B_PID" 2>/dev/null || true
-    wait "$NODE_A_PID" 2>/dev/null || true
+    [ -n "$NODE_B_PID" ] && kill "$NODE_B_PID" 2>/dev/null || true
+    [ -n "$NODE_A_PID" ] && kill "$NODE_A_PID" 2>/dev/null || true
+    [ -n "$NODE_B_PID" ] && wait "$NODE_B_PID" 2>/dev/null || true
+    [ -n "$NODE_A_PID" ] && wait "$NODE_A_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
