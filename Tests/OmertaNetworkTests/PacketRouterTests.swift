@@ -46,6 +46,12 @@ actor MockChannelProvider: ChannelProvider {
         }
     }
 
+    func drainSentMessages() -> [(data: Data, target: String, channel: String)] {
+        let msgs = sentMessages
+        sentMessages.removeAll()
+        return msgs
+    }
+
     func sentMessages(on channel: String) -> [(data: Data, target: String)] {
         sentMessages.filter { $0.channel == channel }.map { ($0.data, $0.target) }
     }
@@ -335,14 +341,12 @@ final class PacketRouterIntegrationTests: XCTestCase {
         let relayTask = Task {
             while !Task.isCancelled {
                 // Relay messages from provider1 to provider2
-                let msgs1 = await provider1.sentMessages
-                for msg in msgs1 where msg.target == "m2" {
+                for msg in await provider1.drainSentMessages() where msg.target == "m2" {
                     await provider2.simulateReceive(msg.data, from: "m1", on: msg.channel)
                 }
 
                 // Relay messages from provider2 to provider1
-                let msgs2 = await provider2.sentMessages
-                for msg in msgs2 where msg.target == "m1" {
+                for msg in await provider2.drainSentMessages() where msg.target == "m1" {
                     await provider1.simulateReceive(msg.data, from: "m2", on: msg.channel)
                 }
 
