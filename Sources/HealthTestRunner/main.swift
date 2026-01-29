@@ -530,6 +530,9 @@ if !isNodeA {
         case "phase6-block":
             // Node B blocks incoming UDP from Node A locally, auto-unblocks after 15s
             let blockPort = cmd.detail ?? "\(port)"
+            // Send ack BEFORE blocking (otherwise the ack can't reach Node A)
+            await sendControl("phase6-ack")
+            try await Task.sleep(for: .milliseconds(500))  // ensure ack is sent
             #if os(macOS)
             let (exitCode, out) = await shell("echo 'block drop quick proto udp from any to any port \(blockPort)' | pfctl -ef -")
             logger.info("Node B pfctl block: exit=\(exitCode) \(out)")
@@ -538,7 +541,6 @@ if !isNodeA {
             let (exitCode, out) = await shell("iptables -A INPUT -s \(nodeAHost) -p udp --dport \(blockPort) -j DROP")
             logger.info("Node B iptables block: exit=\(exitCode) \(out)")
             #endif
-            await sendControl("phase6-ack")
             // Auto-unblock after 15s (can't receive unblock command while blocked)
             Task {
                 try? await Task.sleep(for: .seconds(15))
