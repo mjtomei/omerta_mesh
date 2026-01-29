@@ -45,9 +45,10 @@ public actor TunnelHealthMonitor {
         consecutiveFailures = 0
     }
 
-    /// Called when a probe arrives from the remote — updates liveness without resetting probe interval
+    /// Called when a probe arrives from the remote — updates liveness and resets probe interval
     public func onProbeReceived() {
         lastPacketTime = ContinuousClock.now
+        currentProbeInterval = minProbeInterval
         consecutiveFailures = 0
     }
 
