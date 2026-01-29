@@ -308,77 +308,7 @@ let peerId = mesh.peerId
 let machineId = await mesh.machineId
 logger.info("Mesh started - peerId: \(peerId) machineId: \(machineId)")
 
-// Auto-bootstrap: exchange peer IDs via direct UDP before mesh discovery.
-// Each node sends its peerId to the remote host on a side-channel UDP port (mesh port + 1).
-// Once both nodes know each other's peerId, they can use mesh.addPeer() to connect.
-let bootstrapPort = port + 1
 let remoteEndpoint = "\(remoteHost):\(port)"
-logger.info("Auto-bootstrap: exchanging peer IDs via UDP port \(bootstrapPort)...")
-
-do {
-    let bootstrapGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    var remotePeerIdResult: String? = nil
-    let remotePeerLock = NSLock()
-
-    final class BootstrapHandler: ChannelInboundHandler, @unchecked Sendable {
-        typealias InboundIn = AddressedEnvelope<ByteBuffer>
-        var onReceive: ((String) -> Void)?
-
-        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-            let envelope = unwrapInboundIn(data)
-            var buf = envelope.data
-            if let bytes = buf.readBytes(length: buf.readableBytes) {
-                let msg = String(decoding: Data(bytes), as: UTF8.self)
-                onReceive?(msg)
-            }
-        }
-    }
-
-    let handler = BootstrapHandler()
-    let bootstrapChannel = try await DatagramBootstrap(group: bootstrapGroup)
-        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        .channelInitializer { ch in ch.pipeline.addHandler(handler) }
-        .bind(host: "0.0.0.0", port: bootstrapPort)
-        .get()
-
-    handler.onReceive = { msg in
-        if msg.hasPrefix("peerId:") {
-            let rid = String(msg.dropFirst("peerId:".count))
-            remotePeerLock.lock()
-            remotePeerIdResult = rid
-            remotePeerLock.unlock()
-        }
-    }
-
-    let myMsg = "peerId:\(peerId)"
-    let remoteBootstrapAddr = try SocketAddress(ipAddress: remoteHost, port: bootstrapPort)
-    for i in 1...30 {
-        let buf = bootstrapChannel.allocator.buffer(string: myMsg)
-        let envelope = AddressedEnvelope(remoteAddress: remoteBootstrapAddr, data: buf)
-        try await bootstrapChannel.writeAndFlush(envelope)
-        try await Task.sleep(for: .milliseconds(500))
-        remotePeerLock.lock()
-        let rid = remotePeerIdResult
-        remotePeerLock.unlock()
-        if let rid {
-            logger.info("Auto-bootstrap: discovered remote peerId \(rid) after \(i) attempts")
-            await mesh.addPeer(rid, endpoint: remoteEndpoint)
-            let _ = await mesh.ping(rid, timeout: 3.0)
-            break
-        }
-        if i % 10 == 0 { logger.info("Auto-bootstrap: still waiting for remote peerId... (\(i * 500)ms)") }
-    }
-
-    try await bootstrapChannel.close()
-    try await bootstrapGroup.shutdownGracefully()
-
-    remotePeerLock.lock()
-    let finalResult = remotePeerIdResult
-    remotePeerLock.unlock()
-    if finalResult == nil {
-        logger.error("Auto-bootstrap: failed to discover remote peerId after 15s")
-    }
-}
 
 await cleanup.register {
     logger.info("Cleanup: stopping mesh")
@@ -391,9 +321,59 @@ let initialNetworkState = await NetworkSnapshot.capture()
 logger.info("Initial iptables rules:\n\(initialNetworkState.iptablesRules.isEmpty ? "  (none)" : initialNetworkState.iptablesRules)")
 logger.info("Initial IP addresses:\n\(initialNetworkState.ipAddresses)")
 
-// MARK: - Discover Remote Machine
+// MARK: - Auto-Bootstrap & Discover Remote Machine
+//
+// Exchange peer IDs via a side-channel UDP port (mesh port + 1).
+// Both nodes continuously send their peerId to the remote host.
+// Once a node receives the remote's peerId, it calls mesh.addPeer()
+// to establish mesh connectivity, then discovers the machineId via
+// the mesh "health-discovery" channel.
 
-logger.info("Waiting for remote machine...")
+let bootstrapPort = port + 1
+logger.info("Waiting for remote machine (auto-bootstrap on UDP port \(bootstrapPort))...")
+
+final class BootstrapHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+    var onReceive: ((String) -> Void)?
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let envelope = unwrapInboundIn(data)
+        var buf = envelope.data
+        if let bytes = buf.readBytes(length: buf.readableBytes) {
+            let msg = String(decoding: Data(bytes), as: UTF8.self)
+            onReceive?(msg)
+        }
+    }
+}
+
+let bootstrapGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+let bootstrapHandler = BootstrapHandler()
+let bootstrapChannel = try await DatagramBootstrap(group: bootstrapGroup)
+    .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+    .channelInitializer { ch in ch.pipeline.addHandler(bootstrapHandler) }
+    .bind(host: "0.0.0.0", port: bootstrapPort)
+    .get()
+
+var bootstrapDone = false
+let bootstrapLock = NSLock()
+
+bootstrapHandler.onReceive = { msg in
+    if msg.hasPrefix("peerId:") {
+        let rid = String(msg.dropFirst("peerId:".count))
+        bootstrapLock.lock()
+        let alreadyDone = bootstrapDone
+        if !alreadyDone { bootstrapDone = true }
+        bootstrapLock.unlock()
+        if !alreadyDone {
+            Task {
+                logger.info("Auto-bootstrap: discovered remote peerId \(rid)")
+                await mesh.addPeer(rid, endpoint: remoteEndpoint)
+                let _ = await mesh.ping(rid, timeout: 3.0)
+            }
+        }
+    }
+}
+
 var remoteMachineId: MachineId? = nil
 
 try await mesh.onChannel("health-discovery") { fromMachineId, data in
@@ -404,10 +384,24 @@ try await mesh.onChannel("health-discovery") { fromMachineId, data in
     try? await mesh.sendOnChannel(Data("ack".utf8), toMachine: fromMachineId, channel: "health-discovery")
 }
 
-for i in 1...30 {
-    try await Task.sleep(for: .seconds(2))
+let myMsg = "peerId:\(peerId)"
+let remoteBootstrapAddr = try SocketAddress(ipAddress: remoteHost, port: bootstrapPort)
+
+for i in 1...60 {
+    // Send bootstrap peerId exchange
+    bootstrapLock.lock()
+    let done = bootstrapDone
+    bootstrapLock.unlock()
+    if !done {
+        let buf = bootstrapChannel.allocator.buffer(string: myMsg)
+        let envelope = AddressedEnvelope(remoteAddress: remoteBootstrapAddr, data: buf)
+        try? await bootstrapChannel.writeAndFlush(envelope)
+    }
+
+    try await Task.sleep(for: .seconds(1))
     if remoteMachineId != nil { break }
 
+    // Try mesh-level discovery if we have known peers
     let peers = await mesh.knownPeersWithInfo()
     for peer in peers where peer.peerId != peerId {
         let registry = await mesh.machinePeerRegistry
@@ -415,8 +409,11 @@ for i in 1...30 {
             try? await mesh.sendOnChannel(Data("discover".utf8), toMachine: mid, channel: "health-discovery")
         }
     }
-    if i % 5 == 0 { logger.info("Still waiting... (\(i * 2)s)") }
+    if i % 10 == 0 { logger.info("Still waiting... (\(i)s)") }
 }
+
+try? await bootstrapChannel.close()
+try? await bootstrapGroup.shutdownGracefully()
 
 guard let remoteMachineId else {
     logger.error("No remote machine found after 60s. Exiting.")
