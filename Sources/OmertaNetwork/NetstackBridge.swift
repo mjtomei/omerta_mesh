@@ -90,7 +90,7 @@ public final class NetstackTCPConnection: @unchecked Sendable {
 
         let result = data.withUnsafeBytes { buffer -> Int32 in
             guard let baseAddress = buffer.baseAddress else { return -1 }
-            return NetstackConnWrite(h, baseAddress.assumingMemoryBound(to: UInt8.self), buffer.count)
+            return NetstackConnWrite(h, UnsafeMutablePointer(mutating: baseAddress.assumingMemoryBound(to: UInt8.self)), buffer.count)
         }
 
         if result < 0 {
@@ -273,7 +273,7 @@ public final class NetstackBridge: NetstackBridgeProtocol, @unchecked Sendable {
 
         let result = packet.withUnsafeBytes { buffer -> Int32 in
             guard let baseAddress = buffer.baseAddress else { return -1 }
-            return NetstackInjectPacket(h, baseAddress.assumingMemoryBound(to: UInt8.self), buffer.count)
+            return NetstackInjectPacket(h, UnsafeMutablePointer(mutating: baseAddress.assumingMemoryBound(to: UInt8.self)), buffer.count)
         }
 
         if result != 0 {
