@@ -338,10 +338,18 @@ public actor TunnelManager {
     private func ensureWireChannelRegistered(for channel: String) async {
         let wireChannel = "tunnel-\(channel)"
         guard !registeredWireChannels.contains(wireChannel) else { return }
-        try? await provider.onChannel(wireChannel) { [weak self] machineId, data in
-            await self?.dispatchToSession(data, from: machineId, channel: channel)
+        do {
+            try await provider.onChannel(wireChannel) { [weak self] machineId, data in
+                await self?.dispatchToSession(data, from: machineId, channel: channel)
+            }
+            registeredWireChannels.insert(wireChannel)
+        } catch {
+            logger.error("Failed to register wire channel", metadata: [
+                "wireChannel": "\(wireChannel)",
+                "channel": "\(channel)",
+                "error": "\(error)"
+            ])
         }
-        registeredWireChannels.insert(wireChannel)
     }
 
     private func dispatchToSession(_ data: Data, from machineId: MachineId, channel: String) async {

@@ -734,6 +734,172 @@ final class TunnelSessionTests: XCTestCase {
 
         await manager.stop()
     }
+
+    // MARK: - Wire Channel Dispatch Tests
+
+    func testWireChannelStaysRegisteredWhenOneSessionCloses() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Two sessions on the same channel but different machines
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-2", channel: "data")
+
+        // Close one session
+        let key1 = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        await manager.closeSession(key: key1)
+
+        // Wire channel should still be registered (machine-2 still needs it)
+        let channels = await provider.getRegisteredChannels()
+        XCTAssertTrue(channels.contains("tunnel-data"))
+
+        await manager.stop()
+    }
+
+    func testWireChannelsDeregisteredOnStop() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-1", channel: "control")
+
+        let channelsBefore = await provider.getRegisteredChannels()
+        XCTAssertTrue(channelsBefore.contains("tunnel-data"))
+        XCTAssertTrue(channelsBefore.contains("tunnel-control"))
+
+        await manager.stop()
+
+        // All wire channels should be deregistered
+        let channelsAfter = await provider.getRegisteredChannels()
+        XCTAssertFalse(channelsAfter.contains("tunnel-data"))
+        XCTAssertFalse(channelsAfter.contains("tunnel-control"))
+        XCTAssertFalse(channelsAfter.contains("tunnel-handshake"))
+    }
+
+    func testDispatchRoutesToCorrectSession() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Two sessions on same channel, different machines
+        let session1 = try await manager.getSession(machineId: "machine-1", channel: "data")
+        let session2 = try await manager.getSession(machineId: "machine-2", channel: "data")
+
+        var received1: Data?
+        var received2: Data?
+        await session1.onReceive { data in received1 = data }
+        await session2.onReceive { data in received2 = data }
+
+        // Send to machine-1's session
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([0xAA]))
+
+        XCTAssertEqual(received1, Data([0xAA]))
+        XCTAssertNil(received2)
+
+        // Send to machine-2's session
+        await provider.simulateMessage(from: "machine-2", on: "tunnel-data", data: Data([0xBB]))
+
+        XCTAssertEqual(received2, Data([0xBB]))
+        // machine-1 should still have its original data
+        XCTAssertEqual(received1, Data([0xAA]))
+
+        await manager.stop()
+    }
+
+    func testDispatchDropsDataForUnknownMachine() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
+
+        var receivedData: Data?
+        await session.onReceive { data in receivedData = data }
+
+        // Message from unknown machine — should be silently dropped
+        await provider.simulateMessage(from: "unknown-machine", on: "tunnel-data", data: Data([0xFF]))
+
+        XCTAssertNil(receivedData)
+
+        await manager.stop()
+    }
+
+    func testDispatchAfterSessionCloseDropsData() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
+
+        var receivedData: Data?
+        await session.onReceive { data in receivedData = data }
+
+        // Close the session
+        let key = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        await manager.closeSession(key: key)
+
+        // Wire channel still registered, but session removed — data should be dropped
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([0xCC]))
+
+        XCTAssertNil(receivedData)
+
+        await manager.stop()
+    }
+
+    func testWireChannelRegisteredOnceForMultipleSessions() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create multiple sessions on the same channel
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-2", channel: "data")
+        _ = try await manager.getSession(machineId: "machine-3", channel: "data")
+
+        // Only one "tunnel-data" handler should be registered
+        let channels = await provider.getRegisteredChannels()
+        let dataCount = channels.filter { $0 == "tunnel-data" }.count
+        XCTAssertEqual(dataCount, 1)
+
+        await manager.stop()
+    }
+
+    func testWireChannelRegisteredForIncomingHandshake() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Simulate incoming session request
+        let handshake = SessionHandshake(type: .request, channel: "packet")
+        let data = try JSONEncoder().encode(handshake)
+        await provider.simulateMessage(from: "remote-peer", on: "tunnel-handshake", data: data)
+
+        // Wire channel should be registered for the accepted session's channel
+        let channels = await provider.getRegisteredChannels()
+        XCTAssertTrue(channels.contains("tunnel-packet"))
+
+        await manager.stop()
+    }
+
+    func testDispatchUpdatesSessionStats() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
+        await session.onReceive { _ in }
+
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([1, 2, 3]))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([4, 5]))
+
+        let stats = await session.stats
+        XCTAssertEqual(stats.packetsReceived, 2)
+        XCTAssertEqual(stats.bytesReceived, 5)
+
+        await manager.stop()
+    }
 }
 
 final class TunnelConfigTests: XCTestCase {
