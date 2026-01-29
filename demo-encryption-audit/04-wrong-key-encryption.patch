@@ -1,0 +1,30 @@
+diff --git a/Tests/OmertaMeshTests/DemoAttackTests.swift b/Tests/OmertaMeshTests/DemoAttackTests.swift
+index 3474e9e..63e31ae 100644
+--- a/Tests/OmertaMeshTests/DemoAttackTests.swift
++++ b/Tests/OmertaMeshTests/DemoAttackTests.swift
+@@ -35,6 +35,25 @@ final class DemoAttackTests: XCTestCase {
+         try? group.syncShutdownGracefully()
+         try await super.tearDown()
+     }
++    // Scenario 4: Bug uses a random session key instead of the network key
++    func testWrongKeyEncryption() async throws {
++        let keypair = IdentityKeypair()
++        let envelope = try MeshEnvelope.signed(
++            from: keypair,
++            machineId: UUID().uuidString,
++            to: nil,
++            payload: .data(Data("wrong key".utf8))
++        )
++        // BUG: random key -- recipients cannot decrypt
++        let randomKey = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
++        let sealed = try envelope.encodeV2(networkKey: randomKey)
++        try await socket.send(sealed, to: dest)
++        try await Task.sleep(nanoseconds: 10_000_000)
++        // Passes prefix and type system -- caught only by daemon decryption audit
++        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(sealed.data),
++            "Wrong-key packet passes prefix -- needs decryption audit")
++    }
++
+ }
+ 
+ #endif
