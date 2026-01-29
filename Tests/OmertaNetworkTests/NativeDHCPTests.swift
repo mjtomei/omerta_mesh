@@ -329,8 +329,8 @@ final class NativeDHCPServiceTests: XCTestCase {
         let request = DHCPRequest(machineId: "m1")
         _ = await service.handleRequest(request)
 
-        // Try to renew with wrong IP
-        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.199")
+        // Try to renew with an IP outside the pool range
+        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.50")
         let renewResponse = await service.handleRenewal(renewal)
 
         XCTAssertNil(renewResponse)
