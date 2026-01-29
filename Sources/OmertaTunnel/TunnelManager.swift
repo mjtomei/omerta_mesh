@@ -279,6 +279,8 @@ public actor TunnelManager {
     private func handleHealthFailure(machineId: MachineId) async {
         logger.warning("Health check failed for machine", metadata: ["machine": "\(machineId)"])
         await closeAllSessions(to: machineId)
+        // Remove dead monitor so new sessions get a fresh one
+        healthMonitors.removeValue(forKey: machineId)
     }
 
     private func reprobeAllMachines() async {
