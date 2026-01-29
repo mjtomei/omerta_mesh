@@ -498,16 +498,16 @@ The VM gets minimal host connectivity solely for mesh bootstrap:
 ```bash
 # Provider creates a TAP device for the VM in a restricted namespace
 ip tuntap add mode tap vm-tap-${VM_ID}
-ip addr add 192.168.100.1/30 dev vm-tap-${VM_ID}
+ip addr add 198.51.100.1/30 dev vm-tap-${VM_ID}
 ip link set vm-tap-${VM_ID} up
 
 # VM cloud-init configures its eth0:
-# - IP: 192.168.100.2/30
-# - Default route: 192.168.100.1
+# - IP: 198.51.100.2/30
+# - Default route: 198.51.100.1
 # - DNS: none (DNS goes through mesh after join)
 
-# Provider runs omertad on the host, listening on 192.168.100.1
-# VM's omertad bootstraps to 192.168.100.1:<port>
+# Provider runs omertad on the host, listening on 198.51.100.1
+# VM's omertad bootstraps to 198.51.100.1:<port>
 
 # After mesh join:
 # - omertad creates omerta0 TUN interface
@@ -539,9 +539,9 @@ write_files:
     content: |
       #!/bin/bash
       # Configure eth0 for mesh bootstrap only
-      ip addr add 192.168.100.2/30 dev eth0
+      ip addr add 198.51.100.2/30 dev eth0
       ip link set eth0 up
-      ip route add default via 192.168.100.1
+      ip route add default via 198.51.100.1
 
 bootcmd:
   - /etc/omerta/bootstrap-network.sh
@@ -556,8 +556,8 @@ omerta0 (10.0.x.x/16) — all application traffic
   - Default route for 10.0.0.0/16 → omerta0
   - Default route for 0.0.0.0/0 → omerta0 (internet via gateway)
 
-eth0 (192.168.100.2/30) — mesh UDP only
-  - Route to 192.168.100.1/30 → eth0 (bootstrap peer)
+eth0 (198.51.100.2/30) — mesh UDP only
+  - Route to 198.51.100.1/30 → eth0 (bootstrap peer)
   - No other routes on eth0
 ```
 

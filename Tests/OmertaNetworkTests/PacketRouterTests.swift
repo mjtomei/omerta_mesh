@@ -78,7 +78,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testExtractDestinationIP() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.1")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         let provider = MockChannelProvider(machineId: "m1")
         let tunnelManager = TunnelManager(provider: provider)
 
@@ -96,7 +96,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testInvalidPacketReturnsNil() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.1")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         let provider = MockChannelProvider(machineId: "m1")
         let tunnelManager = TunnelManager(provider: provider)
 
@@ -122,7 +122,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testRouteToLocal() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         let provider = MockChannelProvider(machineId: "m1")
@@ -156,7 +156,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testRouteToPeer() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         await vnet.registerAddress(ip: "10.0.0.10", machineId: "m2")
 
@@ -191,7 +191,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testRouteToGateway() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         await vnet.setGateway(machineId: "gateway-machine", ip: "10.0.0.1")
 
@@ -222,7 +222,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testDropPacketNoGateway() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         // No gateway configured
 
@@ -253,7 +253,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testStartStop() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         let provider = MockChannelProvider(machineId: "m1")
         let tunnelManager = TunnelManager(provider: provider)
 
@@ -274,7 +274,7 @@ final class PacketRouterTests: XCTestCase {
 
     func testMultiplePackets() async throws {
         let mockInterface = MockNetworkInterface(localIP: "10.0.0.5")
-        let vnet = VirtualNetwork(localMachineId: "m1")
+        let vnet = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         let provider = MockChannelProvider(machineId: "m1")
@@ -323,11 +323,11 @@ final class PacketRouterIntegrationTests: XCTestCase {
         let provider2 = MockChannelProvider(machineId: "m2")
 
         // Set up virtual networks
-        let vnet1 = VirtualNetwork(localMachineId: "m1")
+        let vnet1 = VirtualNetwork(localMachineId: "m1", config: .testDefault)
         await vnet1.setLocalAddress("10.0.0.1")
         await vnet1.registerAddress(ip: "10.0.0.2", machineId: "m2")
 
-        let vnet2 = VirtualNetwork(localMachineId: "m2")
+        let vnet2 = VirtualNetwork(localMachineId: "m2", config: .testDefault)
         await vnet2.setLocalAddress("10.0.0.2")
         await vnet2.registerAddress(ip: "10.0.0.1", machineId: "m1")
 

@@ -7,6 +7,12 @@ import Foundation
 
 /// Configuration for dnsmasq DHCP server
 public struct DHCPServerConfig: Sendable {
+    /// Default lease file path under the user's home directory
+    public static let defaultLeaseFilePath: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.omerta/dhcp/dnsmasq.leases"
+    }()
+
     /// The virtual network configuration (subnet, gateway IP, pool range)
     public let networkConfig: VirtualNetworkConfig
 
@@ -26,13 +32,13 @@ public struct DHCPServerConfig: Sendable {
     /// - Parameters:
     ///   - networkConfig: The virtual network configuration
     ///   - leaseDuration: Lease duration in seconds (default 3600 = 1 hour)
-    ///   - leaseFilePath: Path to store leases (default /var/lib/omerta/dnsmasq.leases)
+    ///   - leaseFilePath: Path to store leases (default ~/.omerta/dhcp/dnsmasq.leases)
     ///   - dnsServers: DNS servers to advertise (default empty, uses system)
     ///   - domainName: Optional domain name for the network
     public init(
         networkConfig: VirtualNetworkConfig,
         leaseDuration: TimeInterval = 3600,
-        leaseFilePath: String = "/var/lib/omerta/dnsmasq.leases",
+        leaseFilePath: String = DHCPServerConfig.defaultLeaseFilePath,
         dnsServers: [String] = [],
         domainName: String? = nil
     ) {

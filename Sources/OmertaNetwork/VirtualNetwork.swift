@@ -26,7 +26,7 @@ public actor VirtualNetwork {
     private var reverseMap: [MachineId: String] = [:]    // MachineId -> IP
     private var gatewayMachineId: MachineId?
 
-    public init(localMachineId: MachineId, config: VirtualNetworkConfig = .default) {
+    public init(localMachineId: MachineId, config: VirtualNetworkConfig) {
         self.localMachineId = localMachineId
         self.config = config
     }

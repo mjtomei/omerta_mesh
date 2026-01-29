@@ -7,7 +7,7 @@ import XCTest
 final class VirtualNetworkTests: XCTestCase {
 
     func testRouteToLocalAddress() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         let decision = await vnet.route(destinationIP: "10.0.0.5")
@@ -15,7 +15,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testRouteToPeer() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         await vnet.registerAddress(ip: "10.0.0.10", machineId: "peer-m")
 
@@ -24,7 +24,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testRouteToGateway() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         await vnet.setGateway(machineId: "gateway-m", ip: "10.0.0.1")
 
@@ -34,7 +34,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testRouteUnknownInSubnet() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         // Unknown IP in mesh range, no gateway
@@ -47,7 +47,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testRouteNoGateway() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         // External IP with no gateway
@@ -60,7 +60,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testAddressLookup() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.registerAddress(ip: "10.0.0.50", machineId: "m50")
 
         let machine = await vnet.lookupMachine(ip: "10.0.0.50")
@@ -71,7 +71,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testAddressLookupUnknown() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
 
         let m = await vnet.lookupMachine(ip: "10.0.0.99")
         XCTAssertNil(m)
@@ -80,7 +80,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testRemoveAddress() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.registerAddress(ip: "10.0.0.50", machineId: "m50")
 
         await vnet.removeAddress(machineId: "m50")
@@ -92,7 +92,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testSetLocalAddressRegistersInMaps() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
 
         let machine = await vnet.lookupMachine(ip: "10.0.0.5")
@@ -106,7 +106,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testSetGatewayRegistersAddress() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setGateway(machineId: "gw", ip: "10.0.0.1")
 
         let machine = await vnet.lookupMachine(ip: "10.0.0.1")
@@ -114,7 +114,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testGatewayRoutedAsPeer() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.5")
         await vnet.setGateway(machineId: "gw", ip: "10.0.0.1")
 
@@ -124,7 +124,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testMultiplePeers() async throws {
-        let vnet = VirtualNetwork(localMachineId: "local-m")
+        let vnet = VirtualNetwork(localMachineId: "local-m", config: .testDefault)
         await vnet.setLocalAddress("10.0.0.1")
         await vnet.registerAddress(ip: "10.0.0.2", machineId: "m2")
         await vnet.registerAddress(ip: "10.0.0.3", machineId: "m3")
@@ -145,7 +145,7 @@ final class VirtualNetworkTests: XCTestCase {
 
     func testSubnetCheck() async throws {
         // Custom config with 10.0.0.0/16
-        let config = VirtualNetworkConfig(subnet: "10.0.0.0", netmask: "255.255.0.0")
+        let config = VirtualNetworkConfig(subnet: "10.0.0.0", netmask: "255.255.0.0", prefixLength: 16, gatewayIP: "10.0.0.1", poolStart: "10.0.0.100", poolEnd: "10.0.255.254")
         let vnet = VirtualNetwork(localMachineId: "local-m", config: config)
         await vnet.setLocalAddress("10.0.0.5")
 
@@ -172,7 +172,7 @@ final class VirtualNetworkTests: XCTestCase {
     }
 
     func testVirtualNetworkConfigDefaults() {
-        let config = VirtualNetworkConfig.default
+        let config = VirtualNetworkConfig.testDefault
         XCTAssertEqual(config.subnet, "10.0.0.0")
         XCTAssertEqual(config.netmask, "255.255.0.0")
         XCTAssertEqual(config.prefixLength, 16)

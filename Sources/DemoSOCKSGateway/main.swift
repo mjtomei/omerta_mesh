@@ -119,23 +119,33 @@ killStaleInstances()
 
 logger.info("Setting up DemoSOCKSGateway...")
 
+// Auto-detect a non-conflicting subnet for the virtual network
+let vnetConfig = try VirtualNetworkConfig.autoDetect()
+let gwIP = vnetConfig.gatewayIP
+let peerIP = vnetConfig.poolStart
+logger.info("Virtual network: \(vnetConfig.subnet)/\(vnetConfig.prefixLength), gw=\(gwIP), peer=\(peerIP)")
+
 // 1. Peer node — runs SOCKS proxy, has a real netstack for TCP dial
-let peerBridge = try NetstackBridge(config: .init(gatewayIP: "10.0.0.100"))
-let peerInterface = NetstackInterface(localIP: "10.0.0.100", bridge: peerBridge)
+let peerBridge = try NetstackBridge(config: .init(gatewayIP: peerIP))
+let peerInterface = NetstackInterface(localIP: peerIP, bridge: peerBridge)
 
 // 2. Gateway node — real netstack bridge for internet access
-let gatewayBridge = try NetstackBridge(config: .init(gatewayIP: "10.200.0.1"))
+// Gateway netstack uses a separate internal IP for its own stack
+guard let gwNetstackIP = vnetConfig.internalIP() else {
+    fatalError("Failed to compute gateway netstack IP from subnet \(vnetConfig.subnet)")
+}
+let gatewayBridge = try NetstackBridge(config: .init(gatewayIP: gwNetstackIP))
 let gatewayService = GatewayService(bridge: gatewayBridge)
 
 // 3. Virtual networks
-let peerVNet = VirtualNetwork(localMachineId: "peer")
-await peerVNet.setLocalAddress("10.0.0.100")
-await peerVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
+let peerVNet = VirtualNetwork(localMachineId: "peer", config: vnetConfig)
+await peerVNet.setLocalAddress(peerIP)
+await peerVNet.setGateway(machineId: "gw", ip: gwIP)
 
-let gwVNet = VirtualNetwork(localMachineId: "gw")
-await gwVNet.setLocalAddress("10.0.0.1")
-await gwVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
-await gwVNet.registerAddress(ip: "10.0.0.100", machineId: "peer")
+let gwVNet = VirtualNetwork(localMachineId: "gw", config: vnetConfig)
+await gwVNet.setLocalAddress(gwIP)
+await gwVNet.setGateway(machineId: "gw", ip: gwIP)
+await gwVNet.registerAddress(ip: peerIP, machineId: "peer")
 
 // 4. Mock channel providers + in-process relay
 let peerProvider = E2EChannelProvider(machineId: "peer")
@@ -157,7 +167,7 @@ let peerRouter = PacketRouter(
 )
 
 let gwRouter = PacketRouter(
-    localInterface: NetstackInterface(localIP: "10.0.0.1", bridge: StubNetstackBridge()),
+    localInterface: NetstackInterface(localIP: gwIP, bridge: StubNetstackBridge()),
     virtualNetwork: gwVNet,
     tunnelManager: gwTunnelManager,
     gatewayService: gatewayService

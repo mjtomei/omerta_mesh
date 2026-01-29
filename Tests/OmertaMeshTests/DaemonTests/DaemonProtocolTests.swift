@@ -286,17 +286,20 @@ final class DaemonProtocolTests: XCTestCase {
 
     func testDaemonSocketPathsMeshDaemonControl() {
         let path = DaemonSocketPaths.meshDaemonControl(networkId: "test-network")
-        XCTAssertEqual(path, "/tmp/omerta-meshd-test-network.sock")
+        let socketDir = DaemonSocketPaths.socketDir
+        XCTAssertEqual(path, "\(socketDir)/omerta-meshd-test-network.sock")
     }
 
     func testDaemonSocketPathsMeshDaemonData() {
         let path = DaemonSocketPaths.meshDaemonData(networkId: "test-network")
-        XCTAssertEqual(path, "/tmp/omerta-meshd-test-network.data.sock")
+        let socketDir = DaemonSocketPaths.socketDir
+        XCTAssertEqual(path, "\(socketDir)/omerta-meshd-test-network.data.sock")
     }
 
     func testDaemonSocketPathsVMDaemonControl() {
         let path = DaemonSocketPaths.vmDaemonControl(networkId: "test-network")
-        XCTAssertEqual(path, "/tmp/omertad-test-network.sock")
+        let socketDir = DaemonSocketPaths.socketDir
+        XCTAssertEqual(path, "\(socketDir)/omertad-test-network.sock")
     }
 
     func testDaemonSocketPathsSanitizesNetworkId() {

@@ -406,7 +406,7 @@ sudo tcpdump -i any -n 'not port 18002'
 # Should show NO traffic from VM
 
 # In VM:
-ping 192.168.1.1          # Provider's LAN IP — should fail
+ping 192.0.2.1          # Provider's LAN IP — should fail
 cat /etc/resolv.conf       # Should show mesh gateway IP
 dig google.com             # Should work (via mesh to consumer)
 

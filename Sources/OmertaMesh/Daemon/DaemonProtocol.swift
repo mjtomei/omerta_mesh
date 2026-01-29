@@ -331,7 +331,7 @@ public struct ShareInviteResultData: Codable, Sendable, Equatable {
 /// Utilities for daemon socket paths
 public enum DaemonSocketPaths {
     /// Base directory for daemon sockets
-    public static let socketDir = "/tmp"
+    public static let socketDir = ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp"
 
     /// Control socket path for mesh daemon
     public static func meshDaemonControl(networkId: String) -> String {

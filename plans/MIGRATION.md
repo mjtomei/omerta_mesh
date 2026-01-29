@@ -43,7 +43,7 @@ Multiple networks can run simultaneously on the same machine, each as a separate
 | Layer | Isolation Mechanism |
 |-------|---------------------|
 | **Process** | Separate `omertad` process per network |
-| **Socket** | `/tmp/omertad-{networkId}.sock` per network |
+| **Socket** | `$TMPDIR/omertad-{networkId}.sock` per network |
 | **Persistence** | `~/.omerta/mesh/networks/{networkId}/` per network |
 | **Wire format** | Unencrypted network hash + authenticated encryption |
 
