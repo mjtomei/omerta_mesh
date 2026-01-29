@@ -1283,17 +1283,22 @@ do {
             }
         }
 
-        // Send traffic both directions
+        // Send traffic both directions — retry control message for lossy profiles
         await messageCounter.reset()
-        await sendControl("phase10-latency-start")
 
-        for i in 1...5 {
-            try? await session10.send(Data("A-latency-\(i)".utf8))
-            try await Task.sleep(for: .milliseconds(200))
+        var latencyAck = false
+        for attempt in 1...3 {
+            await sendControl("phase10-latency-start")
+
+            for i in 1...5 {
+                try? await session10.send(Data("A-latency-\(attempt)-\(i)".utf8))
+                try await Task.sleep(for: .milliseconds(200))
+            }
+
+            latencyAck = await waitForAck("phase10-latency-ack", timeout: .seconds(15))
+            if latencyAck { break }
+            logger.info("    Retry \(attempt)/3: no ack, resending...")
         }
-
-        // Wait for messages + ack
-        let latencyAck = await waitForAck("phase10-latency-ack", timeout: .seconds(30))
         try await Task.sleep(for: .seconds(2))
 
         let received = await messageCounter.count
