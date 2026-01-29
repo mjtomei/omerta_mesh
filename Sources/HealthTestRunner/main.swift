@@ -1081,16 +1081,29 @@ logPhase("Phase 10: Summary")
 await sendControl("done")
 _ = await waitForAck("done-ack", timeout: .seconds(10))
 
-// Verify network state matches initial snapshot
-logger.info("Capturing final network state...")
+// Verify test-specific network state is clean
+// Only check iptables rules (which we modify) and that our temp IP is gone.
+// Don't compare all IPs — other system processes may change unrelated interfaces.
+logger.info("Verifying test cleanup...")
 let finalNetworkState = await NetworkSnapshot.capture()
-if let diff = initialNetworkState.diff(against: finalNetworkState) {
-    logger.warning("NETWORK STATE CHANGED DURING TEST:")
-    logger.warning("\(diff)")
-    record("Network State Cleanup", passed: false, detail: "State differs from initial — see diff above")
+var cleanupIssues: [String] = []
+
+// Check iptables: our test rules reference the port
+let testRules = finalNetworkState.iptablesRules.split(separator: "\n").filter { $0.contains("--dport \(port)") }
+if !testRules.isEmpty {
+    cleanupIssues.append("Leftover iptables rules: \(testRules)")
+}
+
+// Check our temp IP from Phase 9 is removed
+if finalNetworkState.ipAddresses.contains("192.168.12.122") {
+    cleanupIssues.append("Temp IP 192.168.12.122 still present")
+}
+
+if cleanupIssues.isEmpty {
+    record("Network State Cleanup", passed: true, detail: "No test-specific artifacts remain")
 } else {
-    logger.info("Network state matches initial snapshot.")
-    record("Network State Cleanup", passed: true, detail: "iptables and IP addresses unchanged")
+    logger.warning("Cleanup issues: \(cleanupIssues)")
+    record("Network State Cleanup", passed: false, detail: cleanupIssues.joined(separator: "; "))
 }
 
 logger.info("")
