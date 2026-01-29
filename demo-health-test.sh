@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# run-health-test.sh — Build and run the cross-machine health monitoring test
+# demo-health-test.sh — Build and run the cross-machine health monitoring test
 #
 # Usage:
-#   ./scripts/run-health-test.sh <ssh-host> <remote-path>
+#   ./demo-health-test.sh <ssh-host> <remote-path>
 #
 # Arguments:
 #   ssh-host     SSH destination for the remote machine (e.g. "mac", "user@host")
@@ -46,7 +46,7 @@ if ssh "$REMOTE_HOST" "test -e '$REMOTE_PATH'" 2>/dev/null; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$SCRIPT_DIR"
 PRODUCT="HealthTestRunner"
 LOCAL_BIN="$HOME/.local/bin/$PRODUCT"
 PORT=18020
