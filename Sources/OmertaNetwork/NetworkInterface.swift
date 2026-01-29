@@ -14,6 +14,7 @@ public enum InterfaceError: Error, Sendable {
     case writeFailed(String)
     case dialFailed(String)
     case notSupported
+    case preflightFailed(String)
 }
 
 /// A TCP connection abstraction

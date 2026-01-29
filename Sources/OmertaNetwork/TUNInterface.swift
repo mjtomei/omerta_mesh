@@ -43,12 +43,37 @@ public actor TUNInterface: NetworkInterface {
         self.mtu = mtu
     }
 
+    /// Check that TUN device creation is possible on this system.
+    /// Call before start() to get clear error messages instead of opaque failures.
+    public static func preflight() throws {
+        guard Glibc.geteuid() == 0 else {
+            throw InterfaceError.preflightFailed(
+                "TUN interfaces require root. Run with sudo or as root.")
+        }
+        guard Glibc.access("/dev/net/tun", F_OK) == 0 else {
+            throw InterfaceError.preflightFailed(
+                "/dev/net/tun not found. The tun kernel module may not be loaded. "
+                + "Try: modprobe tun")
+        }
+        guard Glibc.access("/sbin/ip", X_OK) == 0 else {
+            throw InterfaceError.preflightFailed(
+                "/sbin/ip not found. Install iproute2 (e.g. apt install iproute2).")
+        }
+    }
+
     public func start() async throws {
         guard !started else { throw InterfaceError.alreadyStarted }
 
+        try Self.preflight()
+
         fd = open("/dev/net/tun", O_RDWR)
         guard fd >= 0 else {
-            throw InterfaceError.readFailed("Failed to open /dev/net/tun: errno \(errno)")
+            let e = errno
+            let hint = e == EACCES || e == EPERM
+                ? " (permission denied — run as root)"
+                : e == ENOENT ? " (device not found — load tun module)" : ""
+            throw InterfaceError.readFailed(
+                "Failed to open /dev/net/tun: \(String(cString: strerror(e)))\(hint)")
         }
 
         // Configure TUN device
@@ -65,10 +90,14 @@ public actor TUNInterface: NetworkInterface {
         }
 
         guard Glibc.ioctl(fd, TUNSETIFF, &ifr) >= 0 else {
-            let err = errno
+            let e = errno
             Glibc.close(fd)
             fd = -1
-            throw InterfaceError.readFailed("ioctl TUNSETIFF failed: errno \(err)")
+            let hint = e == EPERM
+                ? " (permission denied — run as root)"
+                : e == EBUSY ? " (device \(name) already in use)" : ""
+            throw InterfaceError.readFailed(
+                "ioctl TUNSETIFF failed for '\(name)': \(String(cString: strerror(e)))\(hint)")
         }
 
         // Configure IP address and bring interface up
@@ -183,8 +212,9 @@ public actor TUNInterface: NetworkInterface {
             proc.waitUntilExit()
             guard proc.terminationStatus == 0 else {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                let errStr = String(data: errData, encoding: .utf8) ?? ""
-                throw InterfaceError.readFailed("ip command failed: \(errStr)")
+                let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let cmd = "ip " + args.joined(separator: " ")
+                throw InterfaceError.readFailed("'\(cmd)' failed (exit \(proc.terminationStatus)): \(errStr)")
             }
         }
 

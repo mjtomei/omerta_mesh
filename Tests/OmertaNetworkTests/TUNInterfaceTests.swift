@@ -20,6 +20,41 @@ final class TUNInterfaceTests: XCTestCase {
         }
     }
 
+    // MARK: - Preflight
+
+    func testPreflightRejectsNonRoot() throws {
+        guard Glibc.geteuid() != 0 else {
+            throw XCTSkip("Test only runs as non-root")
+        }
+        do {
+            try TUNInterface.preflight()
+            XCTFail("preflight should throw for non-root")
+        } catch let error as InterfaceError {
+            guard case .preflightFailed(let msg) = error else {
+                XCTFail("Expected preflightFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(msg.contains("root"), "Message should mention root: \(msg)")
+        }
+    }
+
+    func testPreflightRejectsMissingTUN() throws {
+        guard Glibc.access("/dev/net/tun", F_OK) != 0 else {
+            throw XCTSkip("/dev/net/tun is available — cannot test missing device")
+        }
+        // If we're also non-root, the root check fires first.
+        // That's fine — we just verify preflight throws preflightFailed.
+        do {
+            try TUNInterface.preflight()
+            XCTFail("preflight should throw when /dev/net/tun is missing")
+        } catch let error as InterfaceError {
+            guard case .preflightFailed = error else {
+                XCTFail("Expected preflightFailed, got \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - Lifecycle
 
     func testTUNCreation() async throws {
@@ -170,8 +205,6 @@ final class TUNInterfaceTests: XCTestCase {
 
         let tun = TUNInterface(name: "omerta-t7", ip: "10.99.7.1")
         let bridge = TUNBridgeAdapter(tun: tun)
-        try await bridge.start()
-        defer { Task { await bridge.stop() } }
 
         let expectation = XCTestExpectation(description: "ICMP reply via callback")
         await bridge.setReturnCallback { packet in
@@ -180,6 +213,9 @@ final class TUNInterfaceTests: XCTestCase {
                 expectation.fulfill()
             }
         }
+
+        try await bridge.start()
+        defer { Task { await bridge.stop() } }
 
         // Build and inject a minimal ICMP echo request
         let icmpPacket = Self.buildICMPEchoRequest(src: "10.99.7.2", dst: "10.99.7.1")
