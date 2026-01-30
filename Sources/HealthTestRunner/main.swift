@@ -685,15 +685,24 @@ actor BandwidthMeasurer {
     }
 }
 
+struct BandwidthResult {
+    let packetSize: Int
+    let mbps: Double
+}
+
 struct PerfSummary {
-    var vanillaBandwidthMbps: Double = 0
+    var vanillaBandwidth: [BandwidthResult] = []
     var vanillaLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
-    var meshBandwidthMbps: Double = 0
+    var meshBandwidth: [BandwidthResult] = []
     var meshLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
     var meshHistogram: [(label: String, count: Int)] = []
     var recoveryPreSwapMedian: Double = 0
     var recoveryPeakLatency: Double = 0
     var recoveryTimeSeconds: Double = 0
+
+    // Best bandwidth for the overhead comparison
+    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.mbps).max() ?? 0 }
+    var meshBandwidthMbps: Double { meshBandwidth.map(\.mbps).max() ?? 0 }
 }
 
 let latencyBuckets: [(label: String, range: Range<Double>)] = [
@@ -1597,35 +1606,39 @@ do {
     let vanillaLatCount = await vanillaLatencyCollector.count
     logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
 
-    // Bandwidth: 5000 × 1400-byte datagrams (fits in single Ethernet frame, no fragmentation)
-    let bwPayload = Data(repeating: 0xAA, count: 1400)
-    let bwPacketCount = 5000
-    let bwClock = ContinuousClock()
-    let bwStart = bwClock.now
-    for i in 1...bwPacketCount {
-        let buf = vanillaChannel.allocator.buffer(bytes: bwPayload)
-        let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
-        // Batch: write without flush, flush every 50 packets
-        if i % 50 == 0 || i == bwPacketCount {
-            try? await vanillaChannel.writeAndFlush(envelope)
-        } else {
-            vanillaChannel.write(envelope, promise: nil)
+    // Bandwidth: sweep multiple packet sizes
+    let bwPacketSizes = [64, 256, 512, 1024, 1400]
+    let bwTargetBytes: UInt64 = 7_000_000  // ~7MB per size
+    for pktSize in bwPacketSizes {
+        let bwPayload = Data(repeating: 0xAA, count: pktSize)
+        let bwPacketCount = Int(bwTargetBytes / UInt64(pktSize))
+        let bwClock = ContinuousClock()
+        let bwStart = bwClock.now
+        for i in 1...bwPacketCount {
+            let buf = vanillaChannel.allocator.buffer(bytes: bwPayload)
+            let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
+            if i % 50 == 0 || i == bwPacketCount {
+                try? await vanillaChannel.writeAndFlush(envelope)
+            } else {
+                vanillaChannel.write(envelope, promise: nil)
+            }
         }
+        let bwElapsed = bwClock.now - bwStart
+        let totalBytes = UInt64(bwPacketCount) * UInt64(pktSize)
+        let durationSec = Double(bwElapsed.components.seconds) + Double(bwElapsed.components.attoseconds) / 1e18
+        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: pktSize, mbps: mbps))
+        logger.info("Vanilla bandwidth (\(pktSize)B): \(String(format: "%.1f", mbps)) Mbps (\(bwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
     }
-    let bwElapsed = bwClock.now - bwStart
-    let vanillaSendBytes: UInt64 = UInt64(bwPacketCount) * 1400
-    let vanillaDurationSec = Double(bwElapsed.components.seconds) + Double(bwElapsed.components.attoseconds) / 1e18
-    let vanillaMbps = vanillaDurationSec > 0 ? (Double(vanillaSendBytes) * 8.0 / 1_000_000.0 / vanillaDurationSec) : 0
-    perfSummary.vanillaBandwidthMbps = vanillaMbps
-    logger.info("Vanilla bandwidth: \(String(format: "%.1f", vanillaMbps)) Mbps")
 
     try? await vanillaChannel.close()
     try? await vanillaGroup.shutdownGracefully()
 
     await sendControl("phase11-vanilla-done")
+    let bestVanillaMbps = perfSummary.vanillaBandwidthMbps
     let phase11Pass = vanillaLatCount >= 100
     record("Phase 11: Vanilla Baseline", passed: phase11Pass,
-           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, bw=\(String(format: "%.1f", vanillaMbps))Mbps, \(vanillaLatCount) samples")
+           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, best bw=\(String(format: "%.1f", bestVanillaMbps))Mbps, \(vanillaLatCount) samples")
 } catch {
     record("Phase 11: Vanilla Baseline", passed: false, detail: "Error: \(error)")
 }
@@ -1640,20 +1653,23 @@ do {
     let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
     try await Task.sleep(for: .seconds(1))
 
-    let meshBwPayload = Data(repeating: 0xBB, count: 1400)
-    let meshBwPacketCount = 5000
-    let clock = ContinuousClock()
-    let start = clock.now
-
-    for _ in 1...meshBwPacketCount {
-        try await bwSession.send(meshBwPayload)
+    let meshBwPacketSizes = [64, 256, 512, 1024, 1400]
+    let meshBwTargetBytes: UInt64 = 7_000_000
+    for pktSize in meshBwPacketSizes {
+        let meshBwPayload = Data(repeating: 0xBB, count: pktSize)
+        let meshBwPacketCount = Int(meshBwTargetBytes / UInt64(pktSize))
+        let clock = ContinuousClock()
+        let start = clock.now
+        for _ in 1...meshBwPacketCount {
+            try await bwSession.send(meshBwPayload)
+        }
+        let elapsed = clock.now - start
+        let totalBytes = UInt64(meshBwPacketCount) * UInt64(pktSize)
+        let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        perfSummary.meshBandwidth.append(BandwidthResult(packetSize: pktSize, mbps: mbps))
+        logger.info("Mesh bandwidth (\(pktSize)B): \(String(format: "%.1f", mbps)) Mbps (\(meshBwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
     }
-
-    let elapsed = clock.now - start
-    let elapsedSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-    let sentBytes: UInt64 = UInt64(meshBwPacketCount) * 1400
-    let meshMbps = elapsedSec > 0 ? (Double(sentBytes) * 8.0 / 1_000_000.0 / elapsedSec) : 0
-    perfSummary.meshBandwidthMbps = meshMbps
 
     try await Task.sleep(for: .seconds(2))
     await sendControl("phase12-bw-done")
@@ -1662,9 +1678,10 @@ do {
     let bwReport = await controlMailbox.receive(timeout: .seconds(15))
     let bRecvBytes = bwReport.flatMap { UInt64($0.detail ?? "") } ?? 0
 
-    logger.info("Mesh bandwidth: \(String(format: "%.1f", meshMbps)) Mbps (B received \(bRecvBytes) bytes)")
-    record("Phase 12: Mesh Bandwidth", passed: meshMbps > 0,
-           detail: "\(String(format: "%.1f", meshMbps)) Mbps, B received \(bRecvBytes) bytes")
+    let bestMeshMbps = perfSummary.meshBandwidthMbps
+    logger.info("Mesh bandwidth best: \(String(format: "%.1f", bestMeshMbps)) Mbps (B received \(bRecvBytes) bytes)")
+    record("Phase 12: Mesh Bandwidth", passed: bestMeshMbps > 0,
+           detail: "best=\(String(format: "%.1f", bestMeshMbps)) Mbps, B received \(bRecvBytes) bytes")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
 }
@@ -1910,8 +1927,6 @@ if cleanupIssues.isEmpty {
 logger.info("")
 logger.info("=== PERFORMANCE SUMMARY ===")
 do {
-    let vBw = perfSummary.vanillaBandwidthMbps
-    let mBw = perfSummary.meshBandwidthMbps
     let vL50 = perfSummary.vanillaLatency.p50
     let vL95 = perfSummary.vanillaLatency.p95
     let vL99 = perfSummary.vanillaLatency.p99
@@ -1919,13 +1934,26 @@ do {
     let mL95 = perfSummary.meshLatency.p95
     let mL99 = perfSummary.meshLatency.p99
 
-    let bwOverhead = vBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
     let l50Overhead = vL50 > 0 ? String(format: "%.1fx", mL50 / vL50) : "N/A"
     let l95Overhead = vL95 > 0 ? String(format: "%.1fx", mL95 / vL95) : "N/A"
     let l99Overhead = vL99 > 0 ? String(format: "%.1fx", mL99 / vL99) : "N/A"
 
+    // Bandwidth by packet size
+    logger.info("")
+    logger.info("=== BANDWIDTH BY PACKET SIZE ===")
+    logger.info("Packet Size    Vanilla (Mbps)    Mesh (Mbps)    Overhead")
+    let allSizes = Set(perfSummary.vanillaBandwidth.map(\.packetSize) + perfSummary.meshBandwidth.map(\.packetSize)).sorted()
+    for size in allSizes {
+        let vBw = perfSummary.vanillaBandwidth.first(where: { $0.packetSize == size })?.mbps ?? 0
+        let mBw = perfSummary.meshBandwidth.first(where: { $0.packetSize == size })?.mbps ?? 0
+        let overhead = vBw > 0 && mBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
+        logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))      \(String(format: "%10.1f", mBw))      \(overhead)")
+    }
+
+    // Latency comparison
+    logger.info("")
+    logger.info("=== LATENCY COMPARISON ===")
     logger.info("                    Vanilla (Direct)    Mesh Tunnel    Overhead")
-    logger.info("Bandwidth (Mbps)    \(String(format: "%8.1f", vBw))            \(String(format: "%8.1f", mBw))       \(bwOverhead)")
     logger.info("Latency p50 (us)    \(String(format: "%8.0f", vL50))            \(String(format: "%8.0f", mL50))       \(l50Overhead)")
     logger.info("Latency p95 (us)    \(String(format: "%8.0f", vL95))            \(String(format: "%8.0f", mL95))       \(l95Overhead)")
     logger.info("Latency p99 (us)    \(String(format: "%8.0f", vL99))            \(String(format: "%8.0f", mL99))       \(l99Overhead)")
