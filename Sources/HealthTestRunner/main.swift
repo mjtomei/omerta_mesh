@@ -1283,6 +1283,11 @@ if !isNodeA {
             await sendControl("done-ack")
             break
 
+        case "keepalive":
+            // Silently ignore — keepalive is just to keep health monitors alive,
+            // no ack needed (acks flood the control mailbox)
+            continue
+
         default:
             logger.info("Node B: unknown command '\(cmd.phase)', acking")
             await sendControl("\(cmd.phase)-ack")
@@ -1842,11 +1847,12 @@ record("Phase 10: Latency & Jitter", passed: true,
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
 // During vanilla/TCP/mesh bandwidth phases, no normal tunnel traffic flows.
-// Send periodic keepalive control messages so both sides' health monitors stay alive.
+// Send periodic raw keepalive packets (not control messages) so both sides'
+// health monitors stay alive without flooding the control mailbox.
 let bwKeepaliveTask = Task {
     while !Task.isCancelled {
         try? await Task.sleep(for: .milliseconds(400))
-        await sendControl("keepalive")
+        try? await mesh.sendOnChannel(Data([0x00]), toMachine: remoteMachineId, channel: "health-keepalive")
     }
 }
 logger.info("Started bandwidth keepalive task")
