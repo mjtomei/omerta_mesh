@@ -34,8 +34,8 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-TMPLOG=$(mktemp /tmp/demo-tun-gw.XXXXXX)
-SYSCTL_SAVE="/tmp/demo-tun-gw-sysctl-saved"
+TMPLOG=$(mktemp "${TMPDIR:-/tmp}/demo-tun-gw.XXXXXX")
+SYSCTL_SAVE="${TMPDIR:-/tmp}/demo-tun-gw-sysctl-saved"
 SERVER_PID=""
 
 print_kernel_state() {

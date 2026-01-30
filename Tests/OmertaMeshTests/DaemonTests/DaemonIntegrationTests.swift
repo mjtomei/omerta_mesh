@@ -8,7 +8,7 @@ final class DaemonIntegrationTests: XCTestCase {
 
     // Test socket path
     var testSocketPath: String {
-        "/tmp/omerta-integration-test-\(UUID().uuidString.prefix(8)).sock"
+        "\(NSTemporaryDirectory())omerta-integration-test-\(UUID().uuidString.prefix(8)).sock"
     }
 
     // MARK: - Full Command Round-Trip Tests
@@ -242,8 +242,9 @@ final class DaemonIntegrationTests: XCTestCase {
         let controlPath = DaemonSocketPaths.meshDaemonControl(networkId: networkId)
         let dataPath = DaemonSocketPaths.meshDaemonData(networkId: networkId)
 
-        XCTAssertEqual(controlPath, "/tmp/omerta-meshd-my-test-network.sock")
-        XCTAssertEqual(dataPath, "/tmp/omerta-meshd-my-test-network.data.sock")
+        let socketDir = DaemonSocketPaths.socketDir
+        XCTAssertEqual(controlPath, "\(socketDir)/omerta-meshd-my-test-network.sock")
+        XCTAssertEqual(dataPath, "\(socketDir)/omerta-meshd-my-test-network.data.sock")
     }
 
     func testSocketExistsCheck() async throws {

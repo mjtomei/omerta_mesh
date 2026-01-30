@@ -161,7 +161,8 @@ extension MeshDaemonConfig {
 
     /// Get default PID file path for a network
     public static func defaultPidFilePath(networkId: String) -> String {
-        "/tmp/omerta-meshd-\(networkId).pid"
+        let tmpDir = ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp"
+        return "\(tmpDir)/omerta-meshd-\(networkId).pid"
     }
 }
 

@@ -57,8 +57,8 @@ fi
 
 # Patterns that indicate sensitive data
 PATTERNS=(
-    # Private keys
-    'PRIVATE KEY'
+    # Private keys (require PEM header to avoid matching variable names like privateKeyData)
+    '-----BEGIN.*PRIVATE KEY'
     'BEGIN RSA'
     'BEGIN DSA'
     'BEGIN EC PRIVATE'
@@ -169,12 +169,16 @@ done
 # These patterns catch hardcoded LAN IPs, firewall manipulation, traffic control,
 # and other machine-specific network state that should not be committed.
 
-NETWORK_PATTERNS=(
+NETWORK_IP_PATTERNS=(
     # Private/LAN IPv4 addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
     '192\.168\.[0-9]+\.[0-9]+'
     '\b10\.[0-9]+\.[0-9]+\.[0-9]+'
     '172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+'
+)
 
+# Firewall tools, interface names, and routing commands.
+# Checked in all files except those in NETWORK_TOOL_WHITELIST below.
+NETWORK_TOOL_PATTERNS=(
     # Firewall manipulation
     '\biptables\b'
     '\bip6tables\b'
@@ -198,10 +202,9 @@ NETWORK_PATTERNS=(
     '\bifconfig\b.*\b(up|down|add|delete)\b'
 
     # SSH to hardcoded hosts with sudo (machine-specific orchestration)
-    # Allows ssh "$VAR" sudo (variable hosts) but blocks ssh myhost sudo (literal hosts)
     '\bssh\s+[^"$][^[:space:]]*\s+"?sudo\b'
 
-    # Machine-specific hostnames and paths
+    # Machine-specific interface names
     '\b(en[opsx][0-9]+s[0-9]+|eth[0-9]+|wlan[0-9]+)\b'
 )
 
@@ -221,16 +224,17 @@ for file in $STAGED_FILES; do
         continue
     fi
 
+    # Skip test files (test fixtures use private IPs for virtual network testing)
+    if [[ "$file" =~ ^Tests/ ]]; then
+        continue
+    fi
+
     # Skip if file doesn't exist (deleted)
     [ -f "$file" ] || continue
 
-    for pattern in "${NETWORK_PATTERNS[@]}"; do
-        # For IP address patterns, exclude RFC 5737 documentation IPs
-        if [[ "$pattern" == *'192\.'* ]] || [[ "$pattern" == *'10\.'* ]] || [[ "$pattern" == *'172\.'* ]]; then
-            MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null | grep -vE "$SAFE_IP_EXCLUDE" || true)
-        else
-            MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null || true)
-        fi
+    # Check IP patterns (all files, excluding RFC 5737 documentation IPs)
+    for pattern in "${NETWORK_IP_PATTERNS[@]}"; do
+        MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null | grep -vE "$SAFE_IP_EXCLUDE" || true)
         if [ -n "$MATCHES" ]; then
             echo "ERROR: Local network state in $file"
             echo "  Pattern: $pattern"
@@ -240,6 +244,30 @@ for file in $STAGED_FILES; do
             FOUND=1
         fi
     done
+
+    # Check network tool patterns (firewall, interfaces, routing) in all files
+    # except whitelisted implementation files that legitimately use these tools
+    NETWORK_TOOL_WHITELIST=(
+        'Sources/OmertaNetwork/KernelNetworking.swift'   # firewall backend implementation
+        'Sources/DemoTUNGateway/main.swift'               # outbound interface detection
+        'Sources/HealthTestRunner/main.swift'             # network fault injection for tests
+    )
+    SKIP_TOOL_CHECK=0
+    for wl in "${NETWORK_TOOL_WHITELIST[@]}"; do
+        if [[ "$file" == "$wl" ]]; then SKIP_TOOL_CHECK=1; break; fi
+    done
+    if [ $SKIP_TOOL_CHECK -eq 0 ]; then
+        for pattern in "${NETWORK_TOOL_PATTERNS[@]}"; do
+            MATCHES=$(grep -nE "$pattern" "$file" 2>/dev/null || true)
+            if [ -n "$MATCHES" ]; then
+                echo "ERROR: Local network state in $file"
+                echo "  Pattern: $pattern"
+                echo "  Scripts with machine-specific network state should not be committed."
+                echo "$MATCHES" | head -3 | sed 's/^/  /'
+                FOUND=1
+            fi
+        done
+    fi
 done
 
 # =============================================================================
@@ -260,6 +288,12 @@ ABSPATH_PATTERNS=(
 # Lines to exclude (shebangs, comments referencing standard paths, build system)
 ABSPATH_EXCLUDE='(^#!|^[0-9]+:[[:space:]]*(#|//|/\*)|/usr/bin|/usr/lib|/usr/local|/usr/share|Package\.resolved|\.build/)'
 
+# Files that legitimately reference system paths (e.g. binary lookups, lease storage)
+ABSPATH_WHITELIST=(
+    'Sources/OmertaNetwork/KernelNetworking.swift'    # /sbin/iptables, /usr/sbin/nft, /proc/sys
+    'Sources/OmertaNetwork/DHCPServerManager.swift'    # /opt/homebrew/sbin/dnsmasq binary search
+)
+
 for file in $STAGED_FILES; do
     # Skip binary files
     if [[ "$file" =~ \.(png|jpg|gif|ico|woff|ttf|eot|pdf|zip|tar|gz|exe|dll|so|dylib)$ ]]; then
@@ -273,6 +307,13 @@ for file in $STAGED_FILES; do
 
     # Skip if file doesn't exist (deleted)
     [ -f "$file" ] || continue
+
+    # Skip whitelisted files that legitimately reference system paths
+    SKIP_ABSPATH=0
+    for wl in "${ABSPATH_WHITELIST[@]}"; do
+        if [[ "$file" == "$wl" ]]; then SKIP_ABSPATH=1; break; fi
+    done
+    [ $SKIP_ABSPATH -eq 1 ] && continue
 
     for pattern in "${ABSPATH_PATTERNS[@]}"; do
         # Find matches, then exclude known-safe lines
@@ -292,5 +333,8 @@ if [ $FOUND -eq 1 ]; then
     echo "Commit blocked. Remove sensitive data or use: git commit --no-verify"
     exit 1
 fi
+
+# Auto-correct stale .commit hashes (top-level repo only; no-op in sub-repos)
+[ -x "$REPO_ROOT/scripts/update-commit-hashes.sh" ] && "$REPO_ROOT/scripts/update-commit-hashes.sh"
 
 exit 0

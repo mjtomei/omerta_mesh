@@ -3004,11 +3004,11 @@ Wires together all components built in Phases 1–9:
 
 **Setup:**
 ```bash
-# On local (192.168.1.10)
+# On local (192.0.2.10)
 cd ~/omerta
 swift build
 
-# On arch-home (192.168.1.20)
+# On arch-home (192.0.2.20)
 ssh arch-home
 cd ~/omerta-native
 git pull origin master
@@ -3025,7 +3025,7 @@ swift build
 
 # Terminal 2 - arch-home as peer
 ssh arch-home
-./.build/debug/omertad start --port 18002 --bootstrap "abc123...@192.168.1.10:18002"
+./.build/debug/omertad start --port 18002 --bootstrap "abc123...@192.0.2.10:18002"
 
 # Verify mesh connection
 # On local:
@@ -3079,12 +3079,12 @@ ssh arch-home
 
 # Terminal 2 - arch-home
 ssh arch-home
-./.build/debug/omertad start --port 18002 --bootstrap "<local>@192.168.1.10:18002"
+./.build/debug/omertad start --port 18002 --bootstrap "<local>@192.0.2.10:18002"
 
 # Terminal 3 - Mac
 ssh mac
 cd ~/omerta
-./build/debug/omertad start --port 18002 --bootstrap "<local>@192.168.1.10:18002"
+./build/debug/omertad start --port 18002 --bootstrap "<local>@192.0.2.10:18002"
 
 # Verify all three connected
 ./build/debug/omerta mesh status
@@ -3141,7 +3141,7 @@ sudo ./build/debug/omertad start --port 18002 --gateway --vpn
 
 # Terminal 2 - arch-home with TUN
 ssh arch-home
-sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.168.1.10:18002"
+sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.0.2.10:18002"
 
 # Standard ping should work
 # On arch-home:
@@ -3175,7 +3175,7 @@ ssh user@10.0.0.100
 
 # Terminal 2 - arch-home with TUN
 ssh arch-home
-sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.168.1.10:18002"
+sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.0.2.10:18002"
 
 # Set default route through mesh
 sudo ip route add default via 10.0.0.1 dev omerta0
@@ -3199,14 +3199,14 @@ curl -I https://google.com
 ```bash
 # Terminal 1 - arch-home with TUN (sshd running)
 ssh arch-home
-sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.168.1.10:18002"
+sudo ./.build/debug/omertad start --port 18002 --vpn --bootstrap "<local>@192.0.2.10:18002"
 
 # Terminal 2 - Local as gateway
 ./build/debug/omertad start --port 18002 --gateway
 
 # Terminal 3 - Mac userspace
 ssh mac
-./build/debug/omertad start --port 18002 --bootstrap "<local>@192.168.1.10:18002"
+./build/debug/omertad start --port 18002 --bootstrap "<local>@192.0.2.10:18002"
 
 # Mac gets IP via DHCP
 ./build/debug/omerta network address
@@ -3473,10 +3473,10 @@ swift test
 ./build/debug/omertad start --port 18002 --gateway
 
 # arch-home:
-./.build/debug/omertad start --port 18002 --bootstrap "<local>@192.168.1.10:18002"
+./.build/debug/omertad start --port 18002 --bootstrap "<local>@192.0.2.10:18002"
 
 # Mac:
-./build/debug/omertad start --port 18002 --bootstrap "<local>@192.168.1.10:18002"
+./build/debug/omertad start --port 18002 --bootstrap "<local>@192.0.2.10:18002"
 
 # Status commands
 ./build/debug/omerta mesh status

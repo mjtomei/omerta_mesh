@@ -17,7 +17,7 @@ final class DHCPServerConfigTests: XCTestCase {
         let config = DHCPServerConfig(
             networkConfig: networkConfig,
             leaseDuration: 3600,
-            leaseFilePath: "/tmp/test.leases"
+            leaseFilePath: "\(NSTemporaryDirectory())test.leases"
         )
         let output = config.generateDnsmasqConfig(interfaceName: "omerta0")
 
@@ -25,7 +25,7 @@ final class DHCPServerConfigTests: XCTestCase {
         XCTAssertTrue(output.contains("bind-interfaces"))
         XCTAssertTrue(output.contains("dhcp-range=10.42.0.100,10.42.255.254,255.255.0.0,3600s"))
         XCTAssertTrue(output.contains("dhcp-option=option:router,10.42.0.1"))
-        XCTAssertTrue(output.contains("dhcp-leasefile=/tmp/test.leases"))
+        XCTAssertTrue(output.contains("dhcp-leasefile=\(NSTemporaryDirectory())test.leases"))
         XCTAssertTrue(output.contains("no-daemon"))
         XCTAssertTrue(output.contains("log-dhcp"))
     }
@@ -42,7 +42,7 @@ final class DHCPServerConfigTests: XCTestCase {
         let config = DHCPServerConfig(
             networkConfig: networkConfig,
             leaseDuration: 3600,
-            leaseFilePath: "/tmp/test.leases",
+            leaseFilePath: "\(NSTemporaryDirectory())test.leases",
             dnsServers: ["8.8.8.8", "8.8.4.4"]
         )
         let output = config.generateDnsmasqConfig(interfaceName: "omerta0")
@@ -62,7 +62,7 @@ final class DHCPServerConfigTests: XCTestCase {
         let config = DHCPServerConfig(
             networkConfig: networkConfig,
             leaseDuration: 3600,
-            leaseFilePath: "/tmp/test.leases",
+            leaseFilePath: "\(NSTemporaryDirectory())test.leases",
             domainName: "omerta.local"
         )
         let output = config.generateDnsmasqConfig(interfaceName: "omerta0")
@@ -82,7 +82,7 @@ final class DHCPServerConfigTests: XCTestCase {
         let config = DHCPServerConfig(
             networkConfig: networkConfig,
             leaseDuration: 7200,  // 2 hours
-            leaseFilePath: "/tmp/test.leases"
+            leaseFilePath: "\(NSTemporaryDirectory())test.leases"
         )
         let output = config.generateDnsmasqConfig(interfaceName: "omerta0")
 
@@ -101,7 +101,7 @@ final class DHCPServerConfigTests: XCTestCase {
         let config = DHCPServerConfig(networkConfig: networkConfig)
 
         XCTAssertEqual(config.leaseDuration, 3600)
-        XCTAssertEqual(config.leaseFilePath, "/var/lib/omerta/dnsmasq.leases")
+        XCTAssertEqual(config.leaseFilePath, DHCPServerConfig.defaultLeaseFilePath)
         XCTAssertTrue(config.dnsServers.isEmpty)
         XCTAssertNil(config.domainName)
     }
@@ -283,7 +283,7 @@ final class DHCPServerManagerTests: XCTestCase {
             poolStart: "10.42.0.100",
             poolEnd: "10.42.255.254"
         ))
-        let leaseFile = "/tmp/omerta-test-nonexistent-\(UUID().uuidString).leases"
+        let leaseFile = "\(NSTemporaryDirectory())omerta-test-nonexistent-\(UUID().uuidString).leases"
         let config = DHCPServerConfig(
             networkConfig: networkConfig,
             leaseFilePath: leaseFile
@@ -304,7 +304,7 @@ final class DHCPServerManagerTests: XCTestCase {
             poolStart: "10.42.0.100",
             poolEnd: "10.42.255.254"
         ))
-        let leaseFile = "/tmp/omerta-test-leases-\(UUID().uuidString).leases"
+        let leaseFile = "\(NSTemporaryDirectory())omerta-test-leases-\(UUID().uuidString).leases"
         defer { try? FileManager.default.removeItem(atPath: leaseFile) }
 
         // Create a test lease file in dnsmasq format
@@ -345,7 +345,7 @@ final class DHCPServerManagerTests: XCTestCase {
             poolStart: "10.42.0.100",
             poolEnd: "10.42.255.254"
         ))
-        let leaseFile = "/tmp/omerta-test-leases-\(UUID().uuidString).leases"
+        let leaseFile = "\(NSTemporaryDirectory())omerta-test-leases-\(UUID().uuidString).leases"
         defer { try? FileManager.default.removeItem(atPath: leaseFile) }
 
         // One valid, one expired

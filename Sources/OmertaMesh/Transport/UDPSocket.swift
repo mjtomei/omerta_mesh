@@ -273,7 +273,7 @@ public actor UDPSocket {
 
     /// Parse an endpoint string into a SocketAddress
     /// Supports:
-    /// - IPv4: "192.168.1.1:5000"
+    /// - IPv4: "192.0.2.1:5000"
     /// - IPv6: "[::1]:5000" or "::1:5000" (if unambiguous)
     /// - Hostname: "example.com:5000"
     private func parseEndpoint(_ endpoint: String) throws -> SocketAddress {

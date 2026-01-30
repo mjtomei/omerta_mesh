@@ -63,7 +63,8 @@ public actor DHCPServerManager {
     /// - Parameter config: The DHCP server configuration
     public init(config: DHCPServerConfig) {
         self.config = config
-        self.configFilePath = "/tmp/omerta-dnsmasq-\(UUID().uuidString).conf"
+        let tmpDir = ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp"
+        self.configFilePath = "\(tmpDir)/omerta-dnsmasq-\(UUID().uuidString).conf"
         self.logger = Logger(label: "io.omerta.dhcp.server")
     }
 

@@ -226,15 +226,28 @@ logger.info("Setting up DemoTUNGateway in '\(mode)' mode...")
 
 // --- Shared setup ---
 
-// Virtual networks
-let peerVNet = VirtualNetwork(localMachineId: "peer")
-await peerVNet.setLocalAddress("10.0.0.100")
-await peerVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
+// Auto-detect a non-conflicting subnet for the virtual network
+let vnetConfig = try VirtualNetworkConfig.autoDetect()
+let gwIP = vnetConfig.gatewayIP
+let peerIP = vnetConfig.poolStart
+let subnetBits = vnetConfig.prefixLength
+let sourceSubnet = "\(vnetConfig.subnet)/\(subnetBits)"
+logger.info("Virtual network: \(sourceSubnet), gw=\(gwIP), peer=\(peerIP)")
 
-let gwVNet = VirtualNetwork(localMachineId: "gw")
-await gwVNet.setLocalAddress("10.0.0.1")
-await gwVNet.setGateway(machineId: "gw", ip: "10.0.0.1")
-await gwVNet.registerAddress(ip: "10.0.0.100", machineId: "peer")
+// Gateway netstack uses a separate internal IP for its own stack
+guard let gwNetstackIP = vnetConfig.internalIP() else {
+    fatalError("Failed to compute gateway netstack IP from subnet \(vnetConfig.subnet)")
+}
+
+// Virtual networks
+let peerVNet = VirtualNetwork(localMachineId: "peer", config: vnetConfig)
+await peerVNet.setLocalAddress(peerIP)
+await peerVNet.setGateway(machineId: "gw", ip: gwIP)
+
+let gwVNet = VirtualNetwork(localMachineId: "gw", config: vnetConfig)
+await gwVNet.setLocalAddress(gwIP)
+await gwVNet.setGateway(machineId: "gw", ip: gwIP)
+await gwVNet.registerAddress(ip: peerIP, machineId: "peer")
 
 // Mock channel providers + in-process relay
 let peerProvider = E2EChannelProvider(machineId: "peer")
@@ -264,10 +277,10 @@ if mode == "tun" {
     // Gateway: NetstackBridge (userspace) → GatewayService
     cleanupStaleInterface("omerta0")
 
-    let tun = TUNInterface(name: "omerta0", ip: "10.0.0.100", subnetBits: 16)
+    let tun = TUNInterface(name: "omerta0", ip: peerIP, subnetBits: subnetBits)
     peerTun = tun
 
-    let gwBridge = try NetstackBridge(config: .init(gatewayIP: "10.200.0.1"))
+    let gwBridge = try NetstackBridge(config: .init(gatewayIP: gwNetstackIP))
     let gatewayService = GatewayService(bridge: gwBridge)
 
     peerRouter = PacketRouter(
@@ -277,7 +290,7 @@ if mode == "tun" {
     )
 
     gwRouter = PacketRouter(
-        localInterface: NetstackInterface(localIP: "10.0.0.1", bridge: StubNetstackBridge()),
+        localInterface: NetstackInterface(localIP: gwIP, bridge: StubNetstackBridge()),
         virtualNetwork: gwVNet,
         tunnelManager: gwTunnelManager,
         gatewayService: gatewayService
@@ -296,8 +309,8 @@ if mode == "tun" {
     ============================================================
       TUN Gateway Demo Running (mode: tun)
 
-      Peer TUN:    omerta0     (10.0.0.100/16)
-      Gateway:     netstack    (10.200.0.1, userspace)
+      Peer TUN:    omerta0     (\(peerIP)/\(subnetBits))
+      Gateway:     netstack    (\(gwNetstackIP), userspace)
 
       Test with:
         curl --interface omerta0 http://example.com
@@ -316,11 +329,11 @@ if mode == "tun" {
     cleanupStaleInterface("omerta-gw0")
 
     // Peer side: userspace netstack + SOCKS proxy
-    let peerBridge = try NetstackBridge(config: .init(gatewayIP: "10.0.0.100"))
-    let peerInterface = NetstackInterface(localIP: "10.0.0.100", bridge: peerBridge)
+    let peerBridge = try NetstackBridge(config: .init(gatewayIP: peerIP))
+    let peerInterface = NetstackInterface(localIP: peerIP, bridge: peerBridge)
 
     // Gateway side: real TUN + kernel forwarding
-    let gwTun = TUNInterface(name: "omerta-gw0", ip: "10.0.0.1", subnetBits: 16)
+    let gwTun = TUNInterface(name: "omerta-gw0", ip: gwIP, subnetBits: subnetBits)
     let adapter = TUNBridgeAdapter(tun: gwTun)
     gwTunAdapter = adapter
     let gatewayService = GatewayService(bridge: adapter)
@@ -332,7 +345,7 @@ if mode == "tun" {
     )
 
     gwRouter = PacketRouter(
-        localInterface: NetstackInterface(localIP: "10.0.0.1", bridge: StubNetstackBridge()),
+        localInterface: NetstackInterface(localIP: gwIP, bridge: StubNetstackBridge()),
         virtualNetwork: gwVNet,
         tunnelManager: gwTunnelManager,
         gatewayService: gatewayService
@@ -360,8 +373,8 @@ if mode == "tun" {
     outInterface = detectedIface
     try KernelNetworking.enableForwarding()
     KernelNetworking.looseRPFilter(tunName: "omerta-gw0")
-    try KernelNetworking.enableMasquerade(tunName: "omerta-gw0", outInterface: detectedIface)
-    KernelNetworking.printDiagnostics(tunName: "omerta-gw0", outInterface: detectedIface)
+    try KernelNetworking.enableMasquerade(tunName: "omerta-gw0", outInterface: detectedIface, sourceSubnet: sourceSubnet)
+    KernelNetworking.printDiagnostics(tunName: "omerta-gw0", outInterface: detectedIface, sourceSubnet: sourceSubnet)
 
     let actualPort = await proxy.actualPort
 
@@ -371,7 +384,7 @@ if mode == "tun" {
       TUN Gateway Demo Running (mode: socks-tun)
 
       Peer:        SOCKS5 proxy on localhost:\(actualPort) (userspace netstack)
-      Gateway TUN: omerta-gw0  (10.0.0.1/16, kernel forwarding)
+      Gateway TUN: omerta-gw0  (\(gwIP)/\(subnetBits), kernel forwarding)
       Outbound:    \(detectedIface)
 
       Test with:
@@ -447,7 +460,7 @@ if let tun = peerTun {
 if let adapter = gwTunAdapter {
     await adapter.stop()
     if let outIface = outInterface {
-        KernelNetworking.disableMasquerade(tunName: "omerta-gw0", outInterface: outIface)
+        KernelNetworking.disableMasquerade(tunName: "omerta-gw0", outInterface: outIface, sourceSubnet: sourceSubnet)
     }
 }
 logger.info("Done.")
