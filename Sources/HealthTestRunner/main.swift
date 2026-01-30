@@ -973,7 +973,7 @@ if !isNodeA {
                 let msg = String(data: data, encoding: .utf8) ?? ""
                 if msg.hasPrefix("PING:") {
                     let pong = "PONG:" + msg.dropFirst(5)
-                    try? await pingSession.send(Data(pong.utf8))
+                    try? await pingSession.sendAndFlush(Data(pong.utf8))
                 }
             }
             logger.info("Node B: echoing pings on health-test-ping")
@@ -997,7 +997,7 @@ if !isNodeA {
                 let msg = String(data: data, encoding: .utf8) ?? ""
                 if msg.hasPrefix("PING:") {
                     let pong = "PONG:" + msg.dropFirst(5)
-                    try? await recoveryPingSession.send(Data(pong.utf8))
+                    try? await recoveryPingSession.sendAndFlush(Data(pong.utf8))
                 }
             }
             logger.info("Node B: echoing recovery pings")
@@ -1797,7 +1797,7 @@ do {
     for seq in 1...500 {
         let nanos = DispatchTime.now().uptimeNanoseconds
         let probe = "PING:\(seq):\(nanos)"
-        try await pingSession.send(Data(probe.utf8))
+        try await pingSession.sendAndFlush(Data(probe.utf8))
         try await Task.sleep(for: .milliseconds(5))
     }
 
@@ -1887,7 +1887,7 @@ do {
     for probeIdx in 1...totalProbes {
         let nanos = DispatchTime.now().uptimeNanoseconds
         let probe = "PING:\(probeIdx):\(nanos)"
-        try? await recoverySession.send(Data(probe.utf8))
+        try? await recoverySession.sendAndFlush(Data(probe.utf8))
         try await Task.sleep(for: .milliseconds(20))
 
         // After 2s of baseline (100 probes), perform IP swap
