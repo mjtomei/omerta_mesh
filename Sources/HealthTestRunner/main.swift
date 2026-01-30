@@ -144,6 +144,7 @@ func shell(_ command: String, timeout: Duration = .seconds(10)) async -> (exitCo
     process.arguments = ["-c", command]
     process.standardOutput = pipe
     process.standardError = pipe
+    process.standardInput = FileHandle.nullDevice
 
     do {
         try process.run()
