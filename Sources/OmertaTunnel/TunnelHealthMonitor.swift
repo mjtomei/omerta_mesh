@@ -11,9 +11,11 @@
 // that's a failure.
 
 import Foundation
+import Logging
 import OmertaMesh
 
 public actor TunnelHealthMonitor {
+    private let logger = Logger(label: "io.omerta.tunnel.health")
     private var lastPacketTime: ContinuousClock.Instant
     private var currentProbeInterval: Duration
     private var consecutiveFailures: Int = 0
@@ -101,12 +103,15 @@ public actor TunnelHealthMonitor {
                 // Remote is alive — back off probe frequency
                 consecutiveFailures = 0
                 currentProbeInterval = min(currentProbeInterval * 2, maxProbeInterval)
+                logger.debug("Health OK for \(machineId.prefix(8)): interval=\(currentProbeInterval)")
                 continue
             }
 
             // No packet received since last check — count as failure
             consecutiveFailures += 1
+            logger.warning("Health MISS for \(machineId.prefix(8)): failures=\(consecutiveFailures)/\(failureThreshold), interval=\(interval)")
             if consecutiveFailures >= failureThreshold {
+                logger.warning("Health FAIL for \(machineId.prefix(8)): triggering onFailure")
                 await onFailure(machineId)
                 break
             }
