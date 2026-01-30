@@ -3,22 +3,8 @@ name: Tests
 on:
   push:
     branches: [master, main]
-    paths-ignore:
-      - '**.md'
-      - '**.txt'
-      - 'LICENSE'
-      - 'licenses/**'
-      - 'plans/**'
-      - '.gitignore'
   pull_request:
     branches: [master, main]
-    paths-ignore:
-      - '**.md'
-      - '**.txt'
-      - 'LICENSE'
-      - 'licenses/**'
-      - 'plans/**'
-      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -26,10 +12,153 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    uses: mjtomei/omerta/.github/workflows/test-swift.yml@master
-    with:
-      package-path: '.'
-      package-name: 'omerta-mesh'
-      needs-libnetstack: true
-      libnetstack-path: 'Sources/OmertaTunnel/Netstack'
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            src:
+              - '**'
+              - '!**.md'
+              - '!**.txt'
+              - '!LICENSE'
+              - '!licenses/**'
+              - '!plans/**'
+              - '!.gitignore'
+
+  test-macos:
+    name: macOS
+    needs: [changes]
+    if: needs.changes.outputs.src == 'true'
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build libnetstack
+        working-directory: Sources/OmertaTunnel/Netstack
+        run: make install
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build and test with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Generate coverage report
+        run: |
+          LLVM_COV=$(xcrun --find llvm-cov)
+          PROFDATA=$(find .build -name "default.profdata" 2>/dev/null | head -1)
+          if [ -n "$PROFDATA" ]; then
+            TEST_BIN=$(find .build -type f -name "*.xctest" -o -name "*PackageTests" 2>/dev/null | head -1)
+            if [ -n "$TEST_BIN" ]; then
+              $LLVM_COV export -format=lcov "$TEST_BIN" -instr-profile="$PROFDATA" > coverage.lcov 2>/dev/null || true
+            fi
+          fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          flags: omerta-mesh-macos
+          fail_ci_if_error: false
+
+  test-ubuntu:
+    name: Ubuntu
+    needs: [changes]
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-24.04
+    container: swift:6.0-noble
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y git golang-go make
+
+      - uses: actions/checkout@v4
+
+      - name: Configure git safe directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build libnetstack
+        working-directory: Sources/OmertaTunnel/Netstack
+        run: make install
+
+      - name: Build and test with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Generate coverage report
+        run: |
+          PROFDATA=$(find .build -name "default.profdata" 2>/dev/null | head -1)
+          if [ -n "$PROFDATA" ]; then
+            TEST_BIN=$(find .build -type f -perm /111 -name "*PackageTests" 2>/dev/null | head -1)
+            if [ -n "$TEST_BIN" ]; then
+              llvm-cov export -format=lcov "$TEST_BIN" -instr-profile="$PROFDATA" > coverage.lcov 2>/dev/null || true
+            fi
+          fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          flags: omerta-mesh-ubuntu
+          fail_ci_if_error: false
+
+  test-amazonlinux:
+    name: Amazon Linux
+    needs: [changes]
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-24.04
+    container: amazonlinux:2023
+
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y git make tar gzip which
+          dnf install -y swiftlang
+          curl -LO https://go.dev/dl/go1.25.5.linux-amd64.tar.gz
+          tar -C /usr/local -xzf go1.25.5.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Configure git safe directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build libnetstack
+        working-directory: Sources/OmertaTunnel/Netstack
+        run: |
+          export PATH=/usr/local/go/bin:$PATH
+          make install
+
+      - name: Build and test with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Generate coverage report
+        run: |
+          PROFDATA=$(find .build -name "default.profdata" 2>/dev/null | head -1)
+          if [ -n "$PROFDATA" ]; then
+            TEST_BIN=$(find .build -type f -perm /111 -name "*PackageTests" 2>/dev/null | head -1)
+            if [ -n "$TEST_BIN" ]; then
+              llvm-cov export -format=lcov "$TEST_BIN" -instr-profile="$PROFDATA" > coverage.lcov 2>/dev/null || true
+            fi
+          fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          flags: omerta-mesh-amazonlinux
+          fail_ci_if_error: false

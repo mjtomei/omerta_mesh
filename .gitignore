@@ -23,4 +23,3 @@ Sources/CNetstack/libnetstack.h
 
 # Parent repo stub files (ignored when working inside cloned repo)
 .commit
-REPO.md
