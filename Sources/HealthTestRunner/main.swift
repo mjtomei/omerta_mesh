@@ -146,54 +146,30 @@ func shell(_ command: String, timeout: Duration = .seconds(10)) async -> (exitCo
     process.standardError = pipe
     process.standardInput = FileHandle.nullDevice
 
-    do {
-        try process.run()
-    } catch {
-        return (-1, "Failed to launch: \(error)")
-    }
+    // Use terminationHandler + continuation to avoid blocking cooperative threads.
+    // process.waitUntilExit() blocks a thread, which can exhaust the cooperative pool.
+    let exitCode: Int32 = await withCheckedContinuation { continuation in
+        process.terminationHandler = { proc in
+            continuation.resume(returning: proc.terminationStatus)
+        }
+        do {
+            try process.run()
+        } catch {
+            continuation.resume(returning: -1)
+            return
+        }
 
-    // Start reading pipe immediately (before waiting) to avoid deadlock.
-    // readDataToEndOfFile() blocks until the write end is closed (process exit).
-    let pipeTask = Task.detached { () -> Data in
-        pipe.fileHandleForReading.readDataToEndOfFile()
-    }
-
-    // Wait for process with timeout
-    let waitTask = Task {
-        process.waitUntilExit()
-        return process.terminationStatus
-    }
-
-    let result = await withTaskGroup(of: Int32?.self) { group in
-        group.addTask { await waitTask.value }
-        group.addTask {
+        // Timeout: terminate after deadline
+        Task {
             try? await Task.sleep(for: timeout)
-            return nil
+            if process.isRunning {
+                process.terminate()
+            }
         }
-        let first = await group.next()!
-        group.cancelAll()
-        return first
     }
 
-    if result == nil {
-        // Timeout — kill process and close pipe to unblock reader
-        process.terminate()
-        // Close our end of the pipe to ensure readDataToEndOfFile returns
-        try? pipe.fileHandleForReading.close()
-    }
-    let exitCode = result ?? -1
-
-    // Give pipe read a bounded time to finish
-    let data = await withTaskGroup(of: Data.self) { group in
-        group.addTask { await pipeTask.value }
-        group.addTask {
-            try? await Task.sleep(for: .seconds(2))
-            return Data()
-        }
-        let first = await group.next()!
-        group.cancelAll()
-        return first
-    }
+    // Read output after process has exited (pipe write end is closed)
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return (exitCode, output)
 }
