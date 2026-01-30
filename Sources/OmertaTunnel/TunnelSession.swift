@@ -49,18 +49,12 @@ public actor TunnelSession {
     ///   - remoteMachineId: The machine to communicate with
     ///   - channel: The logical channel name for this session
     ///   - provider: The channel provider (mesh network) for transport
-    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider) {
+    ///   - receiveHandler: Optional callback invoked when packets arrive from the remote machine
+    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider, receiveHandler: (@Sendable (Data) async -> Void)? = nil) {
         self.key = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channel)
         self.provider = provider
+        self.receiveHandler = receiveHandler
         self.logger = Logger(label: "io.omerta.tunnel.session")
-    }
-
-    // MARK: - Receive Handler
-
-    /// Set handler for incoming packets (like ChannelProvider.onChannel pattern)
-    /// - Parameter handler: Callback invoked when packets arrive from the remote machine
-    public func onReceive(_ handler: @escaping @Sendable (Data) async -> Void) {
-        self.receiveHandler = handler
     }
 
     // MARK: - Sending

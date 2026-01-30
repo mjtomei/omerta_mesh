@@ -637,18 +637,18 @@ let messageCounter = MessageCounter()
 if !isNodeA {
     logger.info("=== NODE B: Passive responder mode ===")
 
-    // Track the latest session established for each channel
-    actor LatestSession {
-        var session: TunnelSession?
-        func set(_ s: TunnelSession) { session = s }
-        func get() -> TunnelSession? { session }
+    // Track the latest inbound session key
+    actor LatestSessionKey {
+        var key: TunnelSessionKey?
+        func set(_ k: TunnelSessionKey) { key = k }
+        func get() -> TunnelSessionKey? { key }
     }
-    let latestSession = LatestSession()
+    let latestKey = LatestSessionKey()
 
     // Accept all sessions and count messages
-    await manager.setSessionEstablishedHandler { session in
-        await latestSession.set(session)
-        await session.onReceive { data in
+    await manager.setInboundSessionHandler { machineId, channel in
+        await latestKey.set(TunnelSessionKey(remoteMachineId: machineId, channel: channel))
+        return { data in
             await messageCounter.increment()
             let msg = String(data: data, encoding: .utf8) ?? "<binary>"
             logger.debug("  B <- \(msg)")
@@ -673,7 +673,7 @@ if !isNodeA {
         case "phase1-start":
             // Wait for session from Node A (don't call getSession to avoid handshake race)
             try await Task.sleep(for: .seconds(3))
-            guard let session = await latestSession.get() else {
+            guard let key = await latestKey.get(), let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session established for phase1")
                 await sendControl("phase1-done", detail: "0")
                 continue
@@ -686,7 +686,7 @@ if !isNodeA {
 
         case "phase3-burst":
             // Use whatever session is currently active
-            guard let session = await latestSession.get() else {
+            guard let key = await latestKey.get(), let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase3")
                 await sendControl("phase3-burst-done")
                 continue
@@ -700,7 +700,7 @@ if !isNodeA {
         case "phase5-start":
             // Wait for recovery session from Node A
             try await Task.sleep(for: .seconds(3))
-            guard let session = await latestSession.get() else {
+            guard let key = await latestKey.get(), let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase5")
                 await sendControl("phase5-done", detail: "0")
                 continue
@@ -777,7 +777,7 @@ if !isNodeA {
 
         case "phase10-latency-start":
             // Send messages on demand during latency sub-phases
-            guard let session = await latestSession.get() else {
+            guard let key = await latestKey.get(), let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase10")
                 await sendControl("phase10-latency-ack")
                 continue
@@ -848,11 +848,10 @@ do {
     await sendControl("phase1-start")
 
     // Create session - only Node A initiates to avoid handshake race
-    let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test")
-    session1 = s
-    await s.onReceive { data in
+    let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test", receiveHandler: { data in
         await messageCounter.increment()
-    }
+    })
+    session1 = s
 
     // Wait for session to settle
     try await Task.sleep(for: .seconds(2))
@@ -993,10 +992,9 @@ do {
     await sendControl("phase5-start")
 
     // Only Node A initiates session to avoid handshake race
-    let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery")
-    await session5.onReceive { data in
+    let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery", receiveHandler: { data in
         await messageCounter.increment()
-    }
+    })
     try await Task.sleep(for: .seconds(2))
 
     for i in 1...5 {
@@ -1208,9 +1206,8 @@ do {
 
     // Verify mesh still works by sending a message
     var endpointTestPass = false
-    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint") {
+    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint", receiveHandler: { _ in await messageCounter.increment() }) {
         await messageCounter.reset()
-        await session.onReceive { _ in await messageCounter.increment() }
         try? await session.send(Data("endpoint-test".utf8))
         try await Task.sleep(for: .seconds(2))
         endpointTestPass = true // Session creation succeeded
@@ -1242,8 +1239,7 @@ do {
     logger.info("Using interface: \(iface10)")
 
     // Ensure a fresh session
-    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency")
-    await session10.onReceive { _ in await messageCounter.increment() }
+    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency", receiveHandler: { _ in await messageCounter.increment() })
     try await Task.sleep(for: .seconds(2))
 
     struct LatencyProfile {

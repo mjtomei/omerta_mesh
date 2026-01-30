@@ -19,9 +19,7 @@ import Logging
 /// try await manager.start()
 ///
 /// // Get or create a session (keyed by machineId + channel)
-/// let session = try await manager.getSession(machineId: remoteMachineId, channel: "data")
-///
-/// await session.onReceive { data in
+/// let session = try await manager.getSession(machineId: remoteMachineId, channel: "data") { data in
 ///     print("Received \(data.count) bytes")
 /// }
 ///
@@ -50,23 +48,15 @@ public actor TunnelManager {
     /// Wire channels registered for dispatch
     private var registeredWireChannels: Set<String> = []
 
-    /// Pre-session data buffer: holds data that arrives before the session handshake completes.
-    /// Flushed to the session once it's created. Max 32 packets per key, 5s TTL.
-    private var pendingData: [TunnelSessionKey: [(data: Data, bufferedAt: ContinuousClock.Instant)]] = [:]
-    private let pendingDataMaxPerKey = 32
-    private let pendingDataTTL: Duration = .seconds(5)
-
     /// Whether the manager is running
     private var isRunning: Bool = false
 
     /// Task consuming endpoint change events
     private var endpointChangeTask: Task<Void, Never>?
 
-    /// Callback when remote machine initiates a session
-    private var sessionRequestHandler: ((MachineId) async -> Bool)?
-
-    /// Callback when session is established
-    private var sessionEstablishedHandler: ((TunnelSession) async -> Void)?
+    /// Factory for inbound sessions: called when a remote machine requests a session.
+    /// Returns a receive handler to accept (passed to TunnelSession constructor), or nil to reject.
+    private var inboundSessionHandler: ((MachineId, String) async -> (@Sendable (Data) async -> Void)?)?
 
     /// Channel for session handshake
     private let handshakeChannel = "tunnel-handshake"
@@ -160,21 +150,16 @@ public actor TunnelManager {
         }
         sessions.removeAll()
         sessionIds.removeAll()
-        pendingData.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
     }
 
-    /// Set handler for incoming session requests
-    /// - Parameter handler: Callback that returns true to accept, false to reject (receives machineId)
-    public func setSessionRequestHandler(_ handler: @escaping (MachineId) async -> Bool) {
-        self.sessionRequestHandler = handler
-    }
-
-    /// Set handler called when a session is established
-    public func setSessionEstablishedHandler(_ handler: @escaping (TunnelSession) async -> Void) {
-        self.sessionEstablishedHandler = handler
+    /// Set factory for inbound sessions.
+    /// Called when a remote machine requests a session with (machineId, channel).
+    /// Return a receive handler to accept, or nil to reject.
+    public func setInboundSessionHandler(_ handler: @escaping (MachineId, String) async -> (@Sendable (Data) async -> Void)?) {
+        self.inboundSessionHandler = handler
     }
 
     // MARK: - Session Management
@@ -184,7 +169,7 @@ public actor TunnelManager {
     ///   - machineId: The remote machine ID
     ///   - channel: The logical channel name (defaults to "data")
     /// - Returns: The tunnel session (existing or newly created)
-    public func getSession(machineId: MachineId, channel: String = "data") async throws -> TunnelSession {
+    public func getSession(machineId: MachineId, channel: String = "data", receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
         guard isRunning else {
             throw TunnelError.notConnected
         }
@@ -218,7 +203,8 @@ public actor TunnelManager {
         let newSession = TunnelSession(
             remoteMachineId: machineId,
             channel: channel,
-            provider: provider
+            provider: provider,
+            receiveHandler: receiveHandler
         )
 
         await newSession.activate()
@@ -262,8 +248,8 @@ public actor TunnelManager {
 
     /// Create a session with a remote machine on the default "data" channel.
     /// Convenience wrapper around `getSession(machineId:channel:)`.
-    public func createSession(withMachine machine: MachineId) async throws -> TunnelSession {
-        return try await getSession(machineId: machine, channel: defaultChannel)
+    public func createSession(withMachine machine: MachineId, receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
+        return try await getSession(machineId: machine, channel: defaultChannel, receiveHandler: receiveHandler)
     }
 
     /// Close a specific session by key
@@ -347,17 +333,6 @@ public actor TunnelManager {
         let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
         if let session = sessions[key] {
             await session.deliverIncoming(data)
-        } else {
-            // Buffer data that arrives before the session handshake completes
-            let now = ContinuousClock.now
-            var buffer = pendingData[key] ?? []
-            // Evict expired entries
-            buffer.removeAll { now - $0.bufferedAt > pendingDataTTL }
-            if buffer.count < pendingDataMaxPerKey {
-                buffer.append((data: data, bufferedAt: now))
-                pendingData[key] = buffer
-                logger.debug("Buffered pre-session data", metadata: ["machine": "\(machineId)", "channel": "\(channel)", "buffered": "\(buffer.count)"])
-            }
         }
     }
 
@@ -384,14 +359,16 @@ public actor TunnelManager {
         switch handshake.type {
         case .request:
             // Remote machine wants to start a session
-            let accept: Bool
-            if let handler = sessionRequestHandler {
-                accept = await handler(machineId)
+            // Use inbound session handler to get receive handler (accept) or nil (reject)
+            let receiveHandler: (@Sendable (Data) async -> Void)?
+            if let handler = inboundSessionHandler {
+                receiveHandler = await handler(machineId, channel)
             } else {
-                accept = true
+                // Default: accept with no receive handler
+                receiveHandler = { _ in }
             }
 
-            if accept {
+            if receiveHandler != nil {
                 let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
 
                 // Close existing session on same key if any
@@ -399,27 +376,17 @@ public actor TunnelManager {
                     await existing.close()
                 }
 
-                // Create new session
+                // Create new session with receive handler from factory
                 let newSession = TunnelSession(
                     remoteMachineId: machineId,
                     channel: channel,
-                    provider: provider
+                    provider: provider,
+                    receiveHandler: receiveHandler
                 )
                 await newSession.activate()
                 sessions[key] = newSession
                 sessionIds[key] = handshake.sessionId
                 await ensureWireChannelRegistered(for: channel)
-
-                // Flush any data that arrived before the session was created
-                if let buffered = pendingData.removeValue(forKey: key) {
-                    let now = ContinuousClock.now
-                    for entry in buffered where now - entry.bufferedAt <= pendingDataTTL {
-                        await newSession.deliverIncoming(entry.data)
-                    }
-                    if !buffered.isEmpty {
-                        logger.info("Flushed \(buffered.count) buffered packet(s)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
-                    }
-                }
 
                 // Send ack
                 let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
@@ -449,10 +416,6 @@ public actor TunnelManager {
                 }
 
                 logger.info("Session accepted", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
-
-                if let handler = sessionEstablishedHandler {
-                    await handler(newSession)
-                }
             } else {
                 let reject = SessionHandshake(type: .reject, channel: channel)
                 if let rejectData = try? JSONEncoder().encode(reject) {
