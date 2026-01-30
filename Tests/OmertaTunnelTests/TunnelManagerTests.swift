@@ -100,14 +100,14 @@ final class TunnelManagerTests: XCTestCase {
         await manager.stop()
     }
 
-    func testSetSessionRequestHandler() async throws {
+    func testSetInboundSessionHandler() async throws {
         let provider = MockChannelProvider()
         let manager = TunnelManager(provider: provider)
 
         var requestReceived = false
-        await manager.setSessionRequestHandler { machineId in
+        await manager.setInboundSessionHandler { machineId, channel in
             requestReceived = true
-            return true
+            return { _ in }
         }
 
         try await manager.start()
@@ -213,13 +213,14 @@ final class TunnelManagerTests: XCTestCase {
         await manager.stop()
     }
 
-    func testSessionEstablishedCallback() async throws {
+    func testInboundSessionHandlerCallback() async throws {
         let provider = MockChannelProvider()
         let manager = TunnelManager(provider: provider)
 
-        var establishedSession: TunnelSession?
-        await manager.setSessionEstablishedHandler { session in
-            establishedSession = session
+        var handlerCalledWithMachine: MachineId?
+        await manager.setInboundSessionHandler { machineId, channel in
+            handlerCalledWithMachine = machineId
+            return { _ in }
         }
 
         try await manager.start()
@@ -229,9 +230,11 @@ final class TunnelManagerTests: XCTestCase {
         let data = try JSONEncoder().encode(handshake)
         await provider.simulateMessage(from: "remote-initiator", on: "tunnel-handshake", data: data)
 
-        XCTAssertNotNil(establishedSession)
-        let remoteMachineId = await establishedSession?.remoteMachineId
-        XCTAssertEqual(remoteMachineId, "remote-initiator")
+        XCTAssertEqual(handlerCalledWithMachine, "remote-initiator")
+
+        // Session should be created
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 1)
 
         await manager.stop()
     }
@@ -334,15 +337,10 @@ final class TunnelManagerTests: XCTestCase {
         var handlerCalled = false
         var receivedMachineId: MachineId?
 
-        await manager.setSessionRequestHandler { machineId in
+        await manager.setInboundSessionHandler { machineId, channel in
             handlerCalled = true
             receivedMachineId = machineId
-            return true
-        }
-
-        var establishedSession: TunnelSession?
-        await manager.setSessionEstablishedHandler { session in
-            establishedSession = session
+            return { _ in }
         }
 
         try await manager.start()
@@ -357,9 +355,8 @@ final class TunnelManagerTests: XCTestCase {
         XCTAssertEqual(receivedMachineId, "remote-initiator")
 
         // Session should be established
-        XCTAssertNotNil(establishedSession)
-        let remoteMachineId = await establishedSession?.remoteMachineId
-        XCTAssertEqual(remoteMachineId, "remote-initiator")
+        let count = await manager.sessionCount
+        XCTAssertEqual(count, 1)
 
         // Ack should have been sent (filter to handshake channel — health probes may also be sent)
         let handshakeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-handshake" }
@@ -377,9 +374,9 @@ final class TunnelManagerTests: XCTestCase {
         let provider = MockChannelProvider()
         let manager = TunnelManager(provider: provider)
 
-        // Handler rejects the session
-        await manager.setSessionRequestHandler { _ in
-            return false
+        // Handler rejects the session by returning nil
+        await manager.setInboundSessionHandler { _, _ in
+            return nil
         }
 
         try await manager.start()
@@ -620,12 +617,10 @@ final class TunnelSessionTests: XCTestCase {
         let manager = TunnelManager(provider: provider)
         try await manager.start()
 
-        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
-
         var receivedData: Data?
-        await session.onReceive { data in
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in
             receivedData = data
-        }
+        })
 
         // Simulate incoming message — TunnelManager dispatches to the correct session
         await provider.simulateMessage(
@@ -644,12 +639,10 @@ final class TunnelSessionTests: XCTestCase {
         let manager = TunnelManager(provider: provider)
         try await manager.start()
 
-        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
-
         var receivedData: Data?
-        await session.onReceive { data in
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in
             receivedData = data
-        }
+        })
 
         // Simulate message from wrong machine - no session exists for it, so dispatch drops it
         await provider.simulateMessage(
@@ -782,13 +775,10 @@ final class TunnelSessionTests: XCTestCase {
         try await manager.start()
 
         // Two sessions on same channel, different machines
-        let session1 = try await manager.getSession(machineId: "machine-1", channel: "data")
-        let session2 = try await manager.getSession(machineId: "machine-2", channel: "data")
-
         var received1: Data?
         var received2: Data?
-        await session1.onReceive { data in received1 = data }
-        await session2.onReceive { data in received2 = data }
+        let session1 = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in received1 = data })
+        let session2 = try await manager.getSession(machineId: "machine-2", channel: "data", receiveHandler: { data in received2 = data })
 
         // Send to machine-1's session
         await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([0xAA]))
@@ -811,10 +801,8 @@ final class TunnelSessionTests: XCTestCase {
         let manager = TunnelManager(provider: provider)
         try await manager.start()
 
-        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
-
         var receivedData: Data?
-        await session.onReceive { data in receivedData = data }
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in receivedData = data })
 
         // Message from unknown machine — should be silently dropped
         await provider.simulateMessage(from: "unknown-machine", on: "tunnel-data", data: Data([0xFF]))
@@ -829,10 +817,8 @@ final class TunnelSessionTests: XCTestCase {
         let manager = TunnelManager(provider: provider)
         try await manager.start()
 
-        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
-
         var receivedData: Data?
-        await session.onReceive { data in receivedData = data }
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in receivedData = data })
 
         // Close the session
         let key = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
@@ -886,8 +872,7 @@ final class TunnelSessionTests: XCTestCase {
         let manager = TunnelManager(provider: provider)
         try await manager.start()
 
-        let session = try await manager.getSession(machineId: "machine-1", channel: "data")
-        await session.onReceive { _ in }
+        let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { _ in })
 
         await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([1, 2, 3]))
         await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([4, 5]))

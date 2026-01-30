@@ -76,9 +76,13 @@ public actor PacketRouter {
             await self?.routeOutboundLoop()
         }
 
-        // Register for new tunnel sessions to set up inbound routing
-        await tunnelManager.setSessionEstablishedHandler { [weak self] session in
-            await self?.setupInboundRouting(for: session)
+        // Register for inbound tunnel sessions with receive handler
+        await tunnelManager.setInboundSessionHandler { [weak self] machineId, channel in
+            guard channel == "packet" else { return nil }
+            guard let self else { return nil }
+            return { [weak self] packet in
+                await self?.handleInboundPacket(packet, from: machineId)
+            }
         }
 
         // Wire gateway service return handler to route response packets back to peers
@@ -182,8 +186,9 @@ public actor PacketRouter {
         } else {
             // No session yet - try to create one
             do {
-                let session = try await tunnelManager.getSession(machineId: machineId, channel: "packet")
-                await setupInboundRouting(for: session)
+                let session = try await tunnelManager.getSession(machineId: machineId, channel: "packet", receiveHandler: { [weak self] packet in
+                    await self?.handleInboundPacket(packet, from: machineId)
+                })
                 try await session.send(packet)
                 stats.packetsToPeer += 1
                 logger.trace("Created session and sent to peer", metadata: ["dest": "\(destIP)"])
@@ -229,8 +234,10 @@ public actor PacketRouter {
         } else {
             // Create session to gateway
             do {
-                let session = try await tunnelManager.getSession(machineId: gatewayMachineId, channel: "packet")
-                await setupInboundRouting(for: session)
+                let gwId = gatewayMachineId
+                let session = try await tunnelManager.getSession(machineId: gwId, channel: "packet", receiveHandler: { [weak self] packet in
+                    await self?.handleInboundPacket(packet, from: gwId)
+                })
                 try await session.send(packet)
                 stats.packetsToGateway += 1
             } catch {
@@ -241,20 +248,6 @@ public actor PacketRouter {
     }
 
     // MARK: - Inbound Routing
-
-    private func setupInboundRouting(for session: TunnelSession) async {
-        // Only handle "packet" channel sessions
-        let channel = await session.channel
-        guard channel == "packet" else { return }
-
-        let machineId = await session.remoteMachineId
-
-        await session.onReceive { [weak self] packet in
-            await self?.handleInboundPacket(packet, from: machineId)
-        }
-
-        logger.trace("Set up inbound routing", metadata: ["machine": "\(machineId.prefix(8))..."])
-    }
 
     private func deliverLocalReturn(_ packet: Data) async {
         do {
