@@ -1837,6 +1837,13 @@ record("Phase 10: Latency & Jitter", passed: true,
 
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
+// Stop health monitor before vanilla/TCP baseline tests — these don't use the
+// tunnel, so no tunnel packets flow and the monitor would kill all sessions.
+if let mon = monitor {
+    await mon.stopMonitoring()
+    logger.info("Health monitor stopped for bandwidth phases (11a through 12b)")
+}
+
 do {
     // Tell Node B to start vanilla echo server
     await sendControl("phase11-vanilla-start")
@@ -2133,12 +2140,6 @@ do {
 // MARK: - Phase 12: Mesh Bandwidth
 
 logPhase("Phase 12: Mesh Bandwidth")
-
-// Stop health monitor during bandwidth phases to prevent session kills from missed probes
-if let mon = monitor {
-    await mon.stopMonitoring()
-    logger.info("Health monitor stopped for bandwidth phases")
-}
 
 do {
     await sendControl("phase12-bw-start")
