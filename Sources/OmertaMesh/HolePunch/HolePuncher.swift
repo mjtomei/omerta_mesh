@@ -93,7 +93,7 @@ public struct HolePunchConfig: Sendable {
 
 /// UDP hole puncher for establishing direct connections through NAT.
 ///
-/// Uses encrypted mesh pings (via BinaryEnvelopeV2) instead of raw UDP probes.
+/// Uses encrypted mesh pings (via BinaryEnvelope) instead of raw UDP probes.
 /// All packets go through the standard encryption layer.
 public actor HolePuncher {
     private let peerId: String
@@ -221,7 +221,7 @@ public actor HolePuncher {
 ///
 /// Instead of creating a raw UDP socket and sending unencrypted probe packets,
 /// this sends encrypted pings through the mesh node's standard send path
-/// (BinaryEnvelopeV2 with ChaCha20-Poly1305).
+/// (BinaryEnvelope with ChaCha20-Poly1305).
 actor HolePunchSession {
     let sessionId: String
     let localPeerId: String
@@ -331,7 +331,7 @@ actor HolePunchSession {
     // MARK: - Private Methods
 
     /// Send encrypted pings to the target endpoint to punch through NAT.
-    /// Uses the standard mesh send path (BinaryEnvelopeV2 encryption).
+    /// Uses the standard mesh send path (BinaryEnvelope encryption).
     private func sendPings(to endpoint: String) async {
         let natType = await services.getNATType(for: localPeerId) ?? .unknown
 

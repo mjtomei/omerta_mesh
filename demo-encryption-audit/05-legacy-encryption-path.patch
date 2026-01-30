@@ -6,7 +6,7 @@ index 3474e9e..aee2906 100644
          try? group.syncShutdownGracefully()
          try await super.tearDown()
      }
-+    // Scenario 5: Code uses old MessageEncryption instead of BinaryEnvelopeV2
++    // Scenario 5: Code uses old MessageEncryption instead of BinaryEnvelope
 +    func testLegacyEncryptionPath() async throws {
 +        let beforeCount = GlobalEncryptionObserver.shared.violations.count
 +        let keypair = IdentityKeypair()

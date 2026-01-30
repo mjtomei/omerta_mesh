@@ -11,12 +11,12 @@ final class EnvelopeCryptoTests: XCTestCase {
     // MARK: - Network Hash Tests
 
     func testNetworkHashComputation() {
-        let hash = BinaryEnvelopeV2.computeNetworkHash(testKey)
+        let hash = BinaryEnvelope.computeNetworkHash(testKey)
 
         XCTAssertEqual(hash.count, 8, "Network hash should be 8 bytes")
 
         // Same key should produce same hash
-        let hash2 = BinaryEnvelopeV2.computeNetworkHash(testKey)
+        let hash2 = BinaryEnvelope.computeNetworkHash(testKey)
         XCTAssertEqual(hash, hash2, "Same key should produce same hash")
     }
 
@@ -24,8 +24,8 @@ final class EnvelopeCryptoTests: XCTestCase {
         let key1 = Data(repeating: 0x01, count: 32)
         let key2 = Data(repeating: 0x02, count: 32)
 
-        let hash1 = BinaryEnvelopeV2.computeNetworkHash(key1)
-        let hash2 = BinaryEnvelopeV2.computeNetworkHash(key2)
+        let hash1 = BinaryEnvelope.computeNetworkHash(key1)
+        let hash2 = BinaryEnvelope.computeNetworkHash(key2)
 
         XCTAssertNotEqual(hash1, hash2, "Different keys should produce different hashes")
     }

@@ -23,7 +23,7 @@ index 3474e9e..5d2095d 100644
 +        try await socket.sendRaw(mangled, to: dest)
 +        try await Task.sleep(nanoseconds: 10_000_000)
 +        // Prefix is valid -- caught by daemon decryption audit, not prefix check
-+        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(mangled),
++        XCTAssertTrue(BinaryEnvelope.isValidPrefix(mangled),
 +            "Corrupted packet passes prefix -- needs decryption audit")
 +    }
 +

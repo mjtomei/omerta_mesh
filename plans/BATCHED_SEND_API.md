@@ -247,7 +247,7 @@ Total envelope overhead: 4 + 12 + 16 + 44 + 16 + 136 + 4 + (16 per chunk) bytes.
 
 **Existing test files to rewrite** (all tests change due to new header structure, compact fields, split routing/auth):
 - `Tests/OmertaMeshTests/EnvelopeTests/EnvelopeHeaderTests.swift` — rewrite for RoutingHeader + AuthHeader split, compact field sizes (16-byte peerId, raw UUID machineId, no channelString), new field ordering
-- `Tests/OmertaMeshTests/EnvelopeTests/BinaryEnvelopeV2Tests.swift` — rewrite (rename to `BinaryEnvelopeTests.swift`): update all encode/decode tests for split routing/auth headers, layered decryption, new wire layout
+- `Tests/OmertaMeshTests/EnvelopeTests/BinaryEnvelopeTests.swift` — rewrite (rename to `BinaryEnvelopeTests.swift`): update all encode/decode tests for split routing/auth headers, layered decryption, new wire layout
 - `Tests/OmertaMeshTests/BinaryEnvelopeTests.swift` — rewrite: update unified encode/decode, format detection, error cases for new format
 
 **New tests to add** (in the rewritten files above or a new file):
@@ -349,7 +349,7 @@ Update mesh bandwidth test to use `send()` + `flush()` and sweep different `Batc
 17. `Sources/OmertaMesh/Monitors/AdaptiveBatchMonitor.swift` — **new**: hill-climbing adaptive monitor
 18. `Sources/HealthTestRunner/main.swift` — use batching, sweep configs, test adaptive monitor
 19. `Tests/OmertaMeshTests/EnvelopeTests/EnvelopeHeaderTests.swift` — rewrite for split routing/auth headers
-20. `Tests/OmertaMeshTests/EnvelopeTests/BinaryEnvelopeV2Tests.swift` — rewrite + rename to `BinaryEnvelopeTests.swift`
+20. `Tests/OmertaMeshTests/EnvelopeTests/BinaryEnvelopeTests.swift` — rewrite + rename to `BinaryEnvelopeTests.swift`
 21. `Tests/OmertaMeshTests/BinaryEnvelopeTests.swift` — rewrite for new format
 22. `Tests/OmertaTunnelTests/BatchWireFormatTests.swift` — **new**: wire format unit tests
 23. `Tests/OmertaMeshTests/BatchConfigTests.swift` — **new**: config resolution tests

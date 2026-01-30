@@ -88,7 +88,7 @@ public actor TunnelSession {
 
     /// Maximum batch payload size to stay within the 65535-byte UDP datagram limit.
     /// Accounts for v3 envelope overhead and JSON/base64 encoding of MeshMessage.data().
-    static let maxDatagramPayload = BinaryEnvelopeV2.maxApplicationDataForUDP
+    static let maxDatagramPayload = BinaryEnvelope.maxApplicationDataForUDP
 
     /// Buffer a packet for batched sending. Starts auto-flush timer if needed.
     /// - Parameter data: The packet data to buffer

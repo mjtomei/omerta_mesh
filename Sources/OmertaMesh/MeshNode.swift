@@ -508,7 +508,7 @@ public actor MeshNode {
         logger.info("Received \(data.count) bytes from \(address)")
 
         // Try v2 wire format first (fast path rejection for non-Omerta packets)
-        if BinaryEnvelopeV2.isValidPrefix(data) {
+        if BinaryEnvelope.isValidPrefix(data) {
             do {
                 // Use decodeV2WithHash to get the raw channel hash for routing
                 let (envelope, channelHash) = try MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey)

@@ -23,7 +23,7 @@ All cryptographic operations use Apple's [CryptoKit](https://developer.apple.com
 
 | Component | File |
 |-----------|------|
-| Wire Format v2 encoding/decoding | `Envelope/BinaryEnvelopeV2.swift` |
+| Wire Format v2 encoding/decoding | `Envelope/BinaryEnvelope.swift` |
 | Envelope header structure | `Envelope/EnvelopeHeader.swift` |
 | Key exchange state machine | `Services/Cloister/KeyExchange.swift` |
 | Network negotiation client | `Services/Cloister/CloisterClient.swift` |
@@ -36,7 +36,7 @@ All cryptographic operations use Apple's [CryptoKit](https://developer.apple.com
 
 ## 1. Wire Format v3 - Packet Encryption
 
-**Implementation:** `Envelope/BinaryEnvelopeV2.swift`, `Envelope/EnvelopeHeader.swift`
+**Implementation:** `Envelope/BinaryEnvelope.swift`, `Envelope/EnvelopeHeader.swift`
 
 ### Structure
 

@@ -1,4 +1,4 @@
-// BinaryEnvelopeV2.swift - Wire Format v3 with split routing/auth/payload encryption
+// BinaryEnvelope.swift - Wire Format v3 with split routing/auth/payload encryption
 //
 // Format structure:
 // UNENCRYPTED PREFIX (4 bytes):
@@ -30,7 +30,7 @@ import Foundation
 import Crypto
 
 /// Encrypted data ready for network transmission.
-/// Can only be constructed by BinaryEnvelopeV2 encryption methods.
+/// Can only be constructed by BinaryEnvelope encryption methods.
 public struct SealedEnvelope: Sendable {
     /// The encrypted bytes. Read-only for sending.
     public let data: Data
@@ -48,7 +48,7 @@ public struct SealedEnvelope: Sendable {
 }
 
 /// Wire format v3 implementation with split routing/auth/payload encryption
-public enum BinaryEnvelopeV2 {
+public enum BinaryEnvelope {
     /// Magic bytes identifying Omerta packets (3 bytes)
     public static let magic = Data("OMR".utf8)
 
@@ -435,7 +435,7 @@ public enum BinaryEnvelopeV2 {
 extension MeshEnvelope {
     /// Encode envelope using v3 wire format
     public func encodeV2(networkKey: Data) throws -> SealedEnvelope {
-        let networkHash = BinaryEnvelopeV2.computeNetworkHash(networkKey)
+        let networkHash = BinaryEnvelope.computeNetworkHash(networkKey)
         let channelHash = ChannelHash.hash(channel)
 
         let messageUUID: UUID
@@ -470,12 +470,12 @@ extension MeshEnvelope {
         )
 
         let payloadData = try JSONCoding.encoder.encode(payload)
-        return try BinaryEnvelopeV2.encode(header: header, payload: payloadData, networkKey: networkKey)
+        return try BinaryEnvelope.encode(header: header, payload: payloadData, networkKey: networkKey)
     }
 
     /// Decode envelope from v3 wire format
     public static func decodeV2(_ data: Data, networkKey: Data) throws -> MeshEnvelope {
-        let (header, payloadData) = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
+        let (header, payloadData) = try BinaryEnvelope.decode(data, networkKey: networkKey)
         let payload = try JSONCoding.decoder.decode(MeshMessage.self, from: payloadData)
 
         let messageId = header.messageId.uuidString
@@ -498,7 +498,7 @@ extension MeshEnvelope {
 
     /// Decode envelope from v3 wire format, returning the raw channel hash
     public static func decodeV2WithHash(_ data: Data, networkKey: Data) throws -> (envelope: MeshEnvelope, channelHash: UInt16) {
-        let (header, payloadData) = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
+        let (header, payloadData) = try BinaryEnvelope.decode(data, networkKey: networkKey)
         let payload = try JSONCoding.decoder.decode(MeshMessage.self, from: payloadData)
 
         let messageId = header.messageId.uuidString

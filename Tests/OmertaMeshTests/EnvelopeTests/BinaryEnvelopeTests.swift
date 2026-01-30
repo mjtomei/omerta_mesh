@@ -1,7 +1,7 @@
 import XCTest
 @testable import OmertaMesh
 
-final class BinaryEnvelopeV2Tests: XCTestCase {
+final class BinaryEnvelopeTests: XCTestCase {
 
     // Test key (32 bytes)
     let testKey = Data(repeating: 0x42, count: 32)
@@ -26,8 +26,8 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         let encoded = try envelope.encodeV2(networkKey: testKey)
 
         // Verify it starts with magic and version
-        XCTAssertEqual(encoded.data.prefix(3), BinaryEnvelopeV2.magic)
-        XCTAssertEqual(encoded.data[3], BinaryEnvelopeV2.version)
+        XCTAssertEqual(encoded.data.prefix(3), BinaryEnvelope.magic)
+        XCTAssertEqual(encoded.data[3], BinaryEnvelope.version)
 
         // Decode from v3 format with hash
         let (decoded, channelHash) = try MeshEnvelope.decodeV2WithHash(encoded.data, networkKey: testKey)
@@ -72,37 +72,37 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         var validData = Data("OMR".utf8)
         validData.append(0x03)
         validData.append(contentsOf: [UInt8](repeating: 0, count: 100))
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(validData))
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(validData))
 
         // Wrong magic
         var wrongMagic = Data("XXX".utf8)
         wrongMagic.append(0x03)
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(wrongMagic))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(wrongMagic))
 
         // Wrong version
         var wrongVersion = Data("OMR".utf8)
         wrongVersion.append(0x02)
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(wrongVersion))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(wrongVersion))
 
         // Too short
         let tooShort = Data("OM".utf8)
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(tooShort))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(tooShort))
 
         // Empty
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(Data()))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(Data()))
     }
 
     // MARK: - Network Hash
 
     func testNetworkHashComputation() {
-        let hash1 = BinaryEnvelopeV2.computeNetworkHash(testKey)
-        let hash2 = BinaryEnvelopeV2.computeNetworkHash(testKey)
+        let hash1 = BinaryEnvelope.computeNetworkHash(testKey)
+        let hash2 = BinaryEnvelope.computeNetworkHash(testKey)
 
         XCTAssertEqual(hash1, hash2)
         XCTAssertEqual(hash1.count, 8)
 
         let differentKey = Data(repeating: 0x43, count: 32)
-        let hash3 = BinaryEnvelopeV2.computeNetworkHash(differentKey)
+        let hash3 = BinaryEnvelope.computeNetworkHash(differentKey)
         XCTAssertNotEqual(hash1, hash3)
     }
 
@@ -131,7 +131,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         data.append(0x03)
         data.append(contentsOf: [UInt8](repeating: 0, count: 300))
 
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(data, networkKey: testKey)) { error in
+        XCTAssertThrowsError(try BinaryEnvelope.decode(data, networkKey: testKey)) { error in
             guard case EnvelopeError.invalidMagic = error else {
                 XCTFail("Expected invalidMagic error, got \(error)")
                 return
@@ -144,7 +144,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         data.append(0xFF)
         data.append(contentsOf: [UInt8](repeating: 0, count: 300))
 
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(data, networkKey: testKey)) { error in
+        XCTAssertThrowsError(try BinaryEnvelope.decode(data, networkKey: testKey)) { error in
             guard case EnvelopeError.unsupportedVersion(0xFF) = error else {
                 XCTFail("Expected unsupportedVersion error, got \(error)")
                 return
@@ -156,7 +156,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         var data = Data("OMR".utf8)
         data.append(0x03)
 
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(data, networkKey: testKey)) { error in
+        XCTAssertThrowsError(try BinaryEnvelope.decode(data, networkKey: testKey)) { error in
             guard case EnvelopeError.truncatedPacket = error else {
                 XCTFail("Expected truncatedPacket error, got \(error)")
                 return
@@ -180,7 +180,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         let encoded = try envelope.encodeV2(networkKey: testKey)
 
         // Should be able to decode just routing header without decrypting auth or payload
-        let routingHeader = try BinaryEnvelopeV2.decodeRoutingOnly(encoded.data, networkKey: testKey)
+        let routingHeader = try BinaryEnvelope.decodeRoutingOnly(encoded.data, networkKey: testKey)
 
         XCTAssertEqual(routingHeader.channel, ChannelHash.hash("test-channel"))
         XCTAssertFalse(routingHeader.isBroadcast)
@@ -560,28 +560,28 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
 
     func testTotalOverhead() {
         // Single chunk (payload <= 512)
-        let singleChunkOverhead = BinaryEnvelopeV2.totalOverhead(payloadSize: 100)
+        let singleChunkOverhead = BinaryEnvelope.totalOverhead(payloadSize: 100)
         XCTAssertEqual(singleChunkOverhead, 232 + 16)  // headerOverhead + 1 * perChunkOverhead
 
         // Two chunks
-        let twoChunkOverhead = BinaryEnvelopeV2.totalOverhead(payloadSize: 600)
+        let twoChunkOverhead = BinaryEnvelope.totalOverhead(payloadSize: 600)
         XCTAssertEqual(twoChunkOverhead, 232 + 2 * 16)
 
         // Empty payload still has 1 chunk
-        let emptyOverhead = BinaryEnvelopeV2.totalOverhead(payloadSize: 0)
+        let emptyOverhead = BinaryEnvelope.totalOverhead(payloadSize: 0)
         XCTAssertEqual(emptyOverhead, 232 + 16)
     }
 
     func testMaxPayloadForUDPIsExact() {
-        let maxPayload = BinaryEnvelopeV2.maxPayloadForUDP
+        let maxPayload = BinaryEnvelope.maxPayloadForUDP
 
         // At maxPayload, the wire size should be <= 65535
-        let wireSize = maxPayload + BinaryEnvelopeV2.totalOverhead(payloadSize: maxPayload)
+        let wireSize = maxPayload + BinaryEnvelope.totalOverhead(payloadSize: maxPayload)
         XCTAssertLessThanOrEqual(wireSize, 65535,
             "maxPayloadForUDP (\(maxPayload)) produces wire size \(wireSize) which exceeds 65535")
 
         // At maxPayload + 1, the wire size should exceed 65535
-        let wireSizePlus1 = (maxPayload + 1) + BinaryEnvelopeV2.totalOverhead(payloadSize: maxPayload + 1)
+        let wireSizePlus1 = (maxPayload + 1) + BinaryEnvelope.totalOverhead(payloadSize: maxPayload + 1)
         XCTAssertGreaterThan(wireSizePlus1, 65535,
             "maxPayloadForUDP + 1 should exceed 65535 but wire size is \(wireSizePlus1)")
     }
@@ -590,7 +590,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         // Verify that MeshMessage.data() at maxApplicationDataForUDP encodes to <= 65535 bytes
         let keypair = IdentityKeypair()
         let machineId = UUID().uuidString
-        let maxAppData = BinaryEnvelopeV2.maxApplicationDataForUDP
+        let maxAppData = BinaryEnvelope.maxApplicationDataForUDP
         let largeData = Data(repeating: 0xAB, count: maxAppData)
 
         let envelope = try MeshEnvelope.signed(
@@ -611,7 +611,7 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         let keypair = IdentityKeypair()
         let machineId = UUID().uuidString
         // Use a significantly larger payload to account for base64 granularity
-        let oversize = BinaryEnvelopeV2.maxApplicationDataForUDP + 512
+        let oversize = BinaryEnvelope.maxApplicationDataForUDP + 512
         let largeData = Data(repeating: 0xAB, count: oversize)
 
         let envelope = try MeshEnvelope.signed(
