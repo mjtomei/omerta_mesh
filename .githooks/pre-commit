@@ -334,4 +334,7 @@ if [ $FOUND -eq 1 ]; then
     exit 1
 fi
 
+# Auto-correct stale .commit hashes (top-level repo only; no-op in sub-repos)
+[ -x "$REPO_ROOT/scripts/update-commit-hashes.sh" ] && "$REPO_ROOT/scripts/update-commit-hashes.sh"
+
 exit 0
