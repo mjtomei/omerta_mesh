@@ -114,13 +114,7 @@ public actor TunnelSession {
         }
     }
 
-    /// Maximum batch payload size to stay within UDP datagram limits.
-    /// Envelope overhead (v3 headers + chunked encryption tags) can add ~1KB+,
-    /// so we cap batch payloads well below the 65535-byte UDP limit.
-    private static let maxBatchPayloadSize = 40_000
-
-    /// Flush all buffered packets, splitting into multiple sends if needed
-    /// to avoid exceeding UDP datagram size limits.
+    /// Flush all buffered packets, sending them as a single batch.
     /// - Throws: TunnelError.notConnected if session is not active
     public func flush() async throws {
         guard state == .active else {
@@ -139,35 +133,16 @@ public actor TunnelSession {
         sendBuffer = []
         sendBufferSize = 0
 
-        // Split into chunks that fit within UDP limits
-        var chunkStart = 0
-        var chunkSize = 0
-
-        while chunkStart < packets.count {
-            var chunkEnd = chunkStart
-            chunkSize = 0
-
-            while chunkEnd < packets.count {
-                // Batch overhead per packet: 2 bytes (length) + up to 1 byte (padding)
-                let pktWireSize = 2 + packets[chunkEnd].count + (packets[chunkEnd].count & 1)
-                if chunkSize > 0 && chunkSize + pktWireSize > Self.maxBatchPayloadSize {
-                    break
-                }
-                chunkSize += pktWireSize
-                chunkEnd += 1
-            }
-
-            let slice = Array(packets[chunkStart..<chunkEnd])
-            let batchData: Data
-            if slice.count == 1 {
-                batchData = BatchWireFormat.packSingle(slice[0])
-            } else {
-                batchData = BatchWireFormat.packBatch(slice)
-            }
-
-            try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
-            chunkStart = chunkEnd
+        // Pack into batch wire format
+        let batchData: Data
+        if packets.count == 1 {
+            batchData = BatchWireFormat.packSingle(packets[0])
+        } else {
+            batchData = BatchWireFormat.packBatch(packets)
         }
+
+        // Send directly (not buffered) since tunnel already batched
+        try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
 
         stats.packetsSent += UInt64(packets.count)
         stats.bytesSent += UInt64(totalBytes)
