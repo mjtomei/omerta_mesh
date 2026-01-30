@@ -151,7 +151,13 @@ func shell(_ command: String, timeout: Duration = .seconds(10)) async -> (exitCo
         return (-1, "Failed to launch: \(error)")
     }
 
-    // Wait with timeout
+    // Start reading pipe immediately (before waiting) to avoid deadlock.
+    // readDataToEndOfFile() blocks until the write end is closed (process exit).
+    let pipeTask = Task.detached { () -> Data in
+        pipe.fileHandleForReading.readDataToEndOfFile()
+    }
+
+    // Wait for process with timeout
     let waitTask = Task {
         process.waitUntilExit()
         return process.terminationStatus
@@ -168,8 +174,25 @@ func shell(_ command: String, timeout: Duration = .seconds(10)) async -> (exitCo
         return first
     }
 
-    let exitCode = result ?? { process.terminate(); return -1 as Int32 }()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    if result == nil {
+        // Timeout — kill process and close pipe to unblock reader
+        process.terminate()
+        // Close our end of the pipe to ensure readDataToEndOfFile returns
+        try? pipe.fileHandleForReading.close()
+    }
+    let exitCode = result ?? -1
+
+    // Give pipe read a bounded time to finish
+    let data = await withTaskGroup(of: Data.self) { group in
+        group.addTask { await pipeTask.value }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(2))
+            return Data()
+        }
+        let first = await group.next()!
+        group.cancelAll()
+        return first
+    }
     let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return (exitCode, output)
 }
@@ -351,26 +374,32 @@ if !staleIPs.isEmpty {
     }
 }
 #else
-// macOS: remove pfctl rules recorded by a previous test run
-let stalePfctl = await stateTracker.allPfctlRules()
-if !stalePfctl.isEmpty {
-    logger.info("  Found \(stalePfctl.count) tracked pfctl rule(s) to remove")
-    // Get current rules and remove only the tracked ones
+// macOS: remove pfctl rules from previous test runs (both tracked and untracked)
+do {
     let (_, pfRules) = await shell("pfctl -sr 2>/dev/null || true")
     let pfRulesTrimmed = pfRules.trimmingCharacters(in: .whitespacesAndNewlines)
-    let stalePfctlSet = Set(stalePfctl)
-    let cleanedRules = pfRulesTrimmed.split(separator: "\n")
-        .filter { !stalePfctlSet.contains(String($0)) }
-        .joined(separator: "\n")
-    if cleanedRules.isEmpty && !pfRulesTrimmed.isEmpty {
-        let (_, _) = await shell("pfctl -d 2>&1 || true")
-        let (_, _) = await shell("pfctl -F rules 2>&1 || true")
-        logger.info("  Disabled pfctl (all active rules were test rules)")
-    } else if cleanedRules != pfRulesTrimmed && !pfRulesTrimmed.isEmpty {
-        let (_, _) = await shell("echo '\(cleanedRules)' | pfctl -f - 2>&1 || true")
-        logger.info("  Reloaded pfctl without test rules")
-    } else {
-        logger.info("  No tracked pfctl rules found in active ruleset")
+    if !pfRulesTrimmed.isEmpty {
+        // Remove any rules that mention the test port OR were tracked from a previous run
+        let stalePfctlSet = Set(await stateTracker.allPfctlRules())
+        let cleanedRules = pfRulesTrimmed.split(separator: "\n")
+            .filter { line in
+                let s = String(line)
+                // Remove if tracked OR if it mentions the test port (stale from crashed run)
+                if stalePfctlSet.contains(s) { return false }
+                if s.contains("port") && s.contains("\(port)") { return false }
+                return true
+            }
+            .joined(separator: "\n")
+        if cleanedRules.isEmpty {
+            let (_, _) = await shell("pfctl -d 2>&1 || true")
+            let (_, _) = await shell("pfctl -F rules 2>&1 || true")
+            logger.info("  Disabled pfctl (removed all test-related rules)")
+        } else if cleanedRules != pfRulesTrimmed {
+            let (_, _) = await shell("echo '\(cleanedRules)' | pfctl -f - 2>&1 || true")
+            logger.info("  Reloaded pfctl without test rules")
+        } else {
+            logger.info("  No test-related pfctl rules found")
+        }
     }
 }
 // Check macOS application firewall
