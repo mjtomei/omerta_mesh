@@ -620,9 +620,25 @@ func waitForAck(_ expectedPhase: String, timeout: Duration = .seconds(60)) async
     while ContinuousClock.now < deadline {
         if let msg = await controlMailbox.receive(timeout: .seconds(5)) {
             if msg.phase == expectedPhase { return true }
+            logger.debug("waitForAck(\(expectedPhase)): skipping '\(msg.phase)'")
         }
     }
     return false
+}
+
+/// Wait for a specific phase and return the message (skips non-matching messages)
+func waitForPhase(_ expectedPhase: String, timeout: Duration = .seconds(30)) async -> ControlMessage? {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        let remaining = deadline - ContinuousClock.now
+        let waitTime = min(remaining, .seconds(5))
+        if let msg = await controlMailbox.receive(timeout: waitTime) {
+            if msg.phase == expectedPhase { return msg }
+            logger.debug("waitForPhase(\(expectedPhase)): skipping '\(msg.phase)'")
+        }
+    }
+    logger.warning("waitForPhase(\(expectedPhase)): timed out")
+    return nil
 }
 
 // MARK: - Message Counter
@@ -693,12 +709,16 @@ actor BandwidthMeasurer {
 
 struct BandwidthResult {
     let packetSize: Int
-    let mbps: Double
+    let direction: String       // "A→B" or "B→A"
+    let sentMbps: Double
+    let deliveredMbps: Double
 }
 
 struct BatchSweepResult {
     let delayMs: Int
-    let mbps: Double
+    let direction: String
+    let sentMbps: Double
+    let deliveredMbps: Double
     let latencyUs: Double
 }
 
@@ -709,13 +729,15 @@ struct PerfSummary {
     var meshLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
     var meshHistogram: [(label: String, count: Int)] = []
     var batchSweep: [BatchSweepResult] = []
+    var tcpBandwidth: [BandwidthResult] = []
     var recoveryPreSwapMedian: Double = 0
     var recoveryPeakLatency: Double = 0
     var recoveryTimeSeconds: Double = 0
 
     // Best bandwidth for the overhead comparison
-    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.mbps).max() ?? 0 }
-    var meshBandwidthMbps: Double { meshBandwidth.map(\.mbps).max() ?? 0 }
+    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.sentMbps).max() ?? 0 }
+    var meshBandwidthMbps: Double { meshBandwidth.map(\.sentMbps).max() ?? 0 }
+    var tcpBandwidthMbps: Double { tcpBandwidth.map(\.sentMbps).max() ?? 0 }
 }
 
 let latencyBuckets: [(label: String, range: Range<Double>)] = [
@@ -893,25 +915,97 @@ if !isNodeA {
         case "phase11-vanilla-start":
             // Open a UDP echo server on an ephemeral port for vanilla baseline
             let echoGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+            actor UDPReceiveStats {
+                var totalBytes: UInt64 = 0
+                var startNanos: UInt64 = 0
+                var endNanos: UInt64 = 0
+                func addBytes(_ n: Int) {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if totalBytes == 0 { startNanos = now }
+                    totalBytes += UInt64(n)
+                    endNanos = now
+                }
+                func result() -> (bytes: UInt64, nanos: UInt64) {
+                    return (totalBytes, endNanos > startNanos ? endNanos - startNanos : 0)
+                }
+                func reset() {
+                    totalBytes = 0
+                    startNanos = 0
+                    endNanos = 0
+                }
+            }
+            let udpStats = UDPReceiveStats()
+
             final class EchoHandler: ChannelInboundHandler, @unchecked Sendable {
                 typealias InboundIn = AddressedEnvelope<ByteBuffer>
                 typealias OutboundOut = AddressedEnvelope<ByteBuffer>
+                let stats: UDPReceiveStats
+                init(stats: UDPReceiveStats) { self.stats = stats }
                 func channelRead(context: ChannelHandlerContext, data: NIOAny) {
                     let envelope = self.unwrapInboundIn(data)
+                    let byteCount = envelope.data.readableBytes
+                    Task { await self.stats.addBytes(byteCount) }
                     // Echo back the data to the sender
                     context.writeAndFlush(self.wrapOutboundOut(envelope), promise: nil)
                 }
             }
             let echoChannel = try await DatagramBootstrap(group: echoGroup)
                 .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                .channelInitializer { ch in ch.pipeline.addHandler(EchoHandler()) }
+                .channelInitializer { ch in ch.pipeline.addHandler(EchoHandler(stats: udpStats)) }
                 .bind(host: "0.0.0.0", port: 0)
                 .get()
             let echoPort = echoChannel.localAddress?.port ?? 0
             logger.info("Node B: vanilla UDP echo server on port \(echoPort)")
             await sendControl("phase11-vanilla-ready", detail: "\(echoPort)")
 
-            // Wait for Node A to finish
+            // Wait for Node A to finish A→B bandwidth
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase11-udp-done" { break }
+            }
+
+            // Small delay to let fire-and-forget Task{addBytes} calls complete
+            try await Task.sleep(for: .milliseconds(200))
+            // Report receive stats for A→B
+            let udpRecvResult = await udpStats.result()
+            await sendControl("phase11-udp-bw-report", detail: "\(udpRecvResult.bytes),\(udpRecvResult.nanos)")
+            logger.info("Node B: A→B received \(udpRecvResult.bytes) bytes in \(udpRecvResult.nanos)ns")
+
+            // Wait for reverse direction request: B→A
+            while true {
+                guard let revMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if revMsg.phase == "phase11-udp-reverse-go" {
+                    // Parse "packetSize,packetCount,targetPort"
+                    let parts = (revMsg.detail ?? "").split(separator: ",")
+                    guard parts.count >= 3,
+                          let pktSize = Int(parts[0]),
+                          let pktCount = Int(parts[1]),
+                          let targetPort = Int(parts[2]) else {
+                        logger.error("Node B: bad reverse-go detail: \(revMsg.detail ?? "")")
+                        await sendControl("phase11-udp-reverse-done", detail: "0,0")
+                        break
+                    }
+                    let remoteAddr = try SocketAddress(ipAddress: remoteHost, port: targetPort)
+                    let payload = Data(repeating: 0xBB, count: pktSize)
+                    let blastClock = ContinuousClock()
+                    let blastStart = blastClock.now
+                    var sentBytes: UInt64 = 0
+                    for _ in 1...pktCount {
+                        let buf = echoChannel.allocator.buffer(bytes: payload)
+                        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
+                        try? await echoChannel.writeAndFlush(envelope)
+                        sentBytes += UInt64(pktSize)
+                    }
+                    let blastElapsed = blastClock.now - blastStart
+                    let blastNanos = UInt64(blastElapsed.components.seconds) * 1_000_000_000 + UInt64(blastElapsed.components.attoseconds / 1_000_000_000)
+                    await sendControl("phase11-udp-reverse-done", detail: "\(sentBytes),\(blastNanos)")
+                    logger.info("Node B: B→A sent \(sentBytes) bytes in \(blastNanos)ns")
+                    break
+                }
+            }
+
+            // Wait for final cleanup signal
             while true {
                 guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
                 if doneMsg.phase == "phase11-vanilla-done" { break }
@@ -919,6 +1013,78 @@ if !isNodeA {
             try? await echoChannel.close()
             try? await echoGroup.shutdownGracefully()
             logger.info("Node B: vanilla echo server closed")
+
+        case "phase11-tcp-start":
+            // TCP bandwidth server
+            let tcpGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let tcpBlastSize = 10_000_000 // 10MB B→A
+
+            actor TCPStats {
+                var receivedBytes: UInt64 = 0
+                var startNanos: UInt64 = 0
+                var endNanos: UInt64 = 0
+                func addBytes(_ n: Int) {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if receivedBytes == 0 { startNanos = now }
+                    receivedBytes += UInt64(n)
+                    endNanos = now
+                }
+                func result() -> (bytes: UInt64, nanos: UInt64) {
+                    return (receivedBytes, endNanos > startNanos ? endNanos - startNanos : 0)
+                }
+            }
+
+            final class TCPServerHandler: ChannelInboundHandler, @unchecked Sendable {
+                typealias InboundIn = ByteBuffer
+                typealias OutboundOut = ByteBuffer
+                let stats = TCPStats()
+                let blastSize: Int
+                let logger: Logger
+                init(blastSize: Int, logger: Logger) {
+                    self.blastSize = blastSize
+                    self.logger = logger
+                }
+                func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                    let buf = unwrapInboundIn(data)
+                    let count = buf.readableBytes
+                    Task { await self.stats.addBytes(count) }
+                }
+                func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+                    if (event as? ChannelEvent) == .inputClosed {
+                        let ctx = context
+                        Task {
+                            let result = await self.stats.result()
+                            let report = "REPORT:\(result.bytes),\(result.nanos)\n"
+                            var buf = ctx.channel.allocator.buffer(capacity: report.count + self.blastSize)
+                            buf.writeString(report)
+                            buf.writeRepeatingByte(0xDD, count: self.blastSize)
+                            ctx.writeAndFlush(self.wrapOutboundOut(buf), promise: nil)
+                            ctx.close(promise: nil)
+                        }
+                    }
+                }
+            }
+
+            let tcpBoot = ServerBootstrap(group: tcpGroup)
+                .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                .childChannelInitializer { channel in
+                    channel.pipeline.addHandler(TCPServerHandler(blastSize: tcpBlastSize, logger: logger))
+                }
+
+            let tcpServerChannel = try await tcpBoot.bind(host: "0.0.0.0", port: 0).get()
+            let tcpPort = tcpServerChannel.localAddress?.port ?? 0
+            logger.info("Node B: TCP server on port \(tcpPort)")
+            await sendControl("phase11-tcp-ready", detail: "\(tcpPort)")
+
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase11-tcp-done" { break }
+            }
+            try? await tcpServerChannel.close()
+            try? await tcpGroup.shutdownGracefully()
+            logger.info("Node B: TCP server closed")
 
         case "phase12-bw-start":
             // Receive tunnel data on channel "health-test-bw", count bytes, report total
@@ -940,26 +1106,91 @@ if !isNodeA {
                 if doneMsg.phase == "phase12-bw-done" { break }
             }
             let bwResult = await bwMeasurer.result()
-            await sendControl("phase12-bw-report", detail: "\(bwResult.bytes)")
-            logger.info("Node B: received \(bwResult.bytes) bytes for bandwidth test")
+            let bwDurationNanos = UInt64(bwResult.duration.components.seconds) * 1_000_000_000 + UInt64(bwResult.duration.components.attoseconds / 1_000_000_000)
+            await sendControl("phase12-bw-report", detail: "\(bwResult.bytes),\(bwDurationNanos)")
+            logger.info("Node B: received \(bwResult.bytes) bytes in \(bwDurationNanos)ns for bandwidth test")
+
+        case "phase12-bw-reverse-start":
+            // Reverse direction: B→A
+            let parts12r = (cmd.detail ?? "").split(separator: ",")
+            let pktSize12r = parts12r.count >= 1 ? (Int(parts12r[0]) ?? 1400) : 1400
+            let pktCount12r = parts12r.count >= 2 ? (Int(parts12r[1]) ?? 5000) : 5000
+
+            guard let revSession12 = await latestSession.get() else {
+                await sendControl("phase12-bw-reverse-done", detail: "0,0")
+                continue
+            }
+            let revPayload12 = Data(repeating: 0xBB, count: pktSize12r)
+            let revClock12 = ContinuousClock()
+            let revStart12 = revClock12.now
+            var revSentBytes12: UInt64 = 0
+            for _ in 1...pktCount12r {
+                try? await revSession12.send(revPayload12)
+                revSentBytes12 += UInt64(pktSize12r)
+            }
+            try? await revSession12.flush()
+            let revElapsed12 = revClock12.now - revStart12
+            let revNanos12 = UInt64(revElapsed12.components.seconds) * 1_000_000_000 + UInt64(revElapsed12.components.attoseconds / 1_000_000_000)
+            await sendControl("phase12-bw-reverse-done", detail: "\(revSentBytes12),\(revNanos12)")
+            logger.info("Node B: B→A sent \(revSentBytes12) bytes in \(revNanos12)ns")
 
         case "phase12b-sweep-start":
-            // Receive sweep data and count bytes
+            // Set up receive handler for sweep data
             let sweepMeasurer = BandwidthMeasurer()
-            await sweepMeasurer.start()
             if let sweepSession = await latestSession.get() {
                 await sweepSession.onReceive { data in
                     await sweepMeasurer.addBytes(UInt64(data.count))
                 }
             }
-            logger.info("Node B: waiting for batch sweep data on health-test-sweep")
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(120)) else { break }
-                if doneMsg.phase == "phase12b-sweep-done" { break }
+            logger.info("Node B: waiting for batch sweep steps")
+            await sendControl("phase12b-sweep-ack")
+
+        case "phase12b-step-start":
+            // Reset measurer for this step
+            let stepMeasurer12b = BandwidthMeasurer()
+            await stepMeasurer12b.start()
+            if let stepSession = await latestSession.get() {
+                await stepSession.onReceive { data in
+                    await stepMeasurer12b.addBytes(UInt64(data.count))
+                }
             }
-            let sweepResult = await sweepMeasurer.result()
-            await sendControl("phase12b-sweep-report", detail: "\(sweepResult.bytes)")
-            logger.info("Node B: received \(sweepResult.bytes) bytes for batch sweep")
+            // Wait for step done
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase12b-step-done" { break }
+            }
+            try await Task.sleep(for: .milliseconds(200))
+            let stepResult12b = await stepMeasurer12b.result()
+            let stepNanos12b = UInt64(stepResult12b.duration.components.seconds) * 1_000_000_000 + UInt64(stepResult12b.duration.components.attoseconds / 1_000_000_000)
+            await sendControl("phase12b-step-report", detail: "\(stepResult12b.bytes),\(stepNanos12b)")
+            logger.info("Node B: step received \(stepResult12b.bytes) bytes in \(stepNanos12b)ns")
+
+        case "phase12b-step-reverse-start":
+            let parts12bs = (cmd.detail ?? "").split(separator: ",")
+            let pktSize12bs = parts12bs.count >= 1 ? (Int(parts12bs[0]) ?? 512) : 512
+            let pktCount12bs = parts12bs.count >= 2 ? (Int(parts12bs[1]) ?? 5000) : 5000
+
+            guard let revSession12bs = await latestSession.get() else {
+                await sendControl("phase12b-step-reverse-done", detail: "0,0")
+                continue
+            }
+            let revPayload12bs = Data(repeating: 0xCC, count: pktSize12bs)
+            let revClock12bs = ContinuousClock()
+            let revStart12bs = revClock12bs.now
+            var revSent12bs: UInt64 = 0
+            for _ in 1...pktCount12bs {
+                try? await revSession12bs.send(revPayload12bs)
+                revSent12bs += UInt64(pktSize12bs)
+            }
+            try? await revSession12bs.flush()
+            let revElapsed12bs = revClock12bs.now - revStart12bs
+            let revNanos12bs = UInt64(revElapsed12bs.components.seconds) * 1_000_000_000 + UInt64(revElapsed12bs.components.attoseconds / 1_000_000_000)
+            await sendControl("phase12b-step-reverse-done", detail: "\(revSent12bs),\(revNanos12bs)")
+            logger.info("Node B: step reverse sent \(revSent12bs) bytes in \(revNanos12bs)ns")
+
+        case "phase12b-sweep-done":
+            logger.info("Node B: batch sweep complete")
+            await sendControl("phase12b-sweep-done-ack")
 
         case "phase13-ping-start":
             // Echo tunnel pings back (PING→PONG) — wait for Node A's session
@@ -1568,18 +1799,17 @@ record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-// MARK: - Phase 11: Vanilla Baseline (Direct UDP)
+// MARK: - Phase 11a: Vanilla Baseline (Direct UDP)
 
-logPhase("Phase 11: Vanilla Baseline (Direct UDP)")
+logPhase("Phase 11a: Vanilla UDP Baseline")
 
 do {
     // Tell Node B to start vanilla echo server
     await sendControl("phase11-vanilla-start")
-    guard let readyMsg = await controlMailbox.receive(timeout: .seconds(30)),
-          readyMsg.phase == "phase11-vanilla-ready",
+    guard let readyMsg = await waitForPhase("phase11-vanilla-ready", timeout: .seconds(30)),
           let echoPortStr = readyMsg.detail,
           let echoPort = Int(echoPortStr) else {
-        record("Phase 11: Vanilla Baseline", passed: false, detail: "Node B did not report echo port")
+        record("Phase 11a: Vanilla UDP Baseline", passed: false, detail: "Node B did not report echo port")
         throw TunnelError.notConnected
     }
     logger.info("Node B vanilla echo on port \(echoPort)")
@@ -1637,7 +1867,7 @@ do {
     let vanillaLatCount = await vanillaLatencyCollector.count
     logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
 
-    // Bandwidth: sweep multiple packet sizes
+    // A→B Bandwidth: sweep multiple packet sizes
     let bwPacketSizes = [256, 1024, 4096, 8192]
     let bwTargetBytes: UInt64 = 7_000_000  // ~7MB per size
     for pktSize in bwPacketSizes {
@@ -1653,21 +1883,229 @@ do {
         let bwElapsed = bwClock.now - bwStart
         let totalBytes = UInt64(bwPacketCount) * UInt64(pktSize)
         let durationSec = Double(bwElapsed.components.seconds) + Double(bwElapsed.components.attoseconds) / 1e18
-        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
-        perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: pktSize, mbps: mbps))
-        logger.info("Vanilla bandwidth (\(pktSize)B): \(String(format: "%.1f", mbps)) Mbps (\(bwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
+        let sentMbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: pktSize, direction: "A\u{2192}B", sentMbps: sentMbps, deliveredMbps: 0))
+        logger.info("Vanilla A\u{2192}B bandwidth (\(pktSize)B): \(String(format: "%.1f", sentMbps)) Mbps sent (\(bwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
     }
 
+    // Signal A→B done, get B's receive report
+    await sendControl("phase11-udp-done")
+    var deliveredAtoBMbps: Double = 0
+    if let bwReport = await waitForPhase("phase11-udp-bw-report", timeout: .seconds(15)),
+       let detail = bwReport.detail {
+        let parts = detail.split(separator: ",")
+        if parts.count >= 2,
+           let recvBytes = UInt64(parts[0]),
+           let recvNanos = UInt64(parts[1]),
+           recvNanos > 0 {
+            deliveredAtoBMbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
+        }
+    }
+    logger.info("Vanilla A\u{2192}B aggregate delivered: \(String(format: "%.1f", deliveredAtoBMbps)) Mbps")
+
+    // B→A reverse direction
+    let reverseMeasurer = BandwidthMeasurer()
+
+    // Open a receive-only UDP socket
+    final class ReverseReceiveHandler: ChannelInboundHandler, @unchecked Sendable {
+        typealias InboundIn = AddressedEnvelope<ByteBuffer>
+        let measurer: BandwidthMeasurer
+        init(measurer: BandwidthMeasurer) { self.measurer = measurer }
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            let envelope = self.unwrapInboundIn(data)
+            let count = envelope.data.readableBytes
+            Task { await self.measurer.addBytes(UInt64(count)) }
+        }
+    }
+
+    let reverseGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let reverseChannel = try await DatagramBootstrap(group: reverseGroup)
+        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+        .channelInitializer { ch in ch.pipeline.addHandler(ReverseReceiveHandler(measurer: reverseMeasurer)) }
+        .bind(host: "0.0.0.0", port: 0)
+        .get()
+    let reversePort = reverseChannel.localAddress?.port ?? 0
+    await reverseMeasurer.start()
+
+    let reversePacketSize = 8192
+    let reversePacketCount = Int(bwTargetBytes / UInt64(reversePacketSize))
+    await sendControl("phase11-udp-reverse-go", detail: "\(reversePacketSize),\(reversePacketCount),\(reversePort)")
+
+    // Wait for B to finish sending
+    var bToASentMbps: Double = 0
+    if let revDoneMsg = await waitForPhase("phase11-udp-reverse-done", timeout: .seconds(30)),
+       let detail = revDoneMsg.detail {
+        let parts = detail.split(separator: ",")
+        if parts.count >= 2,
+           let sentBytes = UInt64(parts[0]),
+           let sentNanos = UInt64(parts[1]),
+           sentNanos > 0 {
+            bToASentMbps = Double(sentBytes) * 8.0 / 1_000_000.0 / (Double(sentNanos) / 1e9)
+        }
+    }
+    // Wait a bit for trailing packets
+    try await Task.sleep(for: .seconds(2))
+    let reverseResult = await reverseMeasurer.result()
+    let bToADeliveredMbps = reverseResult.mbps
+    perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: reversePacketSize, direction: "B\u{2192}A", sentMbps: bToASentMbps, deliveredMbps: bToADeliveredMbps))
+    logger.info("Vanilla B\u{2192}A: sent=\(String(format: "%.1f", bToASentMbps)) Mbps, delivered=\(String(format: "%.1f", bToADeliveredMbps)) Mbps")
+
+    try? await reverseChannel.close()
+    try? await reverseGroup.shutdownGracefully()
     try? await vanillaChannel.close()
     try? await vanillaGroup.shutdownGracefully()
 
+    // Clean up Node B
     await sendControl("phase11-vanilla-done")
+
     let bestVanillaMbps = perfSummary.vanillaBandwidthMbps
-    let phase11Pass = vanillaLatCount >= 100
-    record("Phase 11: Vanilla Baseline", passed: phase11Pass,
-           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, best bw=\(String(format: "%.1f", bestVanillaMbps))Mbps, \(vanillaLatCount) samples")
+    let phase11aPass = vanillaLatCount >= 100
+    record("Phase 11a: Vanilla UDP Baseline", passed: phase11aPass,
+           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, best A\u{2192}B sent=\(String(format: "%.1f", bestVanillaMbps))Mbps delivered=\(String(format: "%.1f", deliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", bToASentMbps))Mbps delivered=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
 } catch {
-    record("Phase 11: Vanilla Baseline", passed: false, detail: "Error: \(error)")
+    record("Phase 11a: Vanilla UDP Baseline", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 11b: TCP Baseline
+
+logPhase("Phase 11b: TCP Baseline")
+
+do {
+    await sendControl("phase11-tcp-start")
+    guard let tcpReadyMsg = await waitForPhase("phase11-tcp-ready", timeout: .seconds(30)),
+          let tcpPortStr = tcpReadyMsg.detail,
+          let tcpPort = Int(tcpPortStr) else {
+        record("Phase 11b: TCP Baseline", passed: false, detail: "Node B TCP not ready")
+        throw TunnelError.notConnected
+    }
+    logger.info("Node B TCP on port \(tcpPort)")
+
+    let tcpGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let tcpTargetBytes = 10_000_000 // 10MB
+
+    actor TCPClientState {
+        var receivedData = Data()
+        var receiveStartNanos: UInt64 = 0
+        var receiveEndNanos: UInt64 = 0
+        var done = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func addData(_ bytes: [UInt8]) {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if receivedData.isEmpty { receiveStartNanos = now }
+            receivedData.append(contentsOf: bytes)
+            receiveEndNanos = now
+        }
+        func markDone() {
+            done = true
+            continuation?.resume()
+            continuation = nil
+        }
+        func waitForDone() async {
+            if done { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                if done {
+                    cont.resume()
+                } else {
+                    continuation = cont
+                }
+            }
+        }
+        func getReceivedData() -> Data { receivedData }
+        func getReceiveStartNanos() -> UInt64 { receiveStartNanos }
+        func getReceiveEndNanos() -> UInt64 { receiveEndNanos }
+    }
+
+    let clientState = TCPClientState()
+
+    final class TCPClientHandler: ChannelInboundHandler, @unchecked Sendable {
+        typealias InboundIn = ByteBuffer
+        let state: TCPClientState
+        init(state: TCPClientState) { self.state = state }
+
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            var buf = unwrapInboundIn(data)
+            if let bytes = buf.readBytes(length: buf.readableBytes) {
+                Task { await self.state.addData(bytes) }
+            }
+        }
+
+        func channelInactive(context: ChannelHandlerContext) {
+            Task { await self.state.markDone() }
+        }
+    }
+
+    let tcpChannel = try await ClientBootstrap(group: tcpGroup)
+        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+        .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+        .channelInitializer { channel in
+            channel.pipeline.addHandler(TCPClientHandler(state: clientState))
+        }
+        .connect(host: remoteHost, port: tcpPort)
+        .get()
+
+    // A→B: blast data
+    let sendClock = ContinuousClock()
+    let sendStart = sendClock.now
+    let chunkSize = 65536
+    var tcpRemaining = tcpTargetBytes
+    while tcpRemaining > 0 {
+        let thisChunk = min(chunkSize, tcpRemaining)
+        var buf = tcpChannel.allocator.buffer(capacity: thisChunk)
+        buf.writeRepeatingByte(0xAA, count: thisChunk)
+        try await tcpChannel.writeAndFlush(buf)
+        tcpRemaining -= thisChunk
+    }
+    let sendElapsed = sendClock.now - sendStart
+    let sendSec = Double(sendElapsed.components.seconds) + Double(sendElapsed.components.attoseconds) / 1e18
+    let tcpSendMbps = sendSec > 0 ? (Double(tcpTargetBytes) * 8.0 / 1_000_000.0 / sendSec) : 0
+
+    // Half-close write side
+    try await tcpChannel.close(mode: .output)
+
+    // Wait for B's response + close
+    await clientState.waitForDone()
+
+    let allReceived = await clientState.getReceivedData()
+    let recvStartNanos = await clientState.getReceiveStartNanos()
+    let recvEndNanos = await clientState.getReceiveEndNanos()
+
+    // Parse REPORT line from beginning of received data
+    var deliveredAtoB_Mbps: Double = 0
+    var bToATcpBytes: Int = 0
+    if let newlineRange = allReceived.range(of: Data("\n".utf8)) {
+        let reportLineData = allReceived[allReceived.startIndex..<newlineRange.lowerBound]
+        if let reportLine = String(data: reportLineData, encoding: .utf8),
+           reportLine.hasPrefix("REPORT:") {
+            let parts = reportLine.dropFirst("REPORT:".count).split(separator: ",")
+            if parts.count >= 2,
+               let recvBytes = UInt64(parts[0]),
+               let recvNanos = UInt64(parts[1]),
+               recvNanos > 0 {
+                deliveredAtoB_Mbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
+            }
+        }
+        bToATcpBytes = allReceived.count - allReceived.distance(from: allReceived.startIndex, to: newlineRange.upperBound)
+    } else {
+        bToATcpBytes = allReceived.count
+    }
+
+    let recvDurationSec = recvEndNanos > recvStartNanos ? Double(recvEndNanos - recvStartNanos) / 1e9 : 0
+    let bToADeliveredMbps = recvDurationSec > 0 ? (Double(bToATcpBytes) * 8.0 / 1_000_000.0 / recvDurationSec) : 0
+
+    perfSummary.tcpBandwidth.append(BandwidthResult(packetSize: 0, direction: "A\u{2192}B", sentMbps: tcpSendMbps, deliveredMbps: deliveredAtoB_Mbps))
+    perfSummary.tcpBandwidth.append(BandwidthResult(packetSize: 0, direction: "B\u{2192}A", sentMbps: 0, deliveredMbps: bToADeliveredMbps))
+
+    logger.info("TCP A\u{2192}B: sent=\(String(format: "%.1f", tcpSendMbps)) Mbps, delivered=\(String(format: "%.1f", deliveredAtoB_Mbps)) Mbps")
+    logger.info("TCP B\u{2192}A: delivered=\(String(format: "%.1f", bToADeliveredMbps)) Mbps")
+
+    await sendControl("phase11-tcp-done")
+    try? await tcpGroup.shutdownGracefully()
+
+    record("Phase 11b: TCP Baseline", passed: tcpSendMbps > 0,
+           detail: "A\u{2192}B sent=\(String(format: "%.1f", tcpSendMbps))Mbps delivered=\(String(format: "%.1f", deliveredAtoB_Mbps))Mbps, B\u{2192}A=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
+} catch {
+    record("Phase 11b: TCP Baseline", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 12: Mesh Bandwidth
@@ -1693,22 +2131,58 @@ do {
         let elapsed = clock.now - start
         let totalBytes = UInt64(meshBwPacketCount) * UInt64(pktSize)
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
-        perfSummary.meshBandwidth.append(BandwidthResult(packetSize: pktSize, mbps: mbps))
-        logger.info("Mesh bandwidth (\(pktSize)B): \(String(format: "%.1f", mbps)) Mbps (\(meshBwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
+        let sentMbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        perfSummary.meshBandwidth.append(BandwidthResult(packetSize: pktSize, direction: "A\u{2192}B", sentMbps: sentMbps, deliveredMbps: 0))
+        logger.info("Mesh A\u{2192}B bandwidth (\(pktSize)B): \(String(format: "%.1f", sentMbps)) Mbps sent (\(meshBwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
     }
 
     try await Task.sleep(for: .seconds(2))
     await sendControl("phase12-bw-done")
 
-    // Wait for Node B report
-    let bwReport = await controlMailbox.receive(timeout: .seconds(15))
-    let bRecvBytes = bwReport.flatMap { UInt64($0.detail ?? "") } ?? 0
+    // Wait for Node B report (bytes,nanos)
+    var meshDeliveredAtoBMbps: Double = 0
+    if let bwReport = await waitForPhase("phase12-bw-report", timeout: .seconds(15)),
+       let detail = bwReport.detail {
+        let parts = detail.split(separator: ",")
+        if parts.count >= 2,
+           let recvBytes = UInt64(parts[0]),
+           let recvNanos = UInt64(parts[1]),
+           recvNanos > 0 {
+            meshDeliveredAtoBMbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
+        }
+        logger.info("Mesh A\u{2192}B delivered: \(String(format: "%.1f", meshDeliveredAtoBMbps)) Mbps (B received \(parts.first ?? "?") bytes)")
+    }
+
+    // Reverse direction: B→A
+    let meshRevMeasurer = BandwidthMeasurer()
+    await meshRevMeasurer.start()
+    await bwSession.onReceive { data in
+        await meshRevMeasurer.addBytes(UInt64(data.count))
+    }
+    let meshRevPktSize = 1400
+    let meshRevPktCount = Int(meshBwTargetBytes / UInt64(meshRevPktSize))
+    await sendControl("phase12-bw-reverse-start", detail: "\(meshRevPktSize),\(meshRevPktCount)")
+
+    var meshBToASentMbps: Double = 0
+    if let revDone = await waitForPhase("phase12-bw-reverse-done", timeout: .seconds(30)),
+       let detail = revDone.detail {
+        let parts = detail.split(separator: ",")
+        if parts.count >= 2,
+           let sentBytes = UInt64(parts[0]),
+           let sentNanos = UInt64(parts[1]),
+           sentNanos > 0 {
+            meshBToASentMbps = Double(sentBytes) * 8.0 / 1_000_000.0 / (Double(sentNanos) / 1e9)
+        }
+    }
+    try await Task.sleep(for: .seconds(2))
+    let meshRevResult = await meshRevMeasurer.result()
+    let meshBToADeliveredMbps = meshRevResult.mbps
+    perfSummary.meshBandwidth.append(BandwidthResult(packetSize: meshRevPktSize, direction: "B\u{2192}A", sentMbps: meshBToASentMbps, deliveredMbps: meshBToADeliveredMbps))
+    logger.info("Mesh B\u{2192}A: sent=\(String(format: "%.1f", meshBToASentMbps)) Mbps, delivered=\(String(format: "%.1f", meshBToADeliveredMbps)) Mbps")
 
     let bestMeshMbps = perfSummary.meshBandwidthMbps
-    logger.info("Mesh bandwidth best: \(String(format: "%.1f", bestMeshMbps)) Mbps (B received \(bRecvBytes) bytes)")
     record("Phase 12: Mesh Bandwidth", passed: bestMeshMbps > 0,
-           detail: "best=\(String(format: "%.1f", bestMeshMbps)) Mbps, B received \(bRecvBytes) bytes")
+           detail: "best A\u{2192}B sent=\(String(format: "%.1f", bestMeshMbps))Mbps delivered=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
 }
@@ -1719,6 +2193,7 @@ logPhase("Phase 12b: Batch Config Sweep")
 
 do {
     await sendControl("phase12b-sweep-start")
+    _ = await waitForPhase("phase12b-sweep-ack", timeout: .seconds(15))
 
     let sweepSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-sweep")
     try await Task.sleep(for: .seconds(1))
@@ -1728,7 +2203,12 @@ do {
     let sweepPayload = Data(repeating: 0xCC, count: sweepPktSize)
     let sweepTargetBytes: UInt64 = 5_000_000
 
-    logger.info("Batch Config Sweep: delay(ms) → bandwidth(Mbps) / latency(us)")
+    logger.info("Batch Config Sweep: delay(ms) \u{2192} bandwidth(Mbps) / latency(us)")
+
+    let sweepRevMeasurer = BandwidthMeasurer()
+    await sweepSession.onReceive { data in
+        await sweepRevMeasurer.addBytes(UInt64(data.count))
+    }
 
     for delayMs in sweepDelays {
         // Reconfigure batch config on the session
@@ -1738,6 +2218,10 @@ do {
         ))
 
         let packetCount = Int(sweepTargetBytes / UInt64(sweepPktSize))
+
+        // Signal step start to Node B
+        await sendControl("phase12b-step-start", detail: "\(delayMs),\(sweepPktSize),\(packetCount)")
+
         let clock = ContinuousClock()
         let start = clock.now
 
@@ -1749,21 +2233,54 @@ do {
         let elapsed = clock.now - start
         let totalBytes = UInt64(packetCount) * UInt64(sweepPktSize)
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        let sentMbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
         let avgLatencyUs = durationSec > 0 ? (durationSec * 1_000_000.0 / Double(packetCount)) : 0
 
-        perfSummary.batchSweep.append(BatchSweepResult(delayMs: delayMs, mbps: mbps, latencyUs: avgLatencyUs))
-        logger.info("  delay=\(String(format: "%3d", delayMs))ms: \(String(format: "%8.1f", mbps)) Mbps, \(String(format: "%8.1f", avgLatencyUs)) us/pkt")
+        // Signal step done, get B's report
+        await sendControl("phase12b-step-done")
+        var stepDeliveredMbps: Double = 0
+        if let stepReport = await waitForPhase("phase12b-step-report", timeout: .seconds(15)),
+           let detail = stepReport.detail {
+            let parts = detail.split(separator: ",")
+            if parts.count >= 2,
+               let recvBytes = UInt64(parts[0]),
+               let recvNanos = UInt64(parts[1]),
+               recvNanos > 0 {
+                stepDeliveredMbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
+            }
+        }
+
+        perfSummary.batchSweep.append(BatchSweepResult(delayMs: delayMs, direction: "A\u{2192}B", sentMbps: sentMbps, deliveredMbps: stepDeliveredMbps, latencyUs: avgLatencyUs))
+        logger.info("  A\u{2192}B delay=\(String(format: "%3d", delayMs))ms: \(String(format: "%8.1f", sentMbps)) Mbps sent, \(String(format: "%8.1f", stepDeliveredMbps)) Mbps delivered, \(String(format: "%8.1f", avgLatencyUs)) us/pkt")
+
+        // Reverse direction for this step
+        await sweepRevMeasurer.start()
+        await sendControl("phase12b-step-reverse-start", detail: "\(sweepPktSize),\(packetCount)")
+
+        var stepRevSentMbps: Double = 0
+        if let revDone = await waitForPhase("phase12b-step-reverse-done", timeout: .seconds(30)),
+           let detail = revDone.detail {
+            let parts = detail.split(separator: ",")
+            if parts.count >= 2,
+               let sentBytes = UInt64(parts[0]),
+               let sentNanos = UInt64(parts[1]),
+               sentNanos > 0 {
+                stepRevSentMbps = Double(sentBytes) * 8.0 / 1_000_000.0 / (Double(sentNanos) / 1e9)
+            }
+        }
+        try await Task.sleep(for: .seconds(1))
+        let stepRevResult = await sweepRevMeasurer.result()
+        let stepRevDeliveredMbps = stepRevResult.mbps
+
+        perfSummary.batchSweep.append(BatchSweepResult(delayMs: delayMs, direction: "B\u{2192}A", sentMbps: stepRevSentMbps, deliveredMbps: stepRevDeliveredMbps, latencyUs: 0))
+        logger.info("  B\u{2192}A delay=\(String(format: "%3d", delayMs))ms: \(String(format: "%8.1f", stepRevSentMbps)) Mbps sent, \(String(format: "%8.1f", stepRevDeliveredMbps)) Mbps delivered")
     }
 
-    try await Task.sleep(for: .seconds(2))
     await sendControl("phase12b-sweep-done")
-
-    // Wait for Node B ack
-    _ = await controlMailbox.receive(timeout: .seconds(15))
+    _ = await waitForPhase("phase12b-sweep-done-ack", timeout: .seconds(15))
 
     record("Phase 12b: Batch Config Sweep", passed: !perfSummary.batchSweep.isEmpty,
-           detail: perfSummary.batchSweep.map { "delay=\($0.delayMs)ms:\(String(format: "%.1f", $0.mbps))Mbps" }.joined(separator: ", "))
+           detail: perfSummary.batchSweep.filter { $0.direction == "A\u{2192}B" }.map { "delay=\($0.delayMs)ms:\(String(format: "%.1f", $0.sentMbps))Mbps" }.joined(separator: ", "))
 } catch {
     record("Phase 12b: Batch Config Sweep", passed: false, detail: "Error: \(error)")
 }
@@ -2020,25 +2537,52 @@ do {
     let l95Overhead = vL95 > 0 ? String(format: "%.1fx", mL95 / vL95) : "N/A"
     let l99Overhead = vL99 > 0 ? String(format: "%.1fx", mL99 / vL99) : "N/A"
 
-    // Bandwidth by packet size
+    // Bandwidth by packet size (A→B)
     logger.info("")
-    logger.info("=== BANDWIDTH BY PACKET SIZE ===")
-    logger.info("Packet Size    Vanilla (Mbps)    Mesh (Mbps)    Overhead")
-    let allSizes = Set(perfSummary.vanillaBandwidth.map(\.packetSize) + perfSummary.meshBandwidth.map(\.packetSize)).sorted()
+    logger.info("=== BANDWIDTH BY PACKET SIZE (A\u{2192}B) ===")
+    logger.info("Packet Size    Vanilla Sent    Mesh Sent    Overhead")
+    let vanillaAtoB = perfSummary.vanillaBandwidth.filter { $0.direction == "A\u{2192}B" }
+    let meshAtoB = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }
+    let allSizes = Set(vanillaAtoB.map(\.packetSize) + meshAtoB.map(\.packetSize)).sorted()
     for size in allSizes {
-        let vBw = perfSummary.vanillaBandwidth.first(where: { $0.packetSize == size })?.mbps ?? 0
-        let mBw = perfSummary.meshBandwidth.first(where: { $0.packetSize == size })?.mbps ?? 0
+        let vBw = vanillaAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
+        let mBw = meshAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
         let overhead = vBw > 0 && mBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
-        logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))      \(String(format: "%10.1f", mBw))      \(overhead)")
+        logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))  \(String(format: "%10.1f", mBw))    \(overhead)")
+    }
+
+    // B→A bandwidth
+    let vanillaBtoA = perfSummary.vanillaBandwidth.filter { $0.direction == "B\u{2192}A" }
+    let meshBtoA = perfSummary.meshBandwidth.filter { $0.direction == "B\u{2192}A" }
+    if !vanillaBtoA.isEmpty || !meshBtoA.isEmpty {
+        logger.info("")
+        logger.info("=== BANDWIDTH B\u{2192}A ===")
+        logger.info("                Sent (Mbps)    Delivered (Mbps)")
+        for r in vanillaBtoA {
+            logger.info("Vanilla UDP     \(String(format: "%10.1f", r.sentMbps))     \(String(format: "%10.1f", r.deliveredMbps))")
+        }
+        for r in meshBtoA {
+            logger.info("Mesh Tunnel     \(String(format: "%10.1f", r.sentMbps))     \(String(format: "%10.1f", r.deliveredMbps))")
+        }
+    }
+
+    // TCP bandwidth
+    if !perfSummary.tcpBandwidth.isEmpty {
+        logger.info("")
+        logger.info("=== TCP BANDWIDTH ===")
+        logger.info("Direction    Sent (Mbps)    Delivered (Mbps)")
+        for r in perfSummary.tcpBandwidth {
+            logger.info("\(r.direction.padding(toLength: 12, withPad: " ", startingAt: 0)) \(String(format: "%10.1f", r.sentMbps))     \(String(format: "%10.1f", r.deliveredMbps))")
+        }
     }
 
     // Batch config sweep
     if !perfSummary.batchSweep.isEmpty {
         logger.info("")
         logger.info("=== BATCH CONFIG SWEEP (512B packets) ===")
-        logger.info("Flush Delay    Bandwidth (Mbps)    Avg Latency (us/pkt)")
+        logger.info("Flush Delay    Dir      Sent (Mbps)    Delivered (Mbps)    Avg Latency (us/pkt)")
         for r in perfSummary.batchSweep {
-            logger.info("\(String(format: "%7d ms", r.delayMs))    \(String(format: "%12.1f", r.mbps))        \(String(format: "%12.1f", r.latencyUs))")
+            logger.info("\(String(format: "%7d ms", r.delayMs))    \(r.direction)  \(String(format: "%10.1f", r.sentMbps))       \(String(format: "%10.1f", r.deliveredMbps))         \(String(format: "%10.1f", r.latencyUs))")
         }
     }
 
