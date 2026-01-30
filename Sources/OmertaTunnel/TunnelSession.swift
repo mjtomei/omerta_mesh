@@ -86,6 +86,10 @@ public actor TunnelSession {
 
     // MARK: - Sending
 
+    /// Maximum batch payload size to stay within the 65535-byte UDP datagram limit.
+    /// Accounts for v3 envelope overhead and JSON/base64 encoding of MeshMessage.data().
+    static let maxDatagramPayload = BinaryEnvelopeV2.maxApplicationDataForUDP
+
     /// Buffer a packet for batched sending. Starts auto-flush timer if needed.
     /// - Parameter data: The packet data to buffer
     /// - Throws: TunnelError.notConnected if session is not active
@@ -97,8 +101,11 @@ public actor TunnelSession {
         sendBuffer.append(data)
         sendBufferSize += data.count
 
-        // Check if buffer size threshold triggers immediate flush
-        if batchConfig.maxBufferSize > 0 && sendBufferSize >= batchConfig.maxBufferSize {
+        // Flush if we hit the user-configured threshold or the hard UDP ceiling
+        let effectiveLimit = batchConfig.maxBufferSize > 0
+            ? min(batchConfig.maxBufferSize, Self.maxDatagramPayload)
+            : Self.maxDatagramPayload
+        if sendBufferSize >= effectiveLimit {
             try await flush()
             return
         }

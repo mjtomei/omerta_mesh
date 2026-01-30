@@ -80,6 +80,44 @@ public enum BinaryEnvelopeV2 {
         return headerOverhead + chunkCount * perChunkOverhead
     }
 
+    /// Maximum envelope payload (post-JSON-encoding) that fits in a single
+    /// UDP datagram (65535 bytes).
+    /// Derived from: wireSize = headerOverhead + payload + ceil(payload/chunkSize) * perChunkOverhead
+    public static let maxPayloadForUDP: Int = {
+        let maxWire = 65535
+        // Binary search for the largest payload where totalOverhead(payload) + payload <= maxWire
+        var lo = 0
+        var hi = maxWire
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let wireSize = mid + totalOverhead(payloadSize: mid)
+            if wireSize <= maxWire {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        return lo
+    }()
+
+    /// Maximum application data size for a MeshMessage.data() payload that fits
+    /// in a single UDP datagram. Accounts for JSON encoding overhead: base64
+    /// expands data by 4/3, plus JSON wrapper bytes for the enum encoding.
+    /// Computed empirically from the actual encoder to avoid wrapper size guesses.
+    public static let maxApplicationDataForUDP: Int = {
+        // Measure JSON overhead by encoding a small known payload
+        let probe = Data(repeating: 0, count: 3) // 3 bytes → 4 base64 chars
+        let msg = MeshMessage.data(probe)
+        let encoded = try! JSONCoding.encoder.encode(msg)
+        let jsonOverhead = encoded.count - 4  // subtract the 4 base64 chars for 3 bytes
+
+        // Base64: ceil(n/3) * 4 bytes. Total JSON = jsonOverhead + ceil(n/3)*4
+        // Solve: jsonOverhead + ceil(n/3)*4 <= maxPayloadForUDP
+        let available = maxPayloadForUDP - jsonOverhead
+        // ceil(n/3)*4 <= available → n <= floor(available/4) * 3
+        return (available / 4) * 3
+    }()
+
     /// HKDF info string for header key derivation
     private static let headerKeyInfo = Data("omerta-header-v3".utf8)
 

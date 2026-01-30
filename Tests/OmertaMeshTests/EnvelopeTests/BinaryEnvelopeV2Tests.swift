@@ -571,4 +571,59 @@ final class BinaryEnvelopeV2Tests: XCTestCase {
         let emptyOverhead = BinaryEnvelopeV2.totalOverhead(payloadSize: 0)
         XCTAssertEqual(emptyOverhead, 232 + 16)
     }
+
+    func testMaxPayloadForUDPIsExact() {
+        let maxPayload = BinaryEnvelopeV2.maxPayloadForUDP
+
+        // At maxPayload, the wire size should be <= 65535
+        let wireSize = maxPayload + BinaryEnvelopeV2.totalOverhead(payloadSize: maxPayload)
+        XCTAssertLessThanOrEqual(wireSize, 65535,
+            "maxPayloadForUDP (\(maxPayload)) produces wire size \(wireSize) which exceeds 65535")
+
+        // At maxPayload + 1, the wire size should exceed 65535
+        let wireSizePlus1 = (maxPayload + 1) + BinaryEnvelopeV2.totalOverhead(payloadSize: maxPayload + 1)
+        XCTAssertGreaterThan(wireSizePlus1, 65535,
+            "maxPayloadForUDP + 1 should exceed 65535 but wire size is \(wireSizePlus1)")
+    }
+
+    func testMaxApplicationDataForUDPEncodesSuccessfully() throws {
+        // Verify that MeshMessage.data() at maxApplicationDataForUDP encodes to <= 65535 bytes
+        let keypair = IdentityKeypair()
+        let machineId = UUID().uuidString
+        let maxAppData = BinaryEnvelopeV2.maxApplicationDataForUDP
+        let largeData = Data(repeating: 0xAB, count: maxAppData)
+
+        let envelope = try MeshEnvelope.signed(
+            from: keypair,
+            machineId: machineId,
+            to: nil,
+            channel: "",
+            payload: .data(largeData)
+        )
+
+        let encoded = try envelope.encodeV2(networkKey: Data(repeating: 0x42, count: 32))
+        XCTAssertLessThanOrEqual(encoded.data.count, 65535,
+            "Envelope with maxApplicationDataForUDP bytes should fit in a UDP datagram, got \(encoded.data.count)")
+    }
+
+    func testMaxApplicationDataPlusOneExceedsUDP() throws {
+        // Verify that maxApplicationDataForUDP + 1 exceeds the limit
+        let keypair = IdentityKeypair()
+        let machineId = UUID().uuidString
+        // Use a significantly larger payload to account for base64 granularity
+        let oversize = BinaryEnvelopeV2.maxApplicationDataForUDP + 512
+        let largeData = Data(repeating: 0xAB, count: oversize)
+
+        let envelope = try MeshEnvelope.signed(
+            from: keypair,
+            machineId: machineId,
+            to: nil,
+            channel: "",
+            payload: .data(largeData)
+        )
+
+        let encoded = try envelope.encodeV2(networkKey: Data(repeating: 0x42, count: 32))
+        XCTAssertGreaterThan(encoded.data.count, 65535,
+            "Envelope with maxApplicationDataForUDP + 512 bytes should exceed UDP limit, got \(encoded.data.count)")
+    }
 }

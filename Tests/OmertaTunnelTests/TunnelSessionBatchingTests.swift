@@ -207,7 +207,78 @@ final class TunnelSessionBatchingTests: XCTestCase {
         await session.close()
     }
 
-    /// 7. flush() on a non-active session throws TunnelError.notConnected.
+    /// 7. Sending data beyond maxDatagramPayload triggers auto-flush.
+    func testUDPSizeLimitTriggersFlush() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 0)
+        )
+
+        let maxPayload = TunnelSession.maxDatagramPayload
+        // Send enough data to exceed the limit — each packet is 1000 bytes
+        let packetSize = 1000
+        let packetsNeeded = (maxPayload / packetSize) + 1
+        let packet = Data(repeating: 0xDD, count: packetSize)
+
+        for _ in 0..<packetsNeeded {
+            try await session.send(packet)
+        }
+
+        // At least one flush should have been triggered by the size limit
+        let callCount = await provider.sendCallCount
+        XCTAssertGreaterThanOrEqual(callCount, 1,
+            "Sending \(packetsNeeded) x \(packetSize) bytes should trigger auto-flush at UDP limit")
+
+        await session.close()
+    }
+
+    /// 8. User-configured maxBufferSize is capped by the UDP datagram limit.
+    func testUserBufferSizeCappedByUDPLimit() async throws {
+        let provider = BatchTestProvider()
+        // Configure maxBufferSize larger than the UDP limit
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 100_000)
+        )
+
+        let maxPayload = TunnelSession.maxDatagramPayload
+        let packetSize = 1000
+        let packetsNeeded = (maxPayload / packetSize) + 1
+        let packet = Data(repeating: 0xEE, count: packetSize)
+
+        for _ in 0..<packetsNeeded {
+            try await session.send(packet)
+        }
+
+        // Should have flushed at UDP limit, not at the user's 100_000
+        let callCount = await provider.sendCallCount
+        XCTAssertGreaterThanOrEqual(callCount, 1,
+            "UDP limit should override user's maxBufferSize when it is larger")
+
+        await session.close()
+    }
+
+    /// 9. User-configured maxBufferSize smaller than UDP limit is respected.
+    func testSmallUserBufferSizeRespected() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 500)
+        )
+
+        // Send 600 bytes total (two 300-byte packets) — exceeds the 500-byte user limit
+        try await session.send(Data(repeating: 0xAA, count: 300))
+        try await session.send(Data(repeating: 0xBB, count: 300))
+
+        let callCount = await provider.sendCallCount
+        XCTAssertGreaterThanOrEqual(callCount, 1,
+            "User maxBufferSize of 500 should trigger flush before UDP limit")
+
+        await session.close()
+    }
+
+    /// 10. flush() on a non-active session throws TunnelError.notConnected.
     func testFlushWhileNotActive() async throws {
         let provider = BatchTestProvider()
         // Create session but do NOT activate it — state remains .connecting
