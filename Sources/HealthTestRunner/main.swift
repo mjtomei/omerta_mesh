@@ -630,6 +630,83 @@ actor MessageCounter {
 
 let messageCounter = MessageCounter()
 
+// MARK: - Performance Measurement Helpers
+
+actor LatencyCollector {
+    private var samples: [Double] = []
+
+    func record(_ rttMicroseconds: Double) {
+        samples.append(rttMicroseconds)
+    }
+
+    func summary() -> (p50: Double, p95: Double, p99: Double, min: Double, max: Double, avg: Double) {
+        guard !samples.isEmpty else { return (0, 0, 0, 0, 0, 0) }
+        let sorted = samples.sorted()
+        let n = sorted.count
+        let p50 = sorted[n * 50 / 100]
+        let p95 = sorted[n * 95 / 100]
+        let p99 = sorted[min(n * 99 / 100, n - 1)]
+        let mn = sorted.first!
+        let mx = sorted.last!
+        let avg = sorted.reduce(0, +) / Double(n)
+        return (p50, p95, p99, mn, mx, avg)
+    }
+
+    func histogram(buckets: [(label: String, range: Range<Double>)]) -> [(label: String, count: Int)] {
+        buckets.map { bucket in
+            let count = samples.filter { bucket.range.contains($0) }.count
+            return (label: bucket.label, count: count)
+        }
+    }
+
+    func reset() { samples.removeAll() }
+    var count: Int { samples.count }
+    func allSamples() -> [Double] { samples }
+}
+
+actor BandwidthMeasurer {
+    private var startTime: ContinuousClock.Instant?
+    private var totalBytes: UInt64 = 0
+
+    func start() {
+        startTime = ContinuousClock.now
+        totalBytes = 0
+    }
+
+    func addBytes(_ n: UInt64) {
+        totalBytes += n
+    }
+
+    func result() -> (bytes: UInt64, duration: Duration, mbps: Double) {
+        let elapsed = startTime.map { ContinuousClock.now - $0 } ?? .zero
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        let mbps = seconds > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / seconds) : 0
+        return (totalBytes, elapsed, mbps)
+    }
+}
+
+struct PerfSummary {
+    var vanillaBandwidthMbps: Double = 0
+    var vanillaLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
+    var meshBandwidthMbps: Double = 0
+    var meshLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
+    var meshHistogram: [(label: String, count: Int)] = []
+    var recoveryPreSwapMedian: Double = 0
+    var recoveryPeakLatency: Double = 0
+    var recoveryTimeSeconds: Double = 0
+}
+
+let latencyBuckets: [(label: String, range: Range<Double>)] = [
+    ("    0-  500 us", 0.0..<500.0),
+    ("  500- 1000 us", 500.0..<1000.0),
+    (" 1000- 2000 us", 1000.0..<2000.0),
+    (" 2000- 5000 us", 2000.0..<5000.0),
+    (" 5000-10000 us", 5000.0..<10000.0),
+    ("10000+     us", 10000.0..<Double.infinity),
+]
+
+var perfSummary = PerfSummary()
+
 // ============================================================
 // NODE B: Passive responder
 // ============================================================
@@ -787,6 +864,94 @@ if !isNodeA {
                 try await Task.sleep(for: .milliseconds(200))
             }
             await sendControl("phase10-latency-ack", detail: "\(await messageCounter.count)")
+
+        case "phase11-vanilla-start":
+            // Open a UDP echo server on an ephemeral port for vanilla baseline
+            let echoGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            final class EchoHandler: ChannelInboundHandler, @unchecked Sendable {
+                typealias InboundIn = AddressedEnvelope<ByteBuffer>
+                typealias OutboundOut = AddressedEnvelope<ByteBuffer>
+                func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                    let envelope = self.unwrapInboundIn(data)
+                    // Echo back the data to the sender
+                    context.writeAndFlush(self.wrapOutboundOut(envelope), promise: nil)
+                }
+            }
+            let echoChannel = try await DatagramBootstrap(group: echoGroup)
+                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .channelInitializer { ch in ch.pipeline.addHandler(EchoHandler()) }
+                .bind(host: "0.0.0.0", port: 0)
+                .get()
+            let echoPort = echoChannel.localAddress?.port ?? 0
+            logger.info("Node B: vanilla UDP echo server on port \(echoPort)")
+            await sendControl("phase11-vanilla-ready", detail: "\(echoPort)")
+
+            // Wait for Node A to finish
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase11-vanilla-done" { break }
+            }
+            try? await echoChannel.close()
+            try? await echoGroup.shutdownGracefully()
+            logger.info("Node B: vanilla echo server closed")
+
+        case "phase12-bw-start":
+            // Receive tunnel data on channel "health-test-bw", count bytes, report total
+            let bwMeasurer = BandwidthMeasurer()
+            await bwMeasurer.start()
+
+            let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
+            await bwSession.onReceive { data in
+                await bwMeasurer.addBytes(UInt64(data.count))
+            }
+            logger.info("Node B: waiting for bandwidth data on health-test-bw")
+
+            // Wait for Node A to signal done
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase12-bw-done" { break }
+            }
+            let bwResult = await bwMeasurer.result()
+            await sendControl("phase12-bw-report", detail: "\(bwResult.bytes)")
+            logger.info("Node B: received \(bwResult.bytes) bytes for bandwidth test")
+
+        case "phase13-ping-start":
+            // Echo tunnel pings back (PING→PONG) on channel "health-test-ping"
+            let pingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-ping")
+            await pingSession.onReceive { data in
+                let msg = String(data: data, encoding: .utf8) ?? ""
+                if msg.hasPrefix("PING:") {
+                    let pong = "PONG:" + msg.dropFirst(5)
+                    try? await pingSession.send(Data(pong.utf8))
+                }
+            }
+            logger.info("Node B: echoing pings on health-test-ping")
+
+            // Wait for stop signal
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase13-ping-stop" { break }
+            }
+            logger.info("Node B: ping echo stopped")
+
+        case "phase14-recovery-start":
+            // Same echo as phase 13 but on "health-test-ping" (reuse same channel)
+            let recoveryPingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery-ping")
+            await recoveryPingSession.onReceive { data in
+                let msg = String(data: data, encoding: .utf8) ?? ""
+                if msg.hasPrefix("PING:") {
+                    let pong = "PONG:" + msg.dropFirst(5)
+                    try? await recoveryPingSession.send(Data(pong.utf8))
+                }
+            }
+            logger.info("Node B: echoing recovery pings")
+
+            // Wait for done signal
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if doneMsg.phase == "phase14-recovery-done" { break }
+            }
+            logger.info("Node B: recovery ping echo stopped")
 
         case "done":
             logger.info("Node B: test complete")
@@ -1347,9 +1512,345 @@ record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-// MARK: - Phase 11: Summary
+// MARK: - Phase 11: Vanilla Baseline (Direct UDP)
 
-logPhase("Phase 11: Summary")
+logPhase("Phase 11: Vanilla Baseline (Direct UDP)")
+
+do {
+    // Tell Node B to start vanilla echo server
+    await sendControl("phase11-vanilla-start")
+    guard let readyMsg = await controlMailbox.receive(timeout: .seconds(30)),
+          readyMsg.phase == "phase11-vanilla-ready",
+          let echoPortStr = readyMsg.detail,
+          let echoPort = Int(echoPortStr) else {
+        record("Phase 11: Vanilla Baseline", passed: false, detail: "Node B did not report echo port")
+        throw TunnelError.notConnected
+    }
+    logger.info("Node B vanilla echo on port \(echoPort)")
+
+    let vanillaGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+    // Collect received pongs
+    let vanillaLatencyCollector = LatencyCollector()
+
+    final class VanillaPongHandler: ChannelInboundHandler, @unchecked Sendable {
+        typealias InboundIn = AddressedEnvelope<ByteBuffer>
+        let collector: LatencyCollector
+        let clock = ContinuousClock()
+        init(collector: LatencyCollector) { self.collector = collector }
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            let envelope = self.unwrapInboundIn(data)
+            var buf = envelope.data
+            if let bytes = buf.readBytes(length: buf.readableBytes) {
+                let msg = String(decoding: Data(bytes), as: UTF8.self)
+                // Parse timestamp from probe: "PROBE:<seq>:<nanos>" (may have trailing padding)
+                let parts = msg.trimmingCharacters(in: .whitespaces).split(separator: ":")
+                if parts.count >= 3, let sentNanos = UInt64(parts[2].trimmingCharacters(in: .whitespaces)) {
+                    let nowNanos = DispatchTime.now().uptimeNanoseconds
+                    let rttUs = Double(nowNanos - sentNanos) / 1000.0
+                    Task { await self.collector.record(rttUs) }
+                }
+            }
+        }
+    }
+    let pongHandler = VanillaPongHandler(collector: vanillaLatencyCollector)
+    let vanillaChannel = try await DatagramBootstrap(group: vanillaGroup)
+        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+        .channelInitializer { ch in ch.pipeline.addHandler(pongHandler) }
+        .bind(host: "0.0.0.0", port: 0)
+        .get()
+
+    let remoteEchoAddr = try SocketAddress(ipAddress: remoteHost, port: echoPort)
+
+    // Latency: 200 timestamped 64-byte probes
+    for seq in 1...200 {
+        let nanos = DispatchTime.now().uptimeNanoseconds
+        let probe = "PROBE:\(seq):\(nanos)"
+        // Pad to 64 bytes
+        let padded = probe + String(repeating: " ", count: max(0, 64 - probe.count))
+        let buf = vanillaChannel.allocator.buffer(string: padded)
+        let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
+        try? await vanillaChannel.writeAndFlush(envelope)
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    // Wait for responses
+    try await Task.sleep(for: .seconds(2))
+
+    let vanillaLatSummary = await vanillaLatencyCollector.summary()
+    perfSummary.vanillaLatency = (vanillaLatSummary.p50, vanillaLatSummary.p95, vanillaLatSummary.p99)
+    let vanillaLatCount = await vanillaLatencyCollector.count
+    logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
+
+    // Bandwidth: 1000 × 8KB datagrams
+    let bwMeasurer = BandwidthMeasurer()
+    let payload = Data(repeating: 0xAA, count: 8192)
+    await bwMeasurer.start()
+    for _ in 1...1000 {
+        let buf = vanillaChannel.allocator.buffer(bytes: payload)
+        let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
+        try? await vanillaChannel.writeAndFlush(envelope)
+    }
+    try await Task.sleep(for: .seconds(1))
+    let bwResult = await bwMeasurer.result()
+    // For vanilla bandwidth, measure based on what we sent (1000 * 8KB)
+    let vanillaSendBytes: UInt64 = 1000 * 8192
+    let vanillaDurationSec = Double(bwResult.duration.components.seconds) + Double(bwResult.duration.components.attoseconds) / 1e18
+    let vanillaMbps = vanillaDurationSec > 0 ? (Double(vanillaSendBytes) * 8.0 / 1_000_000.0 / vanillaDurationSec) : 0
+    perfSummary.vanillaBandwidthMbps = vanillaMbps
+    logger.info("Vanilla bandwidth: \(String(format: "%.1f", vanillaMbps)) Mbps")
+
+    try? await vanillaChannel.close()
+    try? await vanillaGroup.shutdownGracefully()
+
+    await sendControl("phase11-vanilla-done")
+    let phase11Pass = vanillaLatCount >= 100
+    record("Phase 11: Vanilla Baseline", passed: phase11Pass,
+           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, bw=\(String(format: "%.1f", vanillaMbps))Mbps, \(vanillaLatCount) samples")
+} catch {
+    record("Phase 11: Vanilla Baseline", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 12: Mesh Bandwidth
+
+logPhase("Phase 12: Mesh Bandwidth")
+
+do {
+    await sendControl("phase12-bw-start")
+
+    let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
+    try await Task.sleep(for: .seconds(1))
+
+    let payload = Data(repeating: 0xBB, count: 8192)
+    let clock = ContinuousClock()
+    let start = clock.now
+
+    for _ in 1...1000 {
+        try await bwSession.send(payload)
+    }
+
+    let elapsed = clock.now - start
+    let elapsedSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+    let sentBytes: UInt64 = 1000 * 8192
+    let meshMbps = elapsedSec > 0 ? (Double(sentBytes) * 8.0 / 1_000_000.0 / elapsedSec) : 0
+    perfSummary.meshBandwidthMbps = meshMbps
+
+    try await Task.sleep(for: .seconds(2))
+    await sendControl("phase12-bw-done")
+
+    // Wait for Node B report
+    let bwReport = await controlMailbox.receive(timeout: .seconds(15))
+    let bRecvBytes = bwReport.flatMap { UInt64($0.detail ?? "") } ?? 0
+
+    logger.info("Mesh bandwidth: \(String(format: "%.1f", meshMbps)) Mbps (B received \(bRecvBytes) bytes)")
+    record("Phase 12: Mesh Bandwidth", passed: meshMbps > 0,
+           detail: "\(String(format: "%.1f", meshMbps)) Mbps, B received \(bRecvBytes) bytes")
+} catch {
+    record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 13: Mesh Latency (Ping-Pong)
+
+logPhase("Phase 13: Mesh Latency (Ping-Pong)")
+
+do {
+    await sendControl("phase13-ping-start")
+
+    let meshLatencyCollector = LatencyCollector()
+    let pingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-ping")
+    await pingSession.onReceive { data in
+        let msg = String(data: data, encoding: .utf8) ?? ""
+        if msg.hasPrefix("PONG:") {
+            let parts = msg.split(separator: ":")
+            if parts.count >= 3, let sentNanos = UInt64(parts[2]) {
+                let nowNanos = DispatchTime.now().uptimeNanoseconds
+                let rttUs = Double(nowNanos - sentNanos) / 1000.0
+                await meshLatencyCollector.record(rttUs)
+            }
+        }
+    }
+    try await Task.sleep(for: .seconds(1))
+
+    // Send 500 probes at 5ms intervals
+    for seq in 1...500 {
+        let nanos = DispatchTime.now().uptimeNanoseconds
+        let probe = "PING:\(seq):\(nanos)"
+        try await pingSession.send(Data(probe.utf8))
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    // 2s drain
+    try await Task.sleep(for: .seconds(2))
+
+    let meshLatSummary = await meshLatencyCollector.summary()
+    perfSummary.meshLatency = (meshLatSummary.p50, meshLatSummary.p95, meshLatSummary.p99)
+    perfSummary.meshHistogram = await meshLatencyCollector.histogram(buckets: latencyBuckets)
+    let meshLatCount = await meshLatencyCollector.count
+
+    logger.info("Mesh latency: p50=\(String(format: "%.0f", meshLatSummary.p50))us p95=\(String(format: "%.0f", meshLatSummary.p95))us p99=\(String(format: "%.0f", meshLatSummary.p99))us (\(meshLatCount) samples)")
+
+    await sendControl("phase13-ping-stop")
+
+    let phase13Pass = meshLatCount >= 200
+    record("Phase 13: Mesh Latency", passed: phase13Pass,
+           detail: "p50=\(String(format: "%.0f", meshLatSummary.p50))us p95=\(String(format: "%.0f", meshLatSummary.p95))us p99=\(String(format: "%.0f", meshLatSummary.p99))us (\(meshLatCount) samples)")
+} catch {
+    record("Phase 13: Mesh Latency", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 14: Interface Swap Recovery Timing (Linux only)
+
+logPhase("Phase 14: Interface Swap Recovery Timing")
+
+#if os(Linux)
+do {
+    await sendControl("phase14-recovery-start")
+
+    // Collect timestamped RTT samples: (wallClockNanos, rttUs)
+    actor TimestampedSamples {
+        var samples: [(timestamp: UInt64, rttUs: Double)] = []
+        func add(_ ts: UInt64, _ rtt: Double) { samples.append((ts, rtt)) }
+        func all() -> [(timestamp: UInt64, rttUs: Double)] { samples }
+    }
+    let tsSamples = TimestampedSamples()
+    let recoveryLatencyCollector = LatencyCollector()
+    let recoverySession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery-ping")
+    try await Task.sleep(for: .seconds(1))
+
+    // Continuous ping-pong: one probe every 20ms
+    // First 2s = baseline, then IP swap, then 15s more
+    let totalProbes = (2 + 15) * 50 // 17s at 50 probes/s
+    var swapTime: UInt64 = 0
+
+    // Find interface and temp IP (same as Phase 9)
+    let (_, ifOutput14) = await shell("ip route get \(remoteHost) | head -1 | sed -n 's/.*dev \\([^ ]*\\).*/\\1/p'")
+    let iface14 = ifOutput14.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !iface14.isEmpty else {
+        record("Phase 14: Recovery Timing", passed: false, detail: "Could not determine interface")
+        throw TunnelError.notConnected
+    }
+
+    let (_, existingAddrs14) = await shell("ip -4 addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
+    let usedIPs14 = Set(existingAddrs14.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) })
+    var tempIP14 = "192.168.12.130"
+    for lastOctet in 130...254 {
+        let candidate = "192.168.12.\(lastOctet)"
+        if !usedIPs14.contains(candidate) {
+            tempIP14 = candidate
+            break
+        }
+    }
+
+    let addCmd14 = "ip addr add \(tempIP14)/24 dev \(iface14)"
+    let delCmd14 = "ip addr del \(tempIP14)/24 dev \(iface14)"
+    await stateTracker.recordTempIP(addCmd14)
+    await cleanup.register { let _ = await shell(delCmd14); await stateTracker.removeTempIP(addCmd14) }
+
+    // Set up pong handler to record timestamped samples
+    await recoverySession.onReceive { data in
+        let msg = String(data: data, encoding: .utf8) ?? ""
+        if msg.hasPrefix("PONG:") {
+            let parts = msg.split(separator: ":")
+            if parts.count >= 3, let sentNanos = UInt64(parts[2]) {
+                let nowNanos = DispatchTime.now().uptimeNanoseconds
+                let rttUs = Double(nowNanos - sentNanos) / 1000.0
+                await recoveryLatencyCollector.record(rttUs)
+                await tsSamples.add(nowNanos, rttUs)
+            }
+        }
+    }
+
+    for probeIdx in 1...totalProbes {
+        let nanos = DispatchTime.now().uptimeNanoseconds
+        let probe = "PING:\(probeIdx):\(nanos)"
+        try? await recoverySession.send(Data(probe.utf8))
+        try await Task.sleep(for: .milliseconds(20))
+
+        // After 2s of baseline (100 probes), perform IP swap
+        if probeIdx == 100 {
+            logger.info("Phase 14: performing IP swap on \(iface14)")
+            // Get the current primary IP before swapping
+            let (_, currentIP) = await shell("ip -4 addr show dev \(iface14) | grep 'inet ' | head -1 | awk '{print $2}'")
+            let currentIPTrimmed = currentIP.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !currentIPTrimmed.isEmpty {
+                // Add temp IP, delete primary, wait, re-add primary, delete temp
+                let (_, _) = await shell(addCmd14)
+                swapTime = DispatchTime.now().uptimeNanoseconds
+                let (_, _) = await shell("ip addr del \(currentIPTrimmed) dev \(iface14)")
+                try await Task.sleep(for: .milliseconds(500))
+                let (_, _) = await shell("ip addr add \(currentIPTrimmed) dev \(iface14)")
+                let (_, _) = await shell(delCmd14)
+                await stateTracker.removeTempIP(addCmd14)
+                logger.info("Phase 14: IP swap complete (removed and re-added \(currentIPTrimmed))")
+            } else {
+                swapTime = DispatchTime.now().uptimeNanoseconds
+                logger.warning("Phase 14: could not determine current IP, skipping swap")
+            }
+        }
+    }
+
+    // Wait for trailing pongs
+    try await Task.sleep(for: .seconds(2))
+
+    await sendControl("phase14-recovery-done")
+
+    // Analyze results
+    let allTS = await tsSamples.all()
+    let preSwapSamples = allTS.filter { $0.timestamp < swapTime }
+    let postSwapSamples = allTS.filter { $0.timestamp >= swapTime }
+
+    let preSwapMedian: Double
+    if preSwapSamples.isEmpty {
+        preSwapMedian = 0
+    } else {
+        let sorted = preSwapSamples.map(\.rttUs).sorted()
+        preSwapMedian = sorted[sorted.count / 2]
+    }
+
+    let peakDuringSwap = postSwapSamples.map(\.rttUs).max() ?? 0
+
+    // Recovery time: time from swap until RTT stays within 2× pre-swap median for 1s
+    var recoveryTime: Double = 0
+    if !postSwapSamples.isEmpty && preSwapMedian > 0 {
+        let threshold = preSwapMedian * 2.0
+        let oneSecondNanos: UInt64 = 1_000_000_000
+        var sustainedStart: UInt64? = nil
+        for sample in postSwapSamples {
+            if sample.rttUs <= threshold {
+                if sustainedStart == nil { sustainedStart = sample.timestamp }
+                if let start = sustainedStart, sample.timestamp - start >= oneSecondNanos {
+                    recoveryTime = Double(start - swapTime) / 1_000_000_000.0
+                    break
+                }
+            } else {
+                sustainedStart = nil
+            }
+        }
+        if recoveryTime == 0 && sustainedStart != nil {
+            // Never sustained for 1s but had some recovery
+            recoveryTime = Double((postSwapSamples.last?.timestamp ?? swapTime) - swapTime) / 1_000_000_000.0
+        }
+    }
+
+    perfSummary.recoveryPreSwapMedian = preSwapMedian
+    perfSummary.recoveryPeakLatency = peakDuringSwap
+    perfSummary.recoveryTimeSeconds = recoveryTime
+
+    logger.info("Recovery: pre-swap median=\(String(format: "%.0f", preSwapMedian))us, peak=\(String(format: "%.0f", peakDuringSwap))us, recovery=\(String(format: "%.2f", recoveryTime))s")
+
+    let phase14Pass = preSwapSamples.count >= 20
+    record("Phase 14: Recovery Timing", passed: phase14Pass,
+           detail: "pre-swap=\(String(format: "%.0f", preSwapMedian))us, peak=\(String(format: "%.0f", peakDuringSwap))us, recovery=\(String(format: "%.2f", recoveryTime))s (\(preSwapSamples.count)+\(postSwapSamples.count) samples)")
+} catch {
+    record("Phase 14: Recovery Timing", passed: false, detail: "Error: \(error)")
+}
+#else
+record("Phase 14: Recovery Timing", passed: true,
+       detail: "Skipped (Linux only)")
+#endif
+
+// MARK: - Phase 15: Summary
+
+logPhase("Phase 15: Summary")
 
 await sendControl("done")
 _ = await waitForAck("done-ack", timeout: .seconds(10))
@@ -1378,6 +1879,54 @@ if cleanupIssues.isEmpty {
     logger.warning("Cleanup issues: \(cleanupIssues)")
     record("Network State Cleanup", passed: false, detail: cleanupIssues.joined(separator: "; "))
 }
+
+// Performance summary table
+logger.info("")
+logger.info("=== PERFORMANCE SUMMARY ===")
+do {
+    let vBw = perfSummary.vanillaBandwidthMbps
+    let mBw = perfSummary.meshBandwidthMbps
+    let vL50 = perfSummary.vanillaLatency.p50
+    let vL95 = perfSummary.vanillaLatency.p95
+    let vL99 = perfSummary.vanillaLatency.p99
+    let mL50 = perfSummary.meshLatency.p50
+    let mL95 = perfSummary.meshLatency.p95
+    let mL99 = perfSummary.meshLatency.p99
+
+    let bwOverhead = vBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
+    let l50Overhead = vL50 > 0 ? String(format: "%.1fx", mL50 / vL50) : "N/A"
+    let l95Overhead = vL95 > 0 ? String(format: "%.1fx", mL95 / vL95) : "N/A"
+    let l99Overhead = vL99 > 0 ? String(format: "%.1fx", mL99 / vL99) : "N/A"
+
+    logger.info("                    Vanilla (Direct)    Mesh Tunnel    Overhead")
+    logger.info("Bandwidth (Mbps)    \(String(format: "%8.1f", vBw))            \(String(format: "%8.1f", mBw))       \(bwOverhead)")
+    logger.info("Latency p50 (us)    \(String(format: "%8.0f", vL50))            \(String(format: "%8.0f", mL50))       \(l50Overhead)")
+    logger.info("Latency p95 (us)    \(String(format: "%8.0f", vL95))            \(String(format: "%8.0f", mL95))       \(l95Overhead)")
+    logger.info("Latency p99 (us)    \(String(format: "%8.0f", vL99))            \(String(format: "%8.0f", mL99))       \(l99Overhead)")
+}
+
+if !perfSummary.meshHistogram.isEmpty {
+    logger.info("")
+    logger.info("=== LATENCY HISTOGRAM (Mesh) ===")
+    let totalSamples = perfSummary.meshHistogram.reduce(0) { $0 + $1.count }
+    let maxCount = perfSummary.meshHistogram.map(\.count).max() ?? 1
+    for bucket in perfSummary.meshHistogram {
+        let barLen = maxCount > 0 ? (bucket.count * 20 / max(maxCount, 1)) : 0
+        let bar = String(repeating: "#", count: barLen)
+        let pct = totalSamples > 0 ? Double(bucket.count) / Double(totalSamples) * 100.0 : 0
+        logger.info("\(bucket.label): \(bar.padding(toLength: 20, withPad: " ", startingAt: 0)) \(String(format: "%4d", bucket.count))  (\(String(format: "%4.1f", pct))%)")
+    }
+}
+
+#if os(Linux)
+if perfSummary.recoveryPreSwapMedian > 0 {
+    logger.info("")
+    logger.info("=== RECOVERY TIMING ===")
+    logger.info("Pre-swap median:  \(String(format: "%.0f", perfSummary.recoveryPreSwapMedian)) us")
+    logger.info("Peak during swap: \(String(format: "%.0f", perfSummary.recoveryPeakLatency)) us")
+    logger.info("Recovery time:    \(String(format: "%.2f", perfSummary.recoveryTimeSeconds)) s")
+}
+#endif
 
 logger.info("")
 logger.info("=== TEST RESULTS ===")
