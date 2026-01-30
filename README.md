@@ -1,5 +1,7 @@
 # OmertaMesh
 
+[![codecov](https://codecov.io/gh/mjtomei/omerta_mesh/graph/badge.svg)](https://codecov.io/gh/mjtomei/omerta_mesh)
+
 A standalone P2P mesh networking library in Swift, providing secure peer-to-peer communication with NAT traversal, hole punching, and relay support.
 
 ## Features
