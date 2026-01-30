@@ -20,3 +20,6 @@ Sources/CNetstack/libnetstack.h
 *.pem
 .env
 .env.*
+
+# Parent repo stub files (ignored when working inside cloned repo)
+.commit

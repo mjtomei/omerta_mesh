@@ -12,12 +12,39 @@ import Logging
 public enum KernelNetworking {
     private static let logger = Logger(label: "io.omerta.network.kernel")
 
+    /// Check that kernel networking tools are available.
+    /// Call before enableForwarding/enableMasquerade to get clear errors.
+    public static func preflight() throws {
+        guard Glibc.access("/proc/sys/net/ipv4/ip_forward", F_OK) == 0 else {
+            throw InterfaceError.preflightFailed(
+                "/proc/sys/net/ipv4/ip_forward not found. "
+                + "procfs may not be mounted (required for kernel networking).")
+        }
+        let hasNft = Glibc.access("/usr/sbin/nft", X_OK) == 0
+        let hasIptablesLegacy = Glibc.access("/sbin/iptables-legacy", X_OK) == 0
+        let hasIptables = Glibc.access("/sbin/iptables", X_OK) == 0
+        guard hasNft || hasIptablesLegacy || hasIptables else {
+            throw InterfaceError.preflightFailed(
+                "No firewall tool found. Need one of: /usr/sbin/nft, "
+                + "/sbin/iptables-legacy, /sbin/iptables. "
+                + "Install nftables (apt install nftables) or iptables (apt install iptables).")
+        }
+        guard Glibc.access("/sbin/ip", X_OK) == 0 else {
+            throw InterfaceError.preflightFailed(
+                "/sbin/ip not found. Install iproute2 (e.g. apt install iproute2).")
+        }
+    }
+
     /// Enable kernel IP forwarding
     public static func enableForwarding() throws {
         let path = "/proc/sys/net/ipv4/ip_forward"
         let fd = Glibc.open(path, O_WRONLY)
         guard fd >= 0 else {
-            throw InterfaceError.writeFailed("Cannot open \(path): errno \(errno)")
+            let e = errno
+            let hint = e == EACCES ? " (permission denied — run as root)"
+                : e == ENOENT ? " (procfs not mounted?)" : ""
+            throw InterfaceError.writeFailed(
+                "Cannot open \(path): \(String(cString: strerror(e)))\(hint)")
         }
         let written = "1".withCString { Glibc.write(fd, $0, 1) }
         Glibc.close(fd)
@@ -84,7 +111,7 @@ public enum KernelNetworking {
                     logger.debug("Fallback \(fallback) failed: \(error)")
                 }
             }
-            logger.error("All firewall backends failed to apply masquerade rules")
+            logger.error("All firewall backends failed to apply masquerade rules. Ensure nftables or iptables is installed and you are running as root.")
         } else {
             logger.info("Masquerade verified with \(backend)")
         }
@@ -318,6 +345,7 @@ public enum KernelNetworking {
     }
 
     private static func shellOutput(_ executable: String, _ args: [String]) -> String {
+        guard Glibc.access(executable, X_OK) == 0 else { return "" }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = args
@@ -333,6 +361,11 @@ public enum KernelNetworking {
     }
 
     private static func runFirewall(_ executable: String, _ args: [String], stdin stdinData: String? = nil) throws {
+        guard Glibc.access(executable, X_OK) == 0 else {
+            throw InterfaceError.preflightFailed(
+                "\(executable) not found or not executable. "
+                + "Install the appropriate package (nftables or iptables).")
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = args
@@ -355,7 +388,7 @@ public enum KernelNetworking {
         guard proc.terminationStatus == 0 else {
             let cmd = ([executable] + args).joined(separator: " ")
             logger.error("\(cmd) failed (exit \(proc.terminationStatus)): \(errStr)")
-            throw InterfaceError.readFailed("\(executable) failed: \(errStr)")
+            throw InterfaceError.readFailed("'\(cmd)' failed (exit \(proc.terminationStatus)): \(errStr.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
         if !errStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             logger.debug("\(executable) stderr: \(errStr.trimmingCharacters(in: .whitespacesAndNewlines))")
