@@ -123,12 +123,10 @@ final class TunnelIntegrationTests: XCTestCase {
         }
 
         // Set up session handler on mesh2 to accept
-        let sessionEstablished = expectation(description: "Session established on mesh2")
         let machineId1 = await mesh1.machineId
-        await tunnel2.setSessionEstablishedHandler { session in
-            let peer = await session.remoteMachineId
-            XCTAssertEqual(peer, machineId1)
-            sessionEstablished.fulfill()
+        await tunnel2.setInboundSessionHandler { machineId, channel in
+            XCTAssertEqual(machineId, machineId1)
+            return { _ in }
         }
 
         // mesh1 initiates session to mesh2
@@ -140,10 +138,12 @@ final class TunnelIntegrationTests: XCTestCase {
         let remotePeer = await session1.remoteMachineId
         XCTAssertEqual(remotePeer, machineId2)
 
-        // Wait for mesh2 to receive and accept session
-        await fulfillment(of: [sessionEstablished], timeout: 5.0)
-
-        // Verify mesh2 has a session
+        // Wait for mesh2 to create the inbound session
+        for _ in 1...25 {
+            let count2 = await tunnel2.sessionCount
+            if count2 == 1 { break }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
         let count2 = await tunnel2.sessionCount
         XCTAssertEqual(count2, 1)
     }
@@ -204,13 +204,12 @@ final class TunnelIntegrationTests: XCTestCase {
             }
         }
 
-        // Set up receiver on mesh2 using callback-based onReceive
+        // Set up receiver on mesh2 with receive handler at construction
         let messageReceived = expectation(description: "Message received on mesh2")
         var receivedData: Data?
 
-        await tunnel2.setSessionEstablishedHandler { session in
-            // Set up receive callback
-            await session.onReceive { data in
+        await tunnel2.setInboundSessionHandler { machineId, channel in
+            return { data in
                 receivedData = data
                 messageReceived.fulfill()
             }
@@ -292,35 +291,26 @@ final class TunnelIntegrationTests: XCTestCase {
         let message1to2Received = expectation(description: "Message 1->2 received")
         let message2to1Received = expectation(description: "Message 2->1 received")
 
-        var session2: TunnelSession?
-
-        await tunnel2.setSessionEstablishedHandler { session in
-            session2 = session
-            // Set up receive callback to handle message and send reply
-            await session.onReceive { data in
+        await tunnel2.setInboundSessionHandler { machineId, channel in
+            return { data in
                 if String(data: data, encoding: .utf8) == "Hello from mesh1" {
                     message1to2Received.fulfill()
-                    // Send reply
-                    try? await session.send(Data("Reply from mesh2".utf8))
+                    // Send reply - look up session from manager
+                    let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+                    if let s = await tunnel2.getExistingSession(key: key) {
+                        try? await s.send(Data("Reply from mesh2".utf8))
+                    }
                 }
             }
         }
 
         let machineId2 = await mesh2.machineId
-        let session1 = try await tunnel1.createSession(withMachine: machineId2)
-        try await Task.sleep(nanoseconds: 300_000_000)
-
-        guard session2 != nil else {
-            XCTFail("Session not established on mesh2")
-            return
-        }
-
-        // Set up receive callback on session1 for the reply
-        await session1.onReceive { data in
+        let session1 = try await tunnel1.createSession(withMachine: machineId2, receiveHandler: { data in
             if String(data: data, encoding: .utf8) == "Reply from mesh2" {
                 message2to1Received.fulfill()
             }
-        }
+        })
+        try await Task.sleep(nanoseconds: 300_000_000)
 
         // Send from mesh1
         try await session1.send(Data("Hello from mesh1".utf8))
@@ -384,9 +374,8 @@ final class TunnelIntegrationTests: XCTestCase {
             }
         }
 
-        var session2: TunnelSession?
-        await tunnel2.setSessionEstablishedHandler { session in
-            session2 = session
+        await tunnel2.setInboundSessionHandler { _, _ in
+            return { _ in }
         }
 
         let machineId2 = await mesh2.machineId
@@ -396,7 +385,6 @@ final class TunnelIntegrationTests: XCTestCase {
         // Verify both have sessions
         let count1 = await tunnel1.sessionCount
         XCTAssertEqual(count1, 1)
-        XCTAssertNotNil(session2)
 
         // Close from mesh1
         await tunnel1.closeSession()
@@ -408,11 +396,6 @@ final class TunnelIntegrationTests: XCTestCase {
         let count2After = await tunnel2.sessionCount
         XCTAssertEqual(count2After, 0)
 
-        // The session object should be disconnected
-        if let s2 = session2 {
-            let state = await s2.state
-            XCTAssertEqual(state, .disconnected)
-        }
     }
 
     // MARK: - NAT/Relay Tests
@@ -522,14 +505,11 @@ final class TunnelIntegrationTests: XCTestCase {
         }
 
         // Set up session handler on mesh2
-        let sessionEstablished = expectation(description: "Session established via relay")
         let messageReceived = expectation(description: "Message received via relay")
         var receivedData: Data?
 
-        await tunnel2.setSessionEstablishedHandler { session in
-            sessionEstablished.fulfill()
-            // Set up receive callback
-            await session.onReceive { data in
+        await tunnel2.setInboundSessionHandler { machineId, channel in
+            return { data in
                 receivedData = data
                 messageReceived.fulfill()
             }
@@ -539,8 +519,14 @@ final class TunnelIntegrationTests: XCTestCase {
         let machineId2 = await mesh2.machineId
         let session1 = try await tunnel1.createSession(withMachine: machineId2)
 
-        // Wait for session
-        await fulfillment(of: [sessionEstablished], timeout: 10.0)
+        // Wait for inbound session to be created on mesh2
+        for _ in 1...50 {
+            let count = await tunnel2.sessionCount
+            if count == 1 { break }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        let relaySessionCount = await tunnel2.sessionCount
+        XCTAssertEqual(relaySessionCount, 1, "Inbound session was not created on mesh2")
 
         // Send message via relay
         let testMessage = Data("Hello via relay!".utf8)

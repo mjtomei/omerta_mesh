@@ -69,19 +69,13 @@ public actor TunnelSession {
     ///   - channel: The logical channel name for this session
     ///   - provider: The channel provider (mesh network) for transport
     ///   - batchConfig: Batch configuration (defaults to .default)
-    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider, batchConfig: BatchConfig = .default) {
+    ///   - receiveHandler: Optional callback invoked when packets arrive from the remote machine
+    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider, batchConfig: BatchConfig = .default, receiveHandler: (@Sendable (Data) async -> Void)? = nil) {
         self.key = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channel)
         self.provider = provider
         self.batchConfig = batchConfig
+        self.receiveHandler = receiveHandler
         self.logger = Logger(label: "io.omerta.tunnel.session")
-    }
-
-    // MARK: - Receive Handler
-
-    /// Set handler for incoming packets (like ChannelProvider.onChannel pattern)
-    /// - Parameter handler: Callback invoked when packets arrive from the remote machine
-    public func onReceive(_ handler: @escaping @Sendable (Data) async -> Void) {
-        self.receiveHandler = handler
     }
 
     // MARK: - Sending
@@ -217,6 +211,11 @@ public actor TunnelSession {
             "machine": "\(remoteMachineId.prefix(16))...",
             "channel": "\(channel)"
         ])
+    }
+
+    /// Replace the receive handler for this session.
+    public func onReceive(_ handler: (@Sendable (Data) async -> Void)?) {
+        receiveHandler = handler
     }
 
     // MARK: - Incoming Data
