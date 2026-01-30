@@ -50,6 +50,12 @@ public actor TunnelManager {
     /// Wire channels registered for dispatch
     private var registeredWireChannels: Set<String> = []
 
+    /// Pre-session data buffer: holds data that arrives before the session handshake completes.
+    /// Flushed to the session once it's created. Max 32 packets per key, 5s TTL.
+    private var pendingData: [TunnelSessionKey: [(data: Data, bufferedAt: ContinuousClock.Instant)]] = [:]
+    private let pendingDataMaxPerKey = 32
+    private let pendingDataTTL: Duration = .seconds(5)
+
     /// Whether the manager is running
     private var isRunning: Bool = false
 
@@ -163,6 +169,7 @@ public actor TunnelManager {
         }
         sessions.removeAll()
         sessionIds.removeAll()
+        pendingData.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
@@ -356,6 +363,17 @@ public actor TunnelManager {
         let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
         if let session = sessions[key] {
             await session.deliverIncoming(data)
+        } else {
+            // Buffer data that arrives before the session handshake completes
+            let now = ContinuousClock.now
+            var buffer = pendingData[key] ?? []
+            // Evict expired entries
+            buffer.removeAll { now - $0.bufferedAt > pendingDataTTL }
+            if buffer.count < pendingDataMaxPerKey {
+                buffer.append((data: data, bufferedAt: now))
+                pendingData[key] = buffer
+                logger.debug("Buffered pre-session data", metadata: ["machine": "\(machineId)", "channel": "\(channel)", "buffered": "\(buffer.count)"])
+            }
         }
     }
 
@@ -407,6 +425,17 @@ public actor TunnelManager {
                 sessions[key] = newSession
                 sessionIds[key] = handshake.sessionId
                 await ensureWireChannelRegistered(for: channel)
+
+                // Flush any data that arrived before the session was created
+                if let buffered = pendingData.removeValue(forKey: key) {
+                    let now = ContinuousClock.now
+                    for entry in buffered where now - entry.bufferedAt <= pendingDataTTL {
+                        await newSession.deliverIncoming(entry.data)
+                    }
+                    if !buffered.isEmpty {
+                        logger.info("Flushed \(buffered.count) buffered packet(s)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                    }
+                }
 
                 // Send ack
                 let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
