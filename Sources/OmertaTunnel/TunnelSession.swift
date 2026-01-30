@@ -2,6 +2,8 @@
 //
 // A simple bidirectional packet channel between two machines on a specific channel.
 // Sessions are identified by (remoteMachineId, channel).
+//
+// Supports batched sending: send() buffers, flush() sends batch, sendAndFlush() is immediate.
 
 import Foundation
 import OmertaMesh
@@ -32,6 +34,23 @@ public actor TunnelSession {
         "tunnel-\(channel)"
     }
 
+    // MARK: - Batching
+
+    /// Batch configuration for this session
+    public var batchConfig: BatchConfig
+
+    /// Update batch configuration
+    public func setBatchConfig(_ config: BatchConfig) {
+        batchConfig = config
+    }
+
+    /// Send buffer for batching
+    private var sendBuffer: [Data] = []
+    private var sendBufferSize: Int = 0
+
+    /// Auto-flush timer task
+    private var autoFlushTask: Task<Void, Never>?
+
     /// Session statistics
     public struct Stats: Sendable {
         public var packetsSent: UInt64 = 0
@@ -49,9 +68,11 @@ public actor TunnelSession {
     ///   - remoteMachineId: The machine to communicate with
     ///   - channel: The logical channel name for this session
     ///   - provider: The channel provider (mesh network) for transport
-    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider) {
+    ///   - batchConfig: Batch configuration (defaults to .default)
+    public init(remoteMachineId: MachineId, channel: String, provider: any ChannelProvider, batchConfig: BatchConfig = .default) {
         self.key = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channel)
         self.provider = provider
+        self.batchConfig = batchConfig
         self.logger = Logger(label: "io.omerta.tunnel.session")
     }
 
@@ -65,15 +86,87 @@ public actor TunnelSession {
 
     // MARK: - Sending
 
-    /// Send a packet to the remote machine
-    /// - Parameter data: The packet data to send
+    /// Buffer a packet for batched sending. Starts auto-flush timer if needed.
+    /// - Parameter data: The packet data to buffer
     /// - Throws: TunnelError.notConnected if session is not active
     public func send(_ data: Data) async throws {
         guard state == .active else {
             throw TunnelError.notConnected
         }
 
-        try await provider.sendOnChannel(data, toMachine: remoteMachineId, channel: wireChannel)
+        sendBuffer.append(data)
+        sendBufferSize += data.count
+
+        // Check if buffer size threshold triggers immediate flush
+        if batchConfig.maxBufferSize > 0 && sendBufferSize >= batchConfig.maxBufferSize {
+            try await flush()
+            return
+        }
+
+        // Start auto-flush timer if not already running
+        if autoFlushTask == nil {
+            let delay = batchConfig.maxFlushDelay
+            autoFlushTask = Task { [weak self] in
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                try? await self?.flush()
+            }
+        }
+    }
+
+    /// Flush all buffered packets, sending them as a single batch.
+    /// - Throws: TunnelError.notConnected if session is not active
+    public func flush() async throws {
+        guard state == .active else {
+            throw TunnelError.notConnected
+        }
+
+        // Cancel pending auto-flush
+        autoFlushTask?.cancel()
+        autoFlushTask = nil
+
+        guard !sendBuffer.isEmpty else { return }
+
+        // Take the buffer
+        let packets = sendBuffer
+        let totalBytes = sendBufferSize
+        sendBuffer = []
+        sendBufferSize = 0
+
+        // Pack into batch wire format
+        let batchData: Data
+        if packets.count == 1 {
+            batchData = BatchWireFormat.packSingle(packets[0])
+        } else {
+            batchData = BatchWireFormat.packBatch(packets)
+        }
+
+        // Send directly (not buffered) since tunnel already batched
+        try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
+
+        stats.packetsSent += UInt64(packets.count)
+        stats.bytesSent += UInt64(totalBytes)
+        stats.lastActivity = Date()
+
+        logger.trace("Flushed batch", metadata: [
+            "packets": "\(packets.count)",
+            "bytes": "\(totalBytes)",
+            "channel": "\(channel)",
+            "to": "\(remoteMachineId.prefix(16))..."
+        ])
+    }
+
+    /// Send a single packet immediately without buffering.
+    /// This is the old send() behavior — wraps in single-packet wire format and sends.
+    /// - Parameter data: The packet data to send
+    /// - Throws: TunnelError.notConnected if session is not active
+    public func sendAndFlush(_ data: Data) async throws {
+        guard state == .active else {
+            throw TunnelError.notConnected
+        }
+
+        let wireData = BatchWireFormat.packSingle(data)
+        try await provider.sendOnChannel(wireData, toMachine: remoteMachineId, channel: wireChannel)
 
         stats.packetsSent += 1
         stats.bytesSent += UInt64(data.count)
@@ -99,8 +192,17 @@ public actor TunnelSession {
 
     /// Close the session and clean up resources
     public func close() async {
+        // Flush any remaining buffered data before closing
+        if state == .active && !sendBuffer.isEmpty {
+            try? await flush()
+        }
+
+        autoFlushTask?.cancel()
+        autoFlushTask = nil
         state = .disconnected
         receiveHandler = nil
+        sendBuffer = []
+        sendBufferSize = 0
 
         logger.info("Session closed", metadata: [
             "machine": "\(remoteMachineId.prefix(16))...",
@@ -110,11 +212,16 @@ public actor TunnelSession {
 
     // MARK: - Incoming Data
 
-    /// Deliver incoming data to this session (called by TunnelManager dispatch)
+    /// Deliver incoming data to this session (called by TunnelManager dispatch).
+    /// Automatically unpacks batch wire format.
     public func deliverIncoming(_ data: Data) async {
-        stats.packetsReceived += 1
-        stats.bytesReceived += UInt64(data.count)
-        stats.lastActivity = Date()
-        await receiveHandler?(data)
+        let packets = BatchWireFormat.unpack(data)
+
+        for packet in packets {
+            stats.packetsReceived += 1
+            stats.bytesReceived += UInt64(packet.count)
+            stats.lastActivity = Date()
+            await receiveHandler?(packet)
+        }
     }
 }

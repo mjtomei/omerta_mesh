@@ -1,36 +1,150 @@
-// EnvelopeHeader.swift - Header structure for Wire Format v2
+// EnvelopeHeader.swift - Split header structure for Wire Format v3
 //
-// The header contains routing information that is encrypted separately from
-// the payload to enable efficient routing decisions without full decryption.
+// Two separately encrypted header sections:
+//   RoutingHeader (44 bytes fixed) - decrypted by relay nodes for routing
+//   AuthHeader (128 bytes fixed) - decrypted by recipients for signature verification
 //
-// All fields are binary-encoded for fast processing without string parsing.
+// Compact field sizes:
+//   - PeerId: 16 bytes (truncated raw key instead of 44-byte Base64)
+//   - MachineId: 16 bytes (raw UUID instead of 36-byte string)
+//   - Channel: UInt16 hash only (no channelString)
 
 import Foundation
 
-/// Header structure for Wire Format v2 envelopes
-/// Contains routing information that can be decrypted independently of payload
-/// All fields use fixed-size binary encoding for efficient processing
-public struct EnvelopeHeader: Sendable, Equatable {
+// MARK: - Routing Header
+
+/// Routing header for Wire Format v3 envelopes.
+/// Contains minimal routing information that relay nodes can decrypt
+/// without accessing authentication or payload data.
+///
+/// Fixed size: 44 bytes, all multi-byte fields 8-byte aligned.
+///
+/// Layout:
+/// - [8 bytes]  networkHash
+/// - [16 bytes] fromPeerId (truncated)
+/// - [16 bytes] toPeerId (all-zeros = broadcast)
+/// - [1 byte]   flags
+/// - [1 byte]   hopCount
+/// - [2 bytes]  channel (UInt16)
+public struct RoutingHeader: Sendable, Equatable {
+    /// Total encoded size in bytes (fixed)
+    public static let encodedSize = 44
+
     /// Network hash (8 bytes) - first 8 bytes of SHA256(networkKey)
-    /// Used to verify the message is for this network after header decryption
     public let networkHash: Data
 
-    /// Sender's peer ID (truncated to 16 bytes for compactness)
-    public let fromPeerId: PeerId
+    /// Sender's peer ID (truncated to 16 bytes)
+    public let fromPeerId: Data
 
-    /// Recipient's peer ID (nil for broadcast, truncated to 16 bytes)
-    public let toPeerId: PeerId?
+    /// Recipient's peer ID (16 bytes; all-zeros = broadcast)
+    public let toPeerId: Data
 
-    /// Channel identifier (UInt16) for O(1) routing lookups
-    /// Use ChannelHash.hash() to convert string channel names
-    public let channel: UInt16
-
-    /// Original channel string (for signature verification)
-    /// This is stored alongside the hash to preserve signature verifiability
-    public let channelString: String
+    /// Flags byte
+    /// - bit 0: reserved
+    public let flags: UInt8
 
     /// Number of hops this message has taken (0-255)
     public let hopCount: UInt8
+
+    /// Channel identifier (UInt16) for O(1) routing lookups
+    public let channel: UInt16
+
+    /// All-zero peer ID used for broadcast
+    public static let broadcastPeerId = Data(repeating: 0, count: 16)
+
+    /// Whether this is a broadcast message
+    public var isBroadcast: Bool {
+        toPeerId == Self.broadcastPeerId
+    }
+
+    public init(
+        networkHash: Data,
+        fromPeerId: Data,
+        toPeerId: Data,
+        flags: UInt8 = 0,
+        hopCount: UInt8,
+        channel: UInt16
+    ) {
+        self.networkHash = networkHash
+        self.fromPeerId = fromPeerId
+        self.toPeerId = toPeerId
+        self.flags = flags
+        self.hopCount = hopCount
+        self.channel = channel
+    }
+
+    /// Encode routing header to exactly 44 bytes
+    public func encode() throws -> Data {
+        guard networkHash.count == 8 else {
+            throw EnvelopeError.invalidNetworkHash
+        }
+        guard fromPeerId.count == 16 else {
+            throw EnvelopeError.invalidPeerIdSize
+        }
+        guard toPeerId.count == 16 else {
+            throw EnvelopeError.invalidPeerIdSize
+        }
+
+        var writer = BinaryWriter(capacity: Self.encodedSize)
+        writer.writeBytes(networkHash)          // 8 bytes  (offset 0)
+        writer.writeBytes(fromPeerId)           // 16 bytes (offset 8)
+        writer.writeBytes(toPeerId)             // 16 bytes (offset 24)
+        writer.writeByte(flags)                 // 1 byte   (offset 40)
+        writer.writeByte(hopCount)              // 1 byte   (offset 41)
+        writer.writeUInt16(channel)             // 2 bytes  (offset 42)
+        return writer.data
+    }
+
+    /// Decode routing header from binary
+    public static func decode(from data: Data) throws -> RoutingHeader {
+        guard data.count >= encodedSize else {
+            throw BinaryEnvelopeError.truncatedData
+        }
+        var reader = BinaryReader(data)
+        let networkHash = try reader.readBytes(8)
+        let fromPeerId = try reader.readBytes(16)
+        let toPeerId = try reader.readBytes(16)
+        let flags = try reader.readByte()
+        let hopCount = try reader.readByte()
+        let channel = try reader.readUInt16()
+        return RoutingHeader(
+            networkHash: networkHash,
+            fromPeerId: fromPeerId,
+            toPeerId: toPeerId,
+            flags: flags,
+            hopCount: hopCount,
+            channel: channel
+        )
+    }
+}
+
+// MARK: - Auth Header
+
+/// Authentication header for Wire Format v3 envelopes.
+/// Contains signature and identity data for message verification.
+/// Recipients decrypt this before the payload to verify signatures
+/// without decrypting potentially large payloads.
+///
+/// Fixed size: 128 bytes, all fields 8-byte aligned.
+///
+/// Layout:
+/// - [8 bytes]  timestamp (UInt64 ms since epoch)
+/// - [16 bytes] messageId (UUID)
+/// - [16 bytes] machineId (raw UUID)
+/// - [32 bytes] publicKey (Ed25519)
+/// - [64 bytes] signature (Ed25519)
+///
+/// Note: The original channel string is stored alongside these headers
+/// for signature verification purposes, but it is NOT part of the auth
+/// header wire format. It is carried in the EnvelopeHeader wrapper.
+public struct AuthHeader: Sendable, Equatable {
+    /// Total encoded size in bytes (fixed)
+    /// 8 (timestamp) + 16 (messageId) + 16 (machineId) + 32 (publicKey) + 64 (signature) = 136
+    public static let encodedSize = 136
+
+    // Field sizes
+    public static let publicKeySize = 32
+    public static let signatureSize = 64
 
     /// When the message was created (Unix timestamp, milliseconds)
     public let timestamp: Date
@@ -38,14 +152,99 @@ public struct EnvelopeHeader: Sendable, Equatable {
     /// Unique message identifier (16 bytes)
     public let messageId: UUID
 
-    /// Machine ID of the sender (truncated to 16 bytes)
-    public let machineId: String
+    /// Machine ID of the sender (raw 16-byte UUID)
+    public let machineId: UUID
 
     /// Public key of the sender (32 bytes raw Ed25519)
     public let publicKey: Data
 
     /// Signature of the envelope (64 bytes Ed25519)
     public let signature: Data
+
+    public init(
+        timestamp: Date,
+        messageId: UUID,
+        machineId: UUID,
+        publicKey: Data,
+        signature: Data
+    ) {
+        self.timestamp = timestamp
+        self.messageId = messageId
+        self.machineId = machineId
+        self.publicKey = publicKey
+        self.signature = signature
+    }
+
+    /// Encode auth header to exactly 128 bytes
+    public func encode() throws -> Data {
+        guard publicKey.count == Self.publicKeySize else {
+            throw EnvelopeError.invalidPublicKeySize
+        }
+        guard signature.count == Self.signatureSize else {
+            throw EnvelopeError.invalidSignatureSize
+        }
+
+        var writer = BinaryWriter(capacity: Self.encodedSize)
+        let timestampMs = UInt64(timestamp.timeIntervalSince1970 * 1000)
+        writer.writeUInt64(timestampMs)         // 8 bytes  (offset 0)
+        writer.writeUUID(messageId)             // 16 bytes (offset 8)
+        writer.writeUUID(machineId)             // 16 bytes (offset 24)
+        writer.writeBytes(publicKey)            // 32 bytes (offset 40) -- Note: not on 8-byte boundary
+        writer.writeBytes(signature)            // 64 bytes (offset 72) -- Note: on 8-byte boundary
+        return writer.data
+    }
+
+    /// Decode auth header from binary
+    public static func decode(from data: Data) throws -> AuthHeader {
+        guard data.count >= encodedSize else {
+            throw BinaryEnvelopeError.truncatedData
+        }
+        var reader = BinaryReader(data)
+        let timestampMs = try reader.readUInt64()
+        let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
+        let messageId = try reader.readUUID()
+        let machineId = try reader.readUUID()
+        let publicKey = try reader.readBytes(Self.publicKeySize)
+        let signature = try reader.readBytes(Self.signatureSize)
+        return AuthHeader(
+            timestamp: timestamp,
+            messageId: messageId,
+            machineId: machineId,
+            publicKey: publicKey,
+            signature: signature
+        )
+    }
+}
+
+// MARK: - Combined Envelope Header
+
+/// Combined header wrapper that holds both routing and auth headers
+/// plus the original channel string (needed for signature verification).
+public struct EnvelopeHeader: Sendable, Equatable {
+    public let routing: RoutingHeader
+    public let auth: AuthHeader
+
+    /// Original channel string for signature verification.
+    /// Not part of wire format — carried separately.
+    public let channelString: String
+
+    /// Original full peer ID strings for signature verification.
+    /// The routing header only carries truncated 16-byte versions.
+    public let fromPeerIdFull: PeerId
+    public let toPeerIdFull: PeerId?
+    public let machineIdString: MachineId
+
+    // Convenience accessors
+    public var networkHash: Data { routing.networkHash }
+    public var fromPeerId: PeerId { fromPeerIdFull }
+    public var toPeerId: PeerId? { toPeerIdFull }
+    public var channel: UInt16 { routing.channel }
+    public var hopCount: UInt8 { routing.hopCount }
+    public var timestamp: Date { auth.timestamp }
+    public var messageId: UUID { auth.messageId }
+    public var machineId: String { machineIdString }
+    public var publicKey: Data { auth.publicKey }
+    public var signature: Data { auth.signature }
 
     public init(
         networkHash: Data,
@@ -60,158 +259,49 @@ public struct EnvelopeHeader: Sendable, Equatable {
         publicKey: Data,
         signature: Data
     ) {
-        self.networkHash = networkHash
-        self.fromPeerId = fromPeerId
-        self.toPeerId = toPeerId
-        self.channel = channel
-        self.channelString = channelString
-        self.hopCount = hopCount
-        self.timestamp = timestamp
-        self.messageId = messageId
-        self.machineId = machineId
-        self.publicKey = publicKey
-        self.signature = signature
-    }
-
-    // MARK: - Binary Encoding
-
-    /// Binary header format (fixed size fields for fast parsing):
-    /// - [8 bytes]  networkHash
-    /// - [1 byte]   flags (bit 0: hasToPeerId)
-    /// - [44 bytes] fromPeerId (base64 peer ID, null-padded)
-    /// - [44 bytes] toPeerId if present, or skipped if flags.bit0 == 0
-    /// - [2 bytes]  channel (UInt16, big-endian)
-    /// - [64 bytes] channelString (original channel name, null-padded)
-    /// - [1 byte]   hopCount
-    /// - [8 bytes]  timestamp (milliseconds since epoch, UInt64 big-endian)
-    /// - [16 bytes] messageId (UUID bytes)
-    /// - [36 bytes] machineId (UUID string, null-padded)
-    /// - [32 bytes] publicKey (raw Ed25519 public key)
-    /// - [64 bytes] signature (raw Ed25519 signature)
-    ///
-    /// Total size: 276 bytes (with toPeerId) or 232 bytes (without)
-
-    public static let peerIdFieldSize = 44      // Base64 peer ID max length
-    public static let channelStringFieldSize = 64  // Channel string max length
-    public static let machineIdFieldSize = 36   // UUID string length
-    public static let publicKeySize = 32        // Ed25519 public key
-    public static let signatureSize = 64        // Ed25519 signature
-
-    public func encode() throws -> Data {
-        var writer = BinaryWriter(capacity: 280)
-
-        // Network hash (exactly 8 bytes)
-        guard networkHash.count == 8 else {
-            throw EnvelopeError.invalidNetworkHash
-        }
-        writer.writeBytes(networkHash)
-
-        // Flags
-        let flags: UInt8 = toPeerId != nil ? 0x01 : 0x00
-        writer.writeByte(flags)
-
-        // fromPeerId (fixed 44 bytes, null-padded)
-        writer.writeFixedString(fromPeerId, size: Self.peerIdFieldSize)
-
-        // toPeerId if present (fixed 44 bytes, null-padded)
-        if let to = toPeerId {
-            writer.writeFixedString(to, size: Self.peerIdFieldSize)
-        }
-
-        // Channel (UInt16)
-        writer.writeUInt16(channel)
-
-        // Channel string (fixed 64 bytes, null-padded)
-        writer.writeFixedString(channelString, size: Self.channelStringFieldSize)
-
-        // hopCount
-        writer.writeByte(hopCount)
-
-        // timestamp (milliseconds since epoch as UInt64)
-        let timestampMs = UInt64(timestamp.timeIntervalSince1970 * 1000)
-        writer.writeUInt64(timestampMs)
-
-        // messageId (16 bytes UUID)
-        writer.writeUUID(messageId)
-
-        // machineId (fixed 36 bytes, null-padded)
-        writer.writeFixedString(machineId, size: Self.machineIdFieldSize)
-
-        // publicKey (32 bytes)
-        guard publicKey.count == Self.publicKeySize else {
-            throw EnvelopeError.invalidPublicKeySize
-        }
-        writer.writeBytes(publicKey)
-
-        // signature (64 bytes)
-        guard signature.count == Self.signatureSize else {
-            throw EnvelopeError.invalidSignatureSize
-        }
-        writer.writeBytes(signature)
-
-        return writer.data
-    }
-
-    /// Decode header from binary format
-    public static func decode(from data: Data) throws -> EnvelopeHeader {
-        var reader = BinaryReader(data)
-
-        // Network hash (8 bytes)
-        let networkHash = try reader.readBytes(8)
-
-        // Flags
-        let flags = try reader.readByte()
-        let hasToPeerId = (flags & 0x01) != 0
-
-        // fromPeerId (fixed 44 bytes)
-        let fromPeerId = try reader.readFixedString(size: peerIdFieldSize)
-
-        // toPeerId if present
-        let toPeerId: PeerId?
-        if hasToPeerId {
-            toPeerId = try reader.readFixedString(size: peerIdFieldSize)
-        } else {
-            toPeerId = nil
-        }
-
-        // Channel (UInt16)
-        let channel = try reader.readUInt16()
-
-        // Channel string (fixed 64 bytes)
-        let channelString = try reader.readFixedString(size: channelStringFieldSize)
-
-        // hopCount
-        let hopCount = try reader.readByte()
-
-        // timestamp (UInt64 milliseconds)
-        let timestampMs = try reader.readUInt64()
-        let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
-
-        // messageId (16 bytes UUID)
-        let messageId = try reader.readUUID()
-
-        // machineId (fixed 36 bytes)
-        let machineId = try reader.readFixedString(size: machineIdFieldSize)
-
-        // publicKey (32 bytes)
-        let publicKey = try reader.readBytes(publicKeySize)
-
-        // signature (64 bytes)
-        let signature = try reader.readBytes(signatureSize)
-
-        return EnvelopeHeader(
+        self.routing = RoutingHeader(
             networkHash: networkHash,
-            fromPeerId: fromPeerId,
-            toPeerId: toPeerId,
-            channel: channel,
-            channelString: channelString,
+            fromPeerId: PeerIdCompact.truncate(fromPeerId),
+            toPeerId: toPeerId.map { PeerIdCompact.truncate($0) } ?? RoutingHeader.broadcastPeerId,
             hopCount: hopCount,
+            channel: channel
+        )
+        self.auth = AuthHeader(
             timestamp: timestamp,
             messageId: messageId,
-            machineId: machineId,
+            machineId: MachineIdCompact.toUUID(machineId) ?? UUID(),
             publicKey: publicKey,
             signature: signature
         )
+        self.channelString = channelString
+        self.fromPeerIdFull = fromPeerId
+        self.toPeerIdFull = toPeerId
+        self.machineIdString = machineId
+    }
+
+    /// Reconstruct from decoded routing and auth headers
+    public init(routing: RoutingHeader, auth: AuthHeader, channelString: String, fromPeerIdFull: PeerId, toPeerIdFull: PeerId?, machineIdString: MachineId) {
+        self.routing = routing
+        self.auth = auth
+        self.channelString = channelString
+        self.fromPeerIdFull = fromPeerIdFull
+        self.toPeerIdFull = toPeerIdFull
+        self.machineIdString = machineIdString
+    }
+
+    /// Encode routing header only (for encryption)
+    public func encodeRouting() throws -> Data {
+        try routing.encode()
+    }
+
+    /// Encode auth header only (for encryption)
+    public func encodeAuth() throws -> Data {
+        try auth.encode()
+    }
+
+    // Legacy encode: encode routing header (for backward compatibility in tests)
+    public func encode() throws -> Data {
+        try routing.encode()
     }
 }
 
@@ -254,6 +344,49 @@ public enum ChannelHash {
     public static let healthRequest: UInt16 = hash("health-request")
     public static let cloisterNegotiate: UInt16 = hash("cloister-negotiate")
     public static let cloisterShare: UInt16 = hash("cloister-share")
+}
+
+// MARK: - PeerId Compact Helpers
+
+/// Utilities for truncating peer IDs to 16 bytes
+public enum PeerIdCompact {
+    /// Truncate a peer ID string to 16 bytes for the routing header.
+    /// Uses the raw bytes of the base64-decoded public key if possible,
+    /// otherwise uses SHA256 hash of the string.
+    public static func truncate(_ peerId: PeerId) -> Data {
+        if let keyData = Data(base64Encoded: peerId), keyData.count >= 16 {
+            return Data(keyData.prefix(16))
+        }
+        // Fallback: hash the string
+        let utf8 = Data(peerId.utf8)
+        if utf8.count >= 16 {
+            return Data(utf8.prefix(16))
+        }
+        // Pad short strings
+        var padded = utf8
+        padded.append(Data(repeating: 0, count: 16 - utf8.count))
+        return padded
+    }
+
+    /// Check if a truncated peer ID matches a full peer ID
+    public static func matches(truncated: Data, full: PeerId) -> Bool {
+        return truncate(full) == truncated
+    }
+}
+
+// MARK: - MachineId Compact Helpers
+
+/// Utilities for converting machine IDs to/from raw 16-byte UUIDs
+public enum MachineIdCompact {
+    /// Convert a machine ID string (UUID format) to a UUID
+    public static func toUUID(_ machineId: MachineId) -> UUID? {
+        UUID(uuidString: machineId)
+    }
+
+    /// Convert a UUID back to a machine ID string
+    public static func toString(_ uuid: UUID) -> MachineId {
+        uuid.uuidString
+    }
 }
 
 // MARK: - Binary Writer Extensions
@@ -370,6 +503,8 @@ public enum EnvelopeError: Error, LocalizedError {
     case truncatedPacket
     case invalidPublicKeySize
     case invalidSignatureSize
+    case invalidPeerIdSize
+    case authDecryptionFailed
 
     public var errorDescription: String? {
         switch self {
@@ -397,6 +532,10 @@ public enum EnvelopeError: Error, LocalizedError {
             return "Public key must be exactly 32 bytes"
         case .invalidSignatureSize:
             return "Signature must be exactly 64 bytes"
+        case .invalidPeerIdSize:
+            return "Peer ID must be exactly 16 bytes (truncated)"
+        case .authDecryptionFailed:
+            return "Failed to decrypt auth header"
         }
     }
 }

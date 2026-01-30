@@ -227,6 +227,20 @@ public actor MeshNode {
     /// Maximum age of queued messages before they're dropped (60 seconds)
     private let queuedMessageMaxAge: TimeInterval = 60.0
 
+    // MARK: - Channel Batching
+
+    /// Per-channel batch configuration overrides
+    private var channelBatchConfigs: [UInt16: BatchConfig] = [:]
+
+    /// Per-channel send buffers keyed by "channelHash:destination"
+    private var channelSendBuffers: [String: (packets: [Data], totalSize: Int)] = [:]
+
+    /// Auto-flush timer tasks per buffer key
+    private var channelFlushTasks: [String: Task<Void, Never>] = [:]
+
+    /// Registered batch monitors
+    private var batchMonitors: [any BatchMonitor] = []
+
     /// Whether the node is running
     private var isRunning = false
 
@@ -2323,6 +2337,129 @@ extension MeshNode: MeshNodeServices {
         channelQueues[channelHash] = queue
 
         logger.debug("Queued message for channel hash \(channelHash) (queue size: \(queue.count))")
+    }
+
+    // MARK: - Buffered Channel Send
+
+    /// Register a handler with a per-channel batch config override
+    public func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        try await onChannel(channel, handler: handler)
+        if let config = batchConfig {
+            let hash = ChannelHash.hash(channel)
+            channelBatchConfigs[hash] = config
+        }
+    }
+
+    /// Buffer data for batched sending on a channel to a peer
+    public func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        guard ChannelUtils.isValid(channel) else {
+            throw MeshNodeError.invalidChannel(channel)
+        }
+        let bufferKey = "\(ChannelHash.hash(channel)):peer:\(peerId)"
+        appendToBuffer(bufferKey, data: data, channel: channel)
+    }
+
+    /// Buffer data for batched sending on a channel to a specific machine
+    public func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        guard ChannelUtils.isValid(channel) else {
+            throw MeshNodeError.invalidChannel(channel)
+        }
+        let bufferKey = "\(ChannelHash.hash(channel)):machine:\(machineId)"
+        appendToBuffer(bufferKey, data: data, channel: channel)
+    }
+
+    /// Flush all buffered data for a channel
+    public func flushChannel(_ channel: String) async throws {
+        let hash = ChannelHash.hash(channel)
+        let prefix = "\(hash):"
+        let keysToFlush = channelSendBuffers.keys.filter { $0.hasPrefix(prefix) }
+
+        for key in keysToFlush {
+            try await flushBuffer(key, channel: channel)
+        }
+    }
+
+    /// Register a batch monitor
+    public func registerBatchMonitor(_ monitor: any BatchMonitor) {
+        batchMonitors.append(monitor)
+    }
+
+    /// Unregister a batch monitor
+    public func unregisterBatchMonitor(_ monitor: any BatchMonitor) {
+        batchMonitors.removeAll { ($0 as AnyObject) === (monitor as AnyObject) }
+    }
+
+    private func appendToBuffer(_ key: String, data: Data, channel: String) {
+        var entry = channelSendBuffers[key] ?? (packets: [], totalSize: 0)
+        entry.packets.append(data)
+        entry.totalSize += data.count
+        channelSendBuffers[key] = entry
+
+        // Check buffer size threshold
+        let hash = ChannelHash.hash(channel)
+        let config = resolvedBatchConfig(channelHash: hash)
+        if config.maxBufferSize > 0 && entry.totalSize >= config.maxBufferSize {
+            let ch = channel
+            Task { try? await self.flushBuffer(key, channel: ch) }
+            return
+        }
+
+        // Start auto-flush timer if not running
+        if channelFlushTasks[key] == nil {
+            let delay = config.maxFlushDelay
+            let ch = channel
+            channelFlushTasks[key] = Task {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                try? await self.flushBuffer(key, channel: ch)
+            }
+        }
+    }
+
+    private func flushBuffer(_ key: String, channel: String) async throws {
+        // Cancel timer
+        channelFlushTasks[key]?.cancel()
+        channelFlushTasks.removeValue(forKey: key)
+
+        guard let entry = channelSendBuffers.removeValue(forKey: key), !entry.packets.isEmpty else {
+            return
+        }
+
+        // Pack into batch
+        let batchData: Data
+        if entry.packets.count == 1 {
+            // Single packet — just send the raw data directly
+            batchData = entry.packets[0]
+        } else {
+            // Multiple packets — length-prefix each
+            var packed = Data()
+            for pkt in entry.packets {
+                var len = UInt16(min(pkt.count, Int(UInt16.max))).bigEndian
+                packed.append(Data(bytes: &len, count: 2))
+                packed.append(pkt)
+            }
+            batchData = packed
+        }
+
+        // Parse key to determine destination type
+        let parts = key.split(separator: ":", maxSplits: 2)
+        if parts.count >= 3 {
+            let destType = String(parts[1])
+            let destId = String(parts[2])
+            if destType == "peer" {
+                try await sendOnChannel(batchData, to: destId, channel: channel)
+            } else {
+                try await sendOnChannel(batchData, toMachine: destId, channel: channel)
+            }
+        }
+    }
+
+    private func resolvedBatchConfig(channelHash: UInt16) -> BatchConfig {
+        // Priority: monitor → channel override → default
+        if let channelConfig = channelBatchConfigs[channelHash] {
+            return channelConfig
+        }
+        return .default
     }
 
     /// Clear expired messages from all channel queues

@@ -64,6 +64,9 @@ public struct TunnelManagerConfig: Sendable {
     /// Number of initial probe intervals to skip failure counting (grace period for remote to start probing)
     public var healthGraceIntervals: Int = 3
 
+    /// Batch configuration for tunnel traffic (overrides channel-level config)
+    public var batchConfig: BatchConfig?
+
     public static let `default` = TunnelManagerConfig()
 
     public init(
@@ -72,7 +75,8 @@ public struct TunnelManagerConfig: Sendable {
         healthProbeMinInterval: Duration = .milliseconds(500),
         healthProbeMaxInterval: Duration = .seconds(15),
         healthFailureThreshold: Int = 3,
-        healthGraceIntervals: Int = 3
+        healthGraceIntervals: Int = 3,
+        batchConfig: BatchConfig? = nil
     ) {
         self.maxSessionsPerMachine = maxSessionsPerMachine
         self.maxTotalSessions = maxTotalSessions
@@ -80,5 +84,6 @@ public struct TunnelManagerConfig: Sendable {
         self.healthProbeMaxInterval = healthProbeMaxInterval
         self.healthFailureThreshold = healthFailureThreshold
         self.healthGraceIntervals = healthGraceIntervals
+        self.batchConfig = batchConfig
     }
 }

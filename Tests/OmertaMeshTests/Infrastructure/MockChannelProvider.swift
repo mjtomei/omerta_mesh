@@ -39,6 +39,10 @@ public actor MockChannelProvider: ChannelProvider {
         handlers[channel] = handler
     }
 
+    public func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        try await onChannel(channel, handler: handler)
+    }
+
     public func offChannel(_ channel: String) async {
         handlers.removeValue(forKey: channel)
     }
@@ -56,6 +60,16 @@ public actor MockChannelProvider: ChannelProvider {
         }
         sentMessages.append((data, machineId, channel))
     }
+
+    public func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        try await sendOnChannel(data, to: peerId, channel: channel)
+    }
+
+    public func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+
+    public func flushChannel(_ channel: String) async throws {}
 
     // MARK: - Test Helpers
 

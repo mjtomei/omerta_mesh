@@ -1,20 +1,30 @@
-// BinaryEnvelopeV2.swift - Wire Format v2 with layered encryption
+// BinaryEnvelopeV2.swift - Wire Format v3 with split routing/auth/payload encryption
 //
 // Format structure:
-// UNENCRYPTED PREFIX (5 bytes):
-//   [4 bytes] magic "OMRT"
-//   [1 byte]  version 0x02
+// UNENCRYPTED PREFIX (4 bytes):
+//   [3 bytes] magic "OMR"
+//   [1 byte]  version 0x03
 //
-// HEADER SECTION:
-//   [12 bytes] nonce
-//   [8 bytes]  header_tag (truncated Poly1305)
-//   [2 bytes]  header_length
-//   [N bytes]  encrypted header data
+// ROUTING HEADER SECTION:
+//   [12 bytes] nonce (base nonce, shared by all sections)
+//   [16 bytes] routing_tag (Poly1305)
+//   [44 bytes] encrypted routing header (fixed size)
 //
-// PAYLOAD SECTION:
-//   [4 bytes]  payload_length
-//   [M bytes]  encrypted payload data
-//   [16 bytes] payload_tag (full Poly1305)
+// AUTH HEADER SECTION:
+//   [16 bytes] auth_tag (Poly1305)
+//   [128 bytes] encrypted auth header (fixed size)
+//
+// PAYLOAD SECTION (chunked encryption for parallel decryption):
+//   [4 bytes]  total_payload_length (plaintext size)
+//   For each chunk (count and sizes derived from total_payload_length):
+//     [N bytes]  encrypted chunk data (512 bytes, last chunk may be smaller)
+//     [16 bytes] chunk_tag (Poly1305)
+//
+// Each chunk uses nonce: base_nonce XOR (0x02 | (chunk_index << 8))
+// Chunk size: 512 bytes (last chunk = total_payload_length % 512, or 512 if even)
+//
+// Fixed header overhead: 4 + 12 + 16 + 44 + 16 + 136 + 4 = 232 bytes
+// Per-chunk overhead: 16 (tag) = 16 bytes
 
 import Foundation
 import Crypto
@@ -37,34 +47,45 @@ public struct SealedEnvelope: Sendable {
     }
 }
 
-/// Wire format v2 implementation with layered encryption
+/// Wire format v3 implementation with split routing/auth/payload encryption
 public enum BinaryEnvelopeV2 {
-    /// Magic bytes identifying Omerta packets
-    public static let magic = Data("OMRT".utf8)
+    /// Magic bytes identifying Omerta packets (3 bytes)
+    public static let magic = Data("OMR".utf8)
 
     /// Wire format version
-    public static let version: UInt8 = 0x02
+    public static let version: UInt8 = 0x03
 
     /// Size of the unencrypted prefix (magic + version)
-    public static let prefixSize = 5
+    public static let prefixSize = 4
 
     /// Size of the nonce
     public static let nonceSize = 12
 
-    /// Size of the truncated header authentication tag
-    public static let headerTagSize = 8
+    /// Size of authentication tags
+    public static let tagSize = 16
 
-    /// Size of the header length field
-    public static let headerLengthSize = 2
+    /// Chunk size for payload encryption (512 bytes)
+    public static let chunkSize = 512
 
-    /// Size of the payload length field
-    public static let payloadLengthSize = 4
+    /// Fixed header overhead (excluding per-chunk overhead)
+    public static let headerOverhead = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize +
+                                       tagSize + AuthHeader.encodedSize + 4  // = 232
 
-    /// Size of the full payload authentication tag
-    public static let payloadTagSize = 16
+    /// Per-chunk overhead: 16 bytes tag only (no length field; derived from total payload length)
+    public static let perChunkOverhead = tagSize  // = 16
+
+    /// Calculate total overhead for a given payload size
+    public static func totalOverhead(payloadSize: Int) -> Int {
+        let chunkCount = max(1, (payloadSize + chunkSize - 1) / chunkSize)
+        return headerOverhead + chunkCount * perChunkOverhead
+    }
 
     /// HKDF info string for header key derivation
-    private static let headerKeyInfo = Data("omerta-header-v2".utf8)
+    private static let headerKeyInfo = Data("omerta-header-v3".utf8)
+
+    /// Nonce XOR values for domain separation
+    private static let routingNonceXor: UInt8 = 0x00
+    private static let authNonceXor: UInt8 = 0x01
 
     // MARK: - Network Hash
 
@@ -86,257 +107,313 @@ public enum BinaryEnvelopeV2 {
         )
     }
 
+    /// Derive a nonce by XORing the last byte of the base nonce
+    private static func deriveNonce(_ baseNonce: [UInt8], xor: UInt8) throws -> ChaChaPoly.Nonce {
+        var derived = baseNonce
+        derived[11] ^= xor
+        return try ChaChaPoly.Nonce(data: derived)
+    }
+
+    /// Derive a chunk nonce: XOR low byte with 0x02, bytes 9-10 with chunk index
+    private static func deriveChunkNonce(_ baseNonce: [UInt8], chunkIndex: Int) throws -> ChaChaPoly.Nonce {
+        var derived = baseNonce
+        derived[11] ^= 0x02
+        derived[9] ^= UInt8(truncatingIfNeeded: chunkIndex >> 8)
+        derived[10] ^= UInt8(truncatingIfNeeded: chunkIndex)
+        return try ChaChaPoly.Nonce(data: derived)
+    }
+
     // MARK: - Encoding
 
-    /// Encode a complete envelope with layered encryption
-    /// - Parameters:
-    ///   - header: The envelope header
-    ///   - payload: The payload data (already JSON-encoded MeshMessage)
-    ///   - networkKey: The 256-bit network encryption key
-    /// - Returns: The complete encrypted packet
+    /// Encode a complete envelope with split routing/auth/payload encryption
     public static func encode(
         header: EnvelopeHeader,
         payload: Data,
         networkKey: Data
     ) throws -> SealedEnvelope {
-        // Generate random nonce using ChaChaPoly's nonce generator
-        let headerNonceValue = ChaChaPoly.Nonce()
-        let headerNonce = Array(headerNonceValue)
+        // Generate random base nonce
+        let baseNonceValue = ChaChaPoly.Nonce()
+        let baseNonce = Array(baseNonceValue)
 
-        // Derive body nonce (XOR last byte with 0x01)
-        var bodyNonce = headerNonce
-        bodyNonce[11] ^= 0x01
-
-        // Derive header key
+        // Derive keys
         let headerKey = deriveHeaderKey(from: networkKey)
         let payloadKey = SymmetricKey(data: networkKey)
 
-        // Encode header to binary
-        let headerData = try header.encode()
+        // Encode headers
+        let routingData = try header.encodeRouting()
+        let authData = try header.encodeAuth()
 
-        // Encrypt header with ChaCha20-Poly1305
-        let headerSealedBox = try ChaChaPoly.seal(headerData, using: headerKey, nonce: headerNonceValue)
+        // Encrypt routing header (nonce XOR 0x00 = base nonce)
+        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingSealedBox = try ChaChaPoly.seal(routingData, using: headerKey, nonce: routingNonce)
 
-        // Encrypt payload with ChaCha20-Poly1305
-        let bodyNonceValue = try ChaChaPoly.Nonce(data: bodyNonce)
-        let payloadSealedBox = try ChaChaPoly.seal(payload, using: payloadKey, nonce: bodyNonceValue)
+        // Encrypt auth header (nonce XOR 0x01)
+        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
+        let authSealedBox = try ChaChaPoly.seal(authData, using: payloadKey, nonce: authNonce)
+
+        // Split payload into chunks and encrypt each
+        let chunkPlaintexts: [Data]
+        if payload.isEmpty {
+            chunkPlaintexts = [Data()]
+        } else {
+            chunkPlaintexts = stride(from: 0, to: payload.count, by: chunkSize).map { start in
+                let end = min(start + chunkSize, payload.count)
+                return Data(payload[start..<end])
+            }
+        }
+
+        var encryptedChunks: [(ciphertext: Data, tag: Data)] = []
+        encryptedChunks.reserveCapacity(chunkPlaintexts.count)
+        for (i, chunkData) in chunkPlaintexts.enumerated() {
+            let chunkNonce = try deriveChunkNonce(baseNonce, chunkIndex: i)
+            let sealed = try ChaChaPoly.seal(chunkData, using: payloadKey, nonce: chunkNonce)
+            encryptedChunks.append((Data(sealed.ciphertext), Data(sealed.tag)))
+        }
 
         // Build the packet
-        var writer = BinaryWriter(capacity: prefixSize + nonceSize + headerTagSize + headerLengthSize +
-                                           headerData.count + payloadLengthSize + payload.count + payloadTagSize + 50)
+        let totalSize = headerOverhead + chunkPlaintexts.count * perChunkOverhead + payload.count
+        var writer = BinaryWriter(capacity: totalSize)
 
-        // Unencrypted prefix
+        // Unencrypted prefix (4 bytes)
         writer.writeBytes(magic)
         writer.writeByte(version)
 
-        // Header section
-        writer.writeBytes(Data(headerNonce))
-        writer.writeBytes(headerSealedBox.tag.prefix(headerTagSize))  // Truncated tag
-        writer.writeUInt16(UInt16(headerSealedBox.ciphertext.count))
-        writer.writeBytes(headerSealedBox.ciphertext)
+        // Routing header section
+        writer.writeBytes(Data(baseNonce))                      // 12 bytes nonce
+        writer.writeBytes(routingSealedBox.tag)                 // 16 bytes tag
+        writer.writeBytes(routingSealedBox.ciphertext)          // 44 bytes encrypted routing
 
-        // Payload section
-        writer.writeUInt32(UInt32(payloadSealedBox.ciphertext.count))
-        writer.writeBytes(payloadSealedBox.ciphertext)
-        writer.writeBytes(payloadSealedBox.tag)  // Full 16-byte tag
+        // Auth header section
+        writer.writeBytes(authSealedBox.tag)                    // 16 bytes tag
+        writer.writeBytes(authSealedBox.ciphertext)             // 136 bytes encrypted auth
+
+        // Payload section (chunked) — chunk count and sizes derived from total length
+        writer.writeUInt32(UInt32(payload.count))               // 4 bytes total plaintext length
+
+        for chunk in encryptedChunks {
+            writer.writeBytes(chunk.ciphertext)                    // N bytes encrypted data
+            writer.writeBytes(chunk.tag)                           // 16 bytes tag
+        }
 
         return SealedEnvelope(data: writer.data)
     }
 
-    // MARK: - Fast Path Rejection
-
-    /// Check if data has valid magic and version (O(1) check)
-    /// Use this for fast rejection of non-Omerta packets
-    public static func isValidPrefix(_ data: Data) -> Bool {
-        guard data.count >= prefixSize else { return false }
-        return data.prefix(4) == magic && data[4] == version
-    }
-
-    // MARK: - Full Decoding
-
-    /// Decode the complete envelope (header + payload)
-    /// Use this when you need the full message content
-    public static func decode(
-        _ data: Data,
-        networkKey: Data
-    ) throws -> (header: EnvelopeHeader, payload: Data) {
-        // For the initial implementation, use full 16-byte tags for both
-        // This simplifies the crypto at the cost of 8 extra bytes
-
-        // Check minimum size
-        let minSize = prefixSize + nonceSize + 16 + headerLengthSize
-        guard data.count >= minSize else {
-            throw EnvelopeError.truncatedPacket
-        }
-
-        // Verify magic
-        guard data.prefix(4) == magic else {
-            throw EnvelopeError.invalidMagic
-        }
-
-        // Verify version
-        let packetVersion = data[4]
-        guard packetVersion == version else {
-            throw EnvelopeError.unsupportedVersion(packetVersion)
-        }
-
-        // Extract header nonce
-        let nonceStart = 5
-        let headerNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
-
-        // Derive body nonce
-        var bodyNonce = headerNonce
-        bodyNonce[11] ^= 0x01
-
-        // Extract header tag (full 16 bytes for now)
-        let headerTagStart = nonceStart + nonceSize
-        let headerTag = Data(data[headerTagStart..<(headerTagStart + 16)])
-
-        // Extract header length
-        let lengthStart = headerTagStart + 16
-        let headerLength = UInt16(data[lengthStart]) << 8 | UInt16(data[lengthStart + 1])
-
-        // Extract encrypted header
-        let headerDataStart = lengthStart + headerLengthSize
-        let headerDataEnd = headerDataStart + Int(headerLength)
-        guard data.count >= headerDataEnd else {
-            throw EnvelopeError.truncatedPacket
-        }
-        let encryptedHeader = Data(data[headerDataStart..<headerDataEnd])
-
-        // Decrypt header
-        let headerKey = deriveHeaderKey(from: networkKey)
-        let headerNonceValue = try ChaChaPoly.Nonce(data: headerNonce)
-        let headerSealedBox = try ChaChaPoly.SealedBox(
-            nonce: headerNonceValue,
-            ciphertext: encryptedHeader,
-            tag: headerTag
-        )
-        let headerData = try ChaChaPoly.open(headerSealedBox, using: headerKey)
-        let header = try EnvelopeHeader.decode(from: headerData)
-
-        // Verify network hash
-        let expectedHash = computeNetworkHash(networkKey)
-        guard header.networkHash == expectedHash else {
-            throw EnvelopeError.networkMismatch
-        }
-
-        // Extract payload length
-        let payloadLengthStart = headerDataEnd
-        guard data.count >= payloadLengthStart + payloadLengthSize else {
-            throw EnvelopeError.truncatedPacket
-        }
-        var reader = BinaryReader(data)
-        reader.offset = payloadLengthStart
-        let payloadLength = try reader.readUInt32()
-
-        // Extract encrypted payload and tag
-        let payloadDataStart = payloadLengthStart + payloadLengthSize
-        let payloadDataEnd = payloadDataStart + Int(payloadLength)
-        let payloadTagEnd = payloadDataEnd + payloadTagSize
-        guard data.count >= payloadTagEnd else {
-            throw EnvelopeError.truncatedPacket
-        }
-        let encryptedPayload = Data(data[payloadDataStart..<payloadDataEnd])
-        let payloadTag = Data(data[payloadDataEnd..<payloadTagEnd])
-
-        // Decrypt payload
-        let payloadKey = SymmetricKey(data: networkKey)
-        let bodyNonceValue = try ChaChaPoly.Nonce(data: bodyNonce)
-        let payloadSealedBox = try ChaChaPoly.SealedBox(
-            nonce: bodyNonceValue,
-            ciphertext: encryptedPayload,
-            tag: payloadTag
-        )
-        let payload = try ChaChaPoly.open(payloadSealedBox, using: payloadKey)
-
-        return (header, payload)
-    }
-}
-
-// MARK: - Updated Encode with Full Header Tag
-
-extension BinaryEnvelopeV2 {
-    /// Encode with full 16-byte header tag (matches decode expectations)
+    // Alias for backward compatibility
     public static func encodeV2(
         header: EnvelopeHeader,
         payload: Data,
         networkKey: Data
     ) throws -> SealedEnvelope {
-        // Generate random nonce using ChaChaPoly's nonce generator
-        let headerNonceValue = ChaChaPoly.Nonce()
-        let headerNonce = Array(headerNonceValue)
+        try encode(header: header, payload: payload, networkKey: networkKey)
+    }
 
-        // Derive body nonce (XOR last byte with 0x01)
-        var bodyNonce = headerNonce
-        bodyNonce[11] ^= 0x01
+    // MARK: - Fast Path Rejection
 
-        // Derive header key
+    /// Check if data has valid magic and version (O(1) check)
+    public static func isValidPrefix(_ data: Data) -> Bool {
+        guard data.count >= prefixSize else { return false }
+        return data.prefix(3) == magic && data[3] == version
+    }
+
+    // MARK: - Routing-Only Decode
+
+    /// Decode only the routing header (for relay routing decisions)
+    /// Does not decrypt auth or payload sections.
+    public static func decodeRoutingOnly(
+        _ data: Data,
+        networkKey: Data
+    ) throws -> RoutingHeader {
+        let minSize = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize
+        guard data.count >= minSize else {
+            throw EnvelopeError.truncatedPacket
+        }
+
+        // Verify prefix
+        guard data.prefix(3) == magic else {
+            throw EnvelopeError.invalidMagic
+        }
+        guard data[3] == version else {
+            throw EnvelopeError.unsupportedVersion(data[3])
+        }
+
+        // Extract nonce
+        let nonceStart = prefixSize
+        let baseNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
+
+        // Extract routing tag + ciphertext
+        let routingTagStart = nonceStart + nonceSize
+        let routingTag = Data(data[routingTagStart..<(routingTagStart + tagSize)])
+        let routingDataStart = routingTagStart + tagSize
+        let routingDataEnd = routingDataStart + RoutingHeader.encodedSize
+        let encryptedRouting = Data(data[routingDataStart..<routingDataEnd])
+
+        // Decrypt routing header
+        let headerKey = deriveHeaderKey(from: networkKey)
+        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingSealedBox = try ChaChaPoly.SealedBox(
+            nonce: routingNonce,
+            ciphertext: encryptedRouting,
+            tag: routingTag
+        )
+        let routingData = try ChaChaPoly.open(routingSealedBox, using: headerKey)
+
+        return try RoutingHeader.decode(from: routingData)
+    }
+
+    // MARK: - Full Decode
+
+    /// Decode the complete envelope (routing + auth + payload)
+    public static func decode(
+        _ data: Data,
+        networkKey: Data
+    ) throws -> (header: EnvelopeHeader, payload: Data) {
+        let routingEnd = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize
+        let authEnd = routingEnd + tagSize + AuthHeader.encodedSize
+        let minSize = authEnd + 4  // + payload length
+        guard data.count >= minSize else {
+            throw EnvelopeError.truncatedPacket
+        }
+
+        // Verify prefix
+        guard data.prefix(3) == magic else {
+            throw EnvelopeError.invalidMagic
+        }
+        guard data[3] == version else {
+            throw EnvelopeError.unsupportedVersion(data[3])
+        }
+
+        // Extract base nonce
+        let nonceStart = prefixSize
+        let baseNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
+
+        // Derive keys
         let headerKey = deriveHeaderKey(from: networkKey)
         let payloadKey = SymmetricKey(data: networkKey)
 
-        // Encode header to binary
-        let headerData = try header.encode()
+        // --- Decrypt routing header ---
+        let routingTagStart = nonceStart + nonceSize
+        let routingTag = Data(data[routingTagStart..<(routingTagStart + tagSize)])
+        let routingDataStart = routingTagStart + tagSize
+        let routingDataEnd = routingDataStart + RoutingHeader.encodedSize
+        let encryptedRouting = Data(data[routingDataStart..<routingDataEnd])
 
-        // Encrypt header with ChaCha20-Poly1305
-        let headerSealedBox = try ChaChaPoly.seal(headerData, using: headerKey, nonce: headerNonceValue)
+        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingSealedBox = try ChaChaPoly.SealedBox(
+            nonce: routingNonce,
+            ciphertext: encryptedRouting,
+            tag: routingTag
+        )
+        let routingBytes = try ChaChaPoly.open(routingSealedBox, using: headerKey)
+        let routingHeader = try RoutingHeader.decode(from: routingBytes)
 
-        // Encrypt payload with ChaCha20-Poly1305
-        let bodyNonceValue = try ChaChaPoly.Nonce(data: bodyNonce)
-        let payloadSealedBox = try ChaChaPoly.seal(payload, using: payloadKey, nonce: bodyNonceValue)
+        // Verify network hash
+        let expectedHash = computeNetworkHash(networkKey)
+        guard routingHeader.networkHash == expectedHash else {
+            throw EnvelopeError.networkMismatch
+        }
 
-        // Build the packet with full 16-byte header tag
-        var writer = BinaryWriter(capacity: prefixSize + nonceSize + 16 + headerLengthSize +
-                                           headerData.count + payloadLengthSize + payload.count + payloadTagSize + 50)
+        // --- Decrypt auth header ---
+        let authTagStart = routingDataEnd
+        let authTag = Data(data[authTagStart..<(authTagStart + tagSize)])
+        let authDataStart = authTagStart + tagSize
+        let authDataEnd = authDataStart + AuthHeader.encodedSize
+        let encryptedAuth = Data(data[authDataStart..<authDataEnd])
 
-        // Unencrypted prefix
-        writer.writeBytes(magic)
-        writer.writeByte(version)
+        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
+        let authSealedBox = try ChaChaPoly.SealedBox(
+            nonce: authNonce,
+            ciphertext: encryptedAuth,
+            tag: authTag
+        )
+        let authBytes = try ChaChaPoly.open(authSealedBox, using: payloadKey)
+        let authHeader = try AuthHeader.decode(from: authBytes)
 
-        // Header section (with full 16-byte tag)
-        writer.writeBytes(Data(headerNonce))
-        writer.writeBytes(headerSealedBox.tag)  // Full 16-byte tag
-        writer.writeUInt16(UInt16(headerSealedBox.ciphertext.count))
-        writer.writeBytes(headerSealedBox.ciphertext)
+        // --- Decrypt payload chunks ---
+        var reader = BinaryReader(data)
+        reader.offset = authDataEnd
+        let totalPayloadLength = Int(try reader.readUInt32())
 
-        // Payload section
-        writer.writeUInt32(UInt32(payloadSealedBox.ciphertext.count))
-        writer.writeBytes(payloadSealedBox.ciphertext)
-        writer.writeBytes(payloadSealedBox.tag)  // Full 16-byte tag
+        // Derive chunk count and sizes from total payload length
+        let chunkCount: Int
+        if totalPayloadLength == 0 {
+            chunkCount = 1  // Empty payload still has one zero-length chunk
+        } else {
+            chunkCount = (totalPayloadLength + chunkSize - 1) / chunkSize
+        }
 
-        return SealedEnvelope(data: writer.data)
+        var payload = Data(capacity: totalPayloadLength)
+
+        for i in 0..<chunkCount {
+            // Derive this chunk's plaintext size
+            let chunkLen: Int
+            if totalPayloadLength == 0 {
+                chunkLen = 0
+            } else if i < chunkCount - 1 {
+                chunkLen = chunkSize  // Full 512-byte chunk
+            } else {
+                let remainder = totalPayloadLength % chunkSize
+                chunkLen = remainder == 0 ? chunkSize : remainder
+            }
+
+            let chunkDataStart = reader.offset
+            let chunkDataEnd = chunkDataStart + chunkLen
+            guard chunkDataEnd + tagSize <= data.count else {
+                throw EnvelopeError.truncatedPacket
+            }
+
+            let encryptedChunk = Data(data[(data.startIndex + chunkDataStart)..<(data.startIndex + chunkDataEnd)])
+            let chunkTag = Data(data[(data.startIndex + chunkDataEnd)..<(data.startIndex + chunkDataEnd + tagSize)])
+            reader.offset = chunkDataEnd + tagSize
+
+            let chunkNonce = try deriveChunkNonce(baseNonce, chunkIndex: i)
+            let chunkSealedBox = try ChaChaPoly.SealedBox(
+                nonce: chunkNonce,
+                ciphertext: encryptedChunk,
+                tag: chunkTag
+            )
+            let chunkData = try ChaChaPoly.open(chunkSealedBox, using: payloadKey)
+            payload.append(chunkData)
+        }
+
+        // Reconstruct combined header
+        let machineIdStr = MachineIdCompact.toString(authHeader.machineId)
+        // Reconstruct full peer ID from public key (peer ID = hex of first 8 bytes of SHA256(publicKey))
+        let fromPeerIdFull = IdentityKeypair.derivePeerId(from: authHeader.publicKey)
+        let header = EnvelopeHeader(
+            routing: routingHeader,
+            auth: authHeader,
+            channelString: "",  // Channel string not in wire format; caller must resolve
+            fromPeerIdFull: fromPeerIdFull,
+            toPeerIdFull: routingHeader.isBroadcast ? nil : routingHeader.toPeerId.map { String(format: "%02x", $0) }.joined(),
+            machineIdString: machineIdStr
+        )
+
+        return (header, payload)
     }
 }
 
 // MARK: - MeshEnvelope Integration
 
 extension MeshEnvelope {
-    /// Encode envelope using v2 wire format
+    /// Encode envelope using v3 wire format
     public func encodeV2(networkKey: Data) throws -> SealedEnvelope {
-        // Create header from envelope fields
         let networkHash = BinaryEnvelopeV2.computeNetworkHash(networkKey)
-
-        // Convert channel string to UInt16 hash
         let channelHash = ChannelHash.hash(channel)
 
-        // Convert messageId string to UUID (parse if valid UUID, or generate deterministically)
         let messageUUID: UUID
         if let uuid = UUID(uuidString: messageId) {
             messageUUID = uuid
         } else {
-            // Generate deterministic UUID from messageId string using FNV-1a
             messageUUID = UUID.fromString(messageId)
         }
 
-        // Convert base64 publicKey to raw bytes
         guard let publicKeyData = Data(base64Encoded: publicKey),
-              publicKeyData.count == EnvelopeHeader.publicKeySize else {
+              publicKeyData.count == AuthHeader.publicKeySize else {
             throw EnvelopeError.invalidPublicKeySize
         }
 
-        // Convert base64 signature to raw bytes
         guard let signatureData = Data(base64Encoded: signature),
-              signatureData.count == EnvelopeHeader.signatureSize else {
+              signatureData.count == AuthHeader.signatureSize else {
             throw EnvelopeError.invalidSignatureSize
         }
 
@@ -345,7 +422,7 @@ extension MeshEnvelope {
             fromPeerId: fromPeerId,
             toPeerId: toPeerId,
             channel: channelHash,
-            channelString: channel,  // Preserve original channel string for signature verification
+            channelString: channel,
             hopCount: UInt8(min(max(hopCount, 0), 255)),
             timestamp: timestamp,
             messageId: messageUUID,
@@ -354,25 +431,17 @@ extension MeshEnvelope {
             signature: signatureData
         )
 
-        // Encode payload as JSON
         let payloadData = try JSONCoding.encoder.encode(payload)
-
-        return try BinaryEnvelopeV2.encodeV2(header: header, payload: payloadData, networkKey: networkKey)
+        return try BinaryEnvelopeV2.encode(header: header, payload: payloadData, networkKey: networkKey)
     }
 
-    /// Decode envelope from v2 wire format
-    /// The original channel string is preserved for signature verification
+    /// Decode envelope from v3 wire format
     public static func decodeV2(_ data: Data, networkKey: Data) throws -> MeshEnvelope {
         let (header, payloadData) = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
         let payload = try JSONCoding.decoder.decode(MeshMessage.self, from: payloadData)
 
-        // Convert UUID to string
         let messageId = header.messageId.uuidString
-
-        // Convert raw publicKey bytes to base64
         let publicKey = header.publicKey.base64EncodedString()
-
-        // Convert raw signature bytes to base64
         let signature = header.signature.base64EncodedString()
 
         return MeshEnvelope(
@@ -381,7 +450,7 @@ extension MeshEnvelope {
             publicKey: publicKey,
             machineId: header.machineId,
             toPeerId: header.toPeerId,
-            channel: header.channelString,  // Use preserved channel string
+            channel: header.channelString,
             hopCount: Int(header.hopCount),
             timestamp: header.timestamp,
             payload: payload,
@@ -389,8 +458,7 @@ extension MeshEnvelope {
         )
     }
 
-    /// Decode envelope from v2 wire format, returning the raw channel hash
-    /// Use this when you need to match against known channel hashes
+    /// Decode envelope from v3 wire format, returning the raw channel hash
     public static func decodeV2WithHash(_ data: Data, networkKey: Data) throws -> (envelope: MeshEnvelope, channelHash: UInt16) {
         let (header, payloadData) = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
         let payload = try JSONCoding.decoder.decode(MeshMessage.self, from: payloadData)
@@ -405,7 +473,7 @@ extension MeshEnvelope {
             publicKey: publicKey,
             machineId: header.machineId,
             toPeerId: header.toPeerId,
-            channel: header.channelString,  // Use preserved channel string
+            channel: header.channelString,
             hopCount: Int(header.hopCount),
             timestamp: header.timestamp,
             payload: payload,

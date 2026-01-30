@@ -1,7 +1,7 @@
 // HealthTestRunner - Comprehensive cross-machine health monitoring test
 //
 // Two roles run the same binary:
-//   Node A (Linux, orchestrator): --role nodeA --port 18020 --lan --remote-host 192.168.12.209
+//   Node A (Linux, orchestrator): --role nodeA --port 18020 --lan --remote-host <remote-ip>
 //   Node B (Mac, responder):      --role nodeB --port 18020 --lan
 //
 // Coordination via "test-control" mesh channel.
@@ -87,7 +87,7 @@ actor TestStateTracker {
     // MARK: - temp IPs
 
     func recordTempIP(_ entry: String) {
-        // entry format: "192.168.12.122/24 dev eth0"
+        // entry format: "198.51.100.1/24 dev eth0"
         var entries = readEntries("temp-ips")
         entries.append(entry)
         writeEntries("temp-ips", entries)
@@ -216,7 +216,7 @@ var role: String = "nodeA"
 var port: Int = 18020
 var bootstrap: String? = nil
 var lan = false
-var remoteHost: String = "192.168.12.209"
+var remoteHost: String = ""
 
 var args = CommandLine.arguments.dropFirst()
 while let arg = args.first {
@@ -234,7 +234,7 @@ while let arg = args.first {
     case "--lan":
         lan = true
     case "--remote-host":
-        remoteHost = String(args.first ?? "192.168.12.209")
+        remoteHost = String(args.first ?? "")
         args = args.dropFirst()
     default:
         break
@@ -690,12 +690,19 @@ struct BandwidthResult {
     let mbps: Double
 }
 
+struct BatchSweepResult {
+    let delayMs: Int
+    let mbps: Double
+    let latencyUs: Double
+}
+
 struct PerfSummary {
     var vanillaBandwidth: [BandwidthResult] = []
     var vanillaLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
     var meshBandwidth: [BandwidthResult] = []
     var meshLatency: (p50: Double, p95: Double, p99: Double) = (0, 0, 0)
     var meshHistogram: [(label: String, count: Int)] = []
+    var batchSweep: [BatchSweepResult] = []
     var recoveryPreSwapMedian: Double = 0
     var recoveryPeakLatency: Double = 0
     var recoveryTimeSeconds: Double = 0
@@ -929,6 +936,24 @@ if !isNodeA {
             let bwResult = await bwMeasurer.result()
             await sendControl("phase12-bw-report", detail: "\(bwResult.bytes)")
             logger.info("Node B: received \(bwResult.bytes) bytes for bandwidth test")
+
+        case "phase12b-sweep-start":
+            // Receive sweep data and count bytes
+            let sweepMeasurer = BandwidthMeasurer()
+            await sweepMeasurer.start()
+            if let sweepSession = await latestSession.get() {
+                await sweepSession.onReceive { data in
+                    await sweepMeasurer.addBytes(UInt64(data.count))
+                }
+            }
+            logger.info("Node B: waiting for batch sweep data on health-test-sweep")
+            while true {
+                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(120)) else { break }
+                if doneMsg.phase == "phase12b-sweep-done" { break }
+            }
+            let sweepResult = await sweepMeasurer.result()
+            await sendControl("phase12b-sweep-report", detail: "\(sweepResult.bytes)")
+            logger.info("Node B: received \(sweepResult.bytes) bytes for batch sweep")
 
         case "phase13-ping-start":
             // Echo tunnel pings back (PING→PONG) — wait for Node A's session
@@ -1366,7 +1391,7 @@ do {
     // Pick a temp IP that doesn't conflict with existing addresses
     let (_, existingAddrs) = await shell("ip -4 addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
     let usedIPs = Set(existingAddrs.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) })
-    var tempIP = "192.168.12.122"
+    var tempIP = "198.51.100.122"
     for lastOctet in 122...254 {
         let candidate = "192.168.12.\(lastOctet)"
         if !usedIPs.contains(candidate) {
@@ -1607,21 +1632,17 @@ do {
     logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
 
     // Bandwidth: sweep multiple packet sizes
-    let bwPacketSizes = [64, 256, 512, 1024, 1400]
+    let bwPacketSizes = [256, 1024, 4096, 8192]
     let bwTargetBytes: UInt64 = 7_000_000  // ~7MB per size
     for pktSize in bwPacketSizes {
         let bwPayload = Data(repeating: 0xAA, count: pktSize)
         let bwPacketCount = Int(bwTargetBytes / UInt64(pktSize))
         let bwClock = ContinuousClock()
         let bwStart = bwClock.now
-        for i in 1...bwPacketCount {
+        for _ in 1...bwPacketCount {
             let buf = vanillaChannel.allocator.buffer(bytes: bwPayload)
             let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
-            if i % 50 == 0 || i == bwPacketCount {
-                try? await vanillaChannel.writeAndFlush(envelope)
-            } else {
-                vanillaChannel.write(envelope, promise: nil)
-            }
+            try? await vanillaChannel.writeAndFlush(envelope)
         }
         let bwElapsed = bwClock.now - bwStart
         let totalBytes = UInt64(bwPacketCount) * UInt64(pktSize)
@@ -1684,6 +1705,61 @@ do {
            detail: "best=\(String(format: "%.1f", bestMeshMbps)) Mbps, B received \(bRecvBytes) bytes")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 12b: Batch Config Sweep
+
+logPhase("Phase 12b: Batch Config Sweep")
+
+do {
+    await sendControl("phase12b-sweep-start")
+
+    let sweepSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-sweep")
+    try await Task.sleep(for: .seconds(1))
+
+    let sweepDelays: [Int] = [0, 1, 5, 10, 50]  // ms
+    let sweepPktSize = 512
+    let sweepPayload = Data(repeating: 0xCC, count: sweepPktSize)
+    let sweepTargetBytes: UInt64 = 5_000_000
+
+    logger.info("Batch Config Sweep: delay(ms) → bandwidth(Mbps) / latency(us)")
+
+    for delayMs in sweepDelays {
+        // Reconfigure batch config on the session
+        await sweepSession.setBatchConfig(BatchConfig(
+            maxFlushDelay: delayMs == 0 ? .zero : .milliseconds(delayMs),
+            maxBufferSize: 0
+        ))
+
+        let packetCount = Int(sweepTargetBytes / UInt64(sweepPktSize))
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        for _ in 1...packetCount {
+            try await sweepSession.send(sweepPayload)
+        }
+        try await sweepSession.flush()
+
+        let elapsed = clock.now - start
+        let totalBytes = UInt64(packetCount) * UInt64(sweepPktSize)
+        let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        let mbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+        let avgLatencyUs = durationSec > 0 ? (durationSec * 1_000_000.0 / Double(packetCount)) : 0
+
+        perfSummary.batchSweep.append(BatchSweepResult(delayMs: delayMs, mbps: mbps, latencyUs: avgLatencyUs))
+        logger.info("  delay=\(String(format: "%3d", delayMs))ms: \(String(format: "%8.1f", mbps)) Mbps, \(String(format: "%8.1f", avgLatencyUs)) us/pkt")
+    }
+
+    try await Task.sleep(for: .seconds(2))
+    await sendControl("phase12b-sweep-done")
+
+    // Wait for Node B ack
+    _ = await controlMailbox.receive(timeout: .seconds(15))
+
+    record("Phase 12b: Batch Config Sweep", passed: !perfSummary.batchSweep.isEmpty,
+           detail: perfSummary.batchSweep.map { "delay=\($0.delayMs)ms:\(String(format: "%.1f", $0.mbps))Mbps" }.joined(separator: ", "))
+} catch {
+    record("Phase 12b: Batch Config Sweep", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 13: Mesh Latency (Ping-Pong)
@@ -1774,7 +1850,7 @@ do {
 
     let (_, existingAddrs14) = await shell("ip -4 addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1")
     let usedIPs14 = Set(existingAddrs14.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) })
-    var tempIP14 = "192.168.12.130"
+    var tempIP14 = "198.51.100.130"
     for lastOctet in 130...254 {
         let candidate = "192.168.12.\(lastOctet)"
         if !usedIPs14.contains(candidate) {
@@ -1912,8 +1988,8 @@ if !testRules.isEmpty {
 }
 
 // Check our temp IP from Phase 9 is removed
-if finalNetworkState.ipAddresses.contains("192.168.12.122") {
-    cleanupIssues.append("Temp IP 192.168.12.122 still present")
+if finalNetworkState.ipAddresses.contains("198.51.100.122") {
+    cleanupIssues.append("Temp IP 198.51.100.122 still present")
 }
 
 if cleanupIssues.isEmpty {
@@ -1948,6 +2024,16 @@ do {
         let mBw = perfSummary.meshBandwidth.first(where: { $0.packetSize == size })?.mbps ?? 0
         let overhead = vBw > 0 && mBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
         logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))      \(String(format: "%10.1f", mBw))      \(overhead)")
+    }
+
+    // Batch config sweep
+    if !perfSummary.batchSweep.isEmpty {
+        logger.info("")
+        logger.info("=== BATCH CONFIG SWEEP (512B packets) ===")
+        logger.info("Flush Delay    Bandwidth (Mbps)    Avg Latency (us/pkt)")
+        for r in perfSummary.batchSweep {
+            logger.info("\(String(format: "%7d ms", r.delayMs))    \(String(format: "%12.1f", r.mbps))        \(String(format: "%12.1f", r.latencyUs))")
+        }
     }
 
     // Latency comparison

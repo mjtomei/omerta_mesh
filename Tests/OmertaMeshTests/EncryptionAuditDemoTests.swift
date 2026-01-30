@@ -102,9 +102,9 @@ final class EncryptionAuditDemoTests: XCTestCase {
     ///   + fake.append(Data(repeating: 0xAA, count: 100))  // garbage
     ///   + try await socket.sendRaw(fake, to: endpoint)
     func testCatchesSpoofedMagicWithGarbageBody() async throws {
-        var fake = Data("OMRT".utf8)
-        fake.append(0x02)
-        fake.append(Data(repeating: 0xAA, count: 100))
+        var fake = Data("OMR".utf8)
+        fake.append(0x03)
+        fake.append(Data(repeating: 0xAA, count: 300))
 
         // This passes the prefix check but will be caught by decryption in --audit-encryption.
         // In the test observer (prefix-only), it passes — demonstrating why the daemon's
@@ -263,8 +263,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
     /// Simulates sending just the magic + version with nothing else.
     /// A minimal "looks encrypted" packet.
     func testCatchesMinimalFakePacket() async throws {
-        var minimal = Data("OMRT".utf8)
-        minimal.append(0x02)
+        var minimal = Data("OMR".utf8)
+        minimal.append(0x03)
 
         XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(minimal), "Exactly prefix-sized data passes prefix check")
         XCTAssertThrowsError(try BinaryEnvelopeV2.decode(minimal, networkKey: Data(repeating: 0x42, count: 32)),

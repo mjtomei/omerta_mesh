@@ -106,6 +106,11 @@ public struct MeshConfig: Sendable {
     /// Default is false - localhost is rejected in production
     public var allowLocalhost: Bool
 
+    // MARK: - Batching Settings
+
+    /// Default batch configuration for all channels (nil = use hardcoded default)
+    public var defaultBatchConfig: BatchConfig?
+
     // MARK: - Initialization
 
     public init(
@@ -131,7 +136,8 @@ public struct MeshConfig: Sendable {
         enableEventLogging: Bool = false,
         eventLogDir: String? = nil,
         forceRelayOnly: Bool = false,
-        allowLocalhost: Bool = false
+        allowLocalhost: Bool = false,
+        defaultBatchConfig: BatchConfig? = nil
     ) {
         self.encryptionKey = encryptionKey
         self.storageDirectory = storageDirectory
@@ -156,6 +162,7 @@ public struct MeshConfig: Sendable {
         self.eventLogDir = eventLogDir
         self.forceRelayOnly = forceRelayOnly
         self.allowLocalhost = allowLocalhost
+        self.defaultBatchConfig = defaultBatchConfig
     }
 
     /// Create a config from a NetworkKey
@@ -193,6 +200,7 @@ public struct MeshConfig: Sendable {
         self.eventLogDir = eventLogDir
         self.forceRelayOnly = forceRelayOnly
         self.allowLocalhost = allowLocalhost
+        self.defaultBatchConfig = nil
     }
 
     // MARK: - Preset Configurations
@@ -292,6 +300,7 @@ public class MeshConfigBuilder {
     private var eventLogDir: String?
     private var forceRelayOnly: Bool = false
     private var allowLocalhost: Bool = false
+    private var defaultBatchConfig: BatchConfig?
 
     public init(encryptionKey: Data) {
         self.encryptionKey = encryptionKey
@@ -381,6 +390,12 @@ public class MeshConfigBuilder {
         return self
     }
 
+    @discardableResult
+    public func defaultBatchConfig(_ config: BatchConfig?) -> Self {
+        self.defaultBatchConfig = config
+        return self
+    }
+
     public func build() throws -> MeshConfig {
         let config = MeshConfig(
             encryptionKey: encryptionKey,
@@ -405,7 +420,8 @@ public class MeshConfigBuilder {
             enableEventLogging: enableEventLogging,
             eventLogDir: eventLogDir,
             forceRelayOnly: forceRelayOnly,
-            allowLocalhost: allowLocalhost
+            allowLocalhost: allowLocalhost,
+            defaultBatchConfig: defaultBatchConfig
         )
         try config.validate()
         return config
@@ -435,7 +451,8 @@ public class MeshConfigBuilder {
             enableEventLogging: enableEventLogging,
             eventLogDir: eventLogDir,
             forceRelayOnly: forceRelayOnly,
-            allowLocalhost: allowLocalhost
+            allowLocalhost: allowLocalhost,
+            defaultBatchConfig: defaultBatchConfig
         )
     }
 }

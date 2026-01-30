@@ -28,6 +28,10 @@ actor MockChannelProvider: ChannelProvider {
         handlers[channel] = handler
     }
 
+    func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        try await onChannel(channel, handler: handler)
+    }
+
     func offChannel(_ channel: String) async {
         handlers.removeValue(forKey: channel)
     }
@@ -39,6 +43,16 @@ actor MockChannelProvider: ChannelProvider {
     func sendOnChannel(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
         sentMessages.append((data, machineId, channel))
     }
+
+    func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        try await sendOnChannel(data, to: peerId, channel: channel)
+    }
+
+    func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+
+    func flushChannel(_ channel: String) async throws {}
 
     func simulateReceive(_ data: Data, from machineId: MachineId, on channel: String) async {
         if let handler = handlers[channel] {
