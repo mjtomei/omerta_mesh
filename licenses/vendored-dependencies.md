@@ -7,7 +7,13 @@ fetched at build time.
 
 | Package | License | Source | Vendored Path |
 |---------|---------|--------|---------------|
+| [gVisor netstack](https://gvisor.dev/) | [Apache-2.0](https://github.com/google/gvisor/blob/master/LICENSE) | https://github.com/google/gvisor | `Sources/OmertaTunnel/Netstack/` |
 | [BoringSSL](https://boringssl.googlesource.com/boringssl/) | [Apache-2.0](https://boringssl.googlesource.com/boringssl/+/refs/heads/master/LICENSE) | Vendored via [swift-crypto](https://github.com/apple/swift-crypto) | `benchmarks/crypto/Sources/CBoringSSL/` |
+
+gVisor's netstack provides a userspace TCP/IP stack for the OmertaTunnel
+module. The Go source is vendored and compiled into `libnetstack.a`.
+See [go-dependencies.md](go-dependencies.md) for the full list of transitive
+Go dependencies included in the static library.
 
 BoringSSL is Google's fork of OpenSSL. The vendored copy was taken from
 Apple's [swift-crypto](https://github.com/apple/swift-crypto) package
