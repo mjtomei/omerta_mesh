@@ -98,17 +98,19 @@ public actor TunnelSession {
             throw TunnelError.notConnected
         }
 
-        sendBuffer.append(data)
-        sendBufferSize += data.count
-
-        // Flush if we hit the user-configured threshold or the hard UDP ceiling
+        // Check if adding this packet would exceed the UDP datagram limit.
+        // Flush the existing buffer first if so, then add the new packet.
+        let packetWireSize = data.count + 2 + (data.count & 1)
+        let projectedWireSize = 4 + sendBufferSize + packetWireSize  // batch header + existing + new
         let effectiveLimit = batchConfig.maxBufferSize > 0
             ? min(batchConfig.maxBufferSize, Self.maxDatagramPayload)
             : Self.maxDatagramPayload
-        if sendBufferSize >= effectiveLimit {
+        if sendBufferSize > 0 && projectedWireSize > effectiveLimit {
             try await flush()
-            return
         }
+
+        sendBuffer.append(data)
+        sendBufferSize += packetWireSize
 
         // Start auto-flush timer if not already running
         if autoFlushTask == nil {
@@ -136,7 +138,6 @@ public actor TunnelSession {
 
         // Take the buffer
         let packets = sendBuffer
-        let totalBytes = sendBufferSize
         sendBuffer = []
         sendBufferSize = 0
 
@@ -151,13 +152,14 @@ public actor TunnelSession {
         // Send directly (not buffered) since tunnel already batched
         try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
 
+        let appBytes = packets.reduce(0) { $0 + $1.count }
         stats.packetsSent += UInt64(packets.count)
-        stats.bytesSent += UInt64(totalBytes)
+        stats.bytesSent += UInt64(appBytes)
         stats.lastActivity = Date()
 
         logger.trace("Flushed batch", metadata: [
             "packets": "\(packets.count)",
-            "bytes": "\(totalBytes)",
+            "bytes": "\(appBytes)",
             "channel": "\(channel)",
             "to": "\(remoteMachineId.prefix(16))..."
         ])

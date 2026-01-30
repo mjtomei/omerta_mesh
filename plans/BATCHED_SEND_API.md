@@ -157,6 +157,7 @@ public actor TunnelSession {
 - `flush()` takes buffer, wraps in batch wire format, calls `provider.sendOnChannel()` once (not buffered — tunnel already batched)
 - `sendAndFlush()` wraps single packet in wire format, sends immediately
 - Auto-flush timer based on resolved `BatchConfig` (tunnel override → channel → process → default → monitor override)
+- **UDP datagram size limit**: `send()` enforces a hard ceiling of `BinaryEnvelope.maxApplicationDataForUDP` bytes per batch, regardless of user-configured `maxBufferSize`. This is computed from the v3 envelope overhead (232 bytes fixed + 16 bytes per 512-byte encryption chunk) plus JSON/base64 encoding overhead, ensuring the final UDP datagram never exceeds 65535 bytes. Datagrams larger than path MTU (~1472 bytes) are IP-fragmented by the kernel transparently; loss of any fragment drops the entire batch, which is acceptable since individual packets are already fire-and-forget.
 
 **File:** `Sources/OmertaTunnel/TunnelSession.swift`
 
