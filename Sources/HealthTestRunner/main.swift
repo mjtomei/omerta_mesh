@@ -1837,12 +1837,15 @@ record("Phase 10: Latency & Jitter", passed: true,
 
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
-// Stop health monitor before vanilla/TCP baseline tests — these don't use the
-// tunnel, so no tunnel packets flow and the monitor would kill all sessions.
-if let mon = monitor {
-    await mon.stopMonitoring()
-    logger.info("Health monitor stopped for bandwidth phases (11a through 12b)")
+// During vanilla/TCP/mesh bandwidth phases, no normal tunnel traffic flows.
+// Send periodic keepalive control messages so both sides' health monitors stay alive.
+let bwKeepaliveTask = Task {
+    while !Task.isCancelled {
+        try? await Task.sleep(for: .milliseconds(400))
+        await sendControl("keepalive")
+    }
 }
+logger.info("Started bandwidth keepalive task")
 
 do {
     // Tell Node B to start vanilla echo server
@@ -2314,8 +2317,9 @@ do {
     record("Phase 12b: Batch Config Sweep", passed: false, detail: "Error: \(error)")
 }
 
-// Health monitor remains stopped — Phases 13/14 don't need it and it would
-// kill sessions during the remaining tests.
+// Stop the bandwidth keepalive task — Phases 13/14 use tunnel traffic directly
+bwKeepaliveTask.cancel()
+logger.info("Bandwidth keepalive task cancelled")
 
 // MARK: - Phase 13: Mesh Latency (Ping-Pong)
 
