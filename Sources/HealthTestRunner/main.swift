@@ -900,9 +900,12 @@ if !isNodeA {
             let bwMeasurer = BandwidthMeasurer()
             await bwMeasurer.start()
 
-            let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
-            await bwSession.onReceive { data in
-                await bwMeasurer.addBytes(UInt64(data.count))
+            // Wait for Node A to establish the session, then track bytes via latestSession
+            try await Task.sleep(for: .seconds(2))
+            if let bwSession = await latestSession.get() {
+                await bwSession.onReceive { data in
+                    await bwMeasurer.addBytes(UInt64(data.count))
+                }
             }
             logger.info("Node B: waiting for bandwidth data on health-test-bw")
 
@@ -916,8 +919,13 @@ if !isNodeA {
             logger.info("Node B: received \(bwResult.bytes) bytes for bandwidth test")
 
         case "phase13-ping-start":
-            // Echo tunnel pings back (PING→PONG) on channel "health-test-ping"
-            let pingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-ping")
+            // Echo tunnel pings back (PING→PONG) — wait for Node A's session
+            await sendControl("phase13-ping-ack")
+            try await Task.sleep(for: .seconds(2))
+            guard let pingSession = await latestSession.get() else {
+                logger.error("Node B: no session for phase13")
+                continue
+            }
             await pingSession.onReceive { data in
                 let msg = String(data: data, encoding: .utf8) ?? ""
                 if msg.hasPrefix("PING:") {
@@ -935,8 +943,13 @@ if !isNodeA {
             logger.info("Node B: ping echo stopped")
 
         case "phase14-recovery-start":
-            // Same echo as phase 13 but on "health-test-ping" (reuse same channel)
-            let recoveryPingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery-ping")
+            // Echo pings for recovery timing — wait for Node A's session
+            await sendControl("phase14-recovery-ack")
+            try await Task.sleep(for: .seconds(2))
+            guard let recoveryPingSession = await latestSession.get() else {
+                logger.error("Node B: no session for phase14")
+                continue
+            }
             await recoveryPingSession.onReceive { data in
                 let msg = String(data: data, encoding: .utf8) ?? ""
                 if msg.hasPrefix("PING:") {
@@ -1653,8 +1666,7 @@ do {
 logPhase("Phase 13: Mesh Latency (Ping-Pong)")
 
 do {
-    await sendControl("phase13-ping-start")
-
+    // Create session first, then tell Node B to start echoing
     let meshLatencyCollector = LatencyCollector()
     let pingSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-ping")
     await pingSession.onReceive { data in
@@ -1668,6 +1680,10 @@ do {
             }
         }
     }
+
+    // Tell Node B to start echoing, wait for ack
+    await sendControl("phase13-ping-start")
+    _ = await waitForAck("phase13-ping-ack", timeout: .seconds(10))
     try await Task.sleep(for: .seconds(1))
 
     // Send 500 probes at 5ms intervals
@@ -1703,8 +1719,6 @@ logPhase("Phase 14: Interface Swap Recovery Timing")
 
 #if os(Linux)
 do {
-    await sendControl("phase14-recovery-start")
-
     // Collect timestamped RTT samples: (wallClockNanos, rttUs)
     actor TimestampedSamples {
         var samples: [(timestamp: UInt64, rttUs: Double)] = []
@@ -1714,6 +1728,10 @@ do {
     let tsSamples = TimestampedSamples()
     let recoveryLatencyCollector = LatencyCollector()
     let recoverySession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery-ping")
+
+    // Tell Node B to start echoing, wait for ack
+    await sendControl("phase14-recovery-start")
+    _ = await waitForAck("phase14-recovery-ack", timeout: .seconds(10))
     try await Task.sleep(for: .seconds(1))
 
     // Continuous ping-pong: one probe every 20ms
