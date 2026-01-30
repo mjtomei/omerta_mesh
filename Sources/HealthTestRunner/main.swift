@@ -783,6 +783,31 @@ if !isNodeA {
     await sendControl("nodeB-ready")
     logger.info("Node B: sent ready signal")
 
+    // Phase 11 state (persisted across separate case blocks)
+    var nodeBEchoChannel: Channel? = nil
+    var nodeBEchoGroup: MultiThreadedEventLoopGroup? = nil
+
+    // UDPReceiveStats must be declared at file scope or use a type-erased wrapper
+    actor _UDPReceiveStats {
+        var totalBytes: UInt64 = 0
+        var startNanos: UInt64 = 0
+        var endNanos: UInt64 = 0
+        func addBytes(_ n: Int) {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if totalBytes == 0 { startNanos = now }
+            totalBytes += UInt64(n)
+            endNanos = now
+        }
+        func result() -> (bytes: UInt64, nanos: UInt64) {
+            return (totalBytes, endNanos > startNanos ? endNanos - startNanos : 0)
+        }
+    }
+    var nodeBUDPStats: _UDPReceiveStats? = nil
+    var nodeBTcpServer: Channel? = nil
+    var nodeBTcpGroup: MultiThreadedEventLoopGroup? = nil
+    var nodeBBwMeasurer: BandwidthMeasurer? = nil
+    var nodeBSweepMeasurer: BandwidthMeasurer? = nil
+
     // Main loop: respond to control commands
     while true {
         guard let cmd = await controlMailbox.receive(timeout: .seconds(120)) else {
@@ -915,38 +940,17 @@ if !isNodeA {
         case "phase11-vanilla-start":
             // Open a UDP echo server on an ephemeral port for vanilla baseline
             let echoGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-
-            actor UDPReceiveStats {
-                var totalBytes: UInt64 = 0
-                var startNanos: UInt64 = 0
-                var endNanos: UInt64 = 0
-                func addBytes(_ n: Int) {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    if totalBytes == 0 { startNanos = now }
-                    totalBytes += UInt64(n)
-                    endNanos = now
-                }
-                func result() -> (bytes: UInt64, nanos: UInt64) {
-                    return (totalBytes, endNanos > startNanos ? endNanos - startNanos : 0)
-                }
-                func reset() {
-                    totalBytes = 0
-                    startNanos = 0
-                    endNanos = 0
-                }
-            }
-            let udpStats = UDPReceiveStats()
+            let udpStats = _UDPReceiveStats()
 
             final class EchoHandler: ChannelInboundHandler, @unchecked Sendable {
                 typealias InboundIn = AddressedEnvelope<ByteBuffer>
                 typealias OutboundOut = AddressedEnvelope<ByteBuffer>
-                let stats: UDPReceiveStats
-                init(stats: UDPReceiveStats) { self.stats = stats }
+                let stats: _UDPReceiveStats
+                init(stats: _UDPReceiveStats) { self.stats = stats }
                 func channelRead(context: ChannelHandlerContext, data: NIOAny) {
                     let envelope = self.unwrapInboundIn(data)
                     let byteCount = envelope.data.readableBytes
                     Task { await self.stats.addBytes(byteCount) }
-                    // Echo back the data to the sender
                     context.writeAndFlush(self.wrapOutboundOut(envelope), promise: nil)
                 }
             }
@@ -958,60 +962,57 @@ if !isNodeA {
             let echoPort = echoChannel.localAddress?.port ?? 0
             logger.info("Node B: vanilla UDP echo server on port \(echoPort)")
             await sendControl("phase11-vanilla-ready", detail: "\(echoPort)")
+            // Store echo channel/stats for later phases to use
+            nodeBEchoChannel = echoChannel
+            nodeBEchoGroup = echoGroup
+            nodeBUDPStats = udpStats
 
-            // Wait for Node A to finish A→B bandwidth
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if doneMsg.phase == "phase11-udp-done" { break }
-            }
-
-            // Small delay to let fire-and-forget Task{addBytes} calls complete
+        case "phase11-udp-done":
+            // A→B bandwidth phase done — report receive stats
             try await Task.sleep(for: .milliseconds(200))
-            // Report receive stats for A→B
-            let udpRecvResult = await udpStats.result()
-            await sendControl("phase11-udp-bw-report", detail: "\(udpRecvResult.bytes),\(udpRecvResult.nanos)")
-            logger.info("Node B: A→B received \(udpRecvResult.bytes) bytes in \(udpRecvResult.nanos)ns")
-
-            // Wait for reverse direction request: B→A
-            while true {
-                guard let revMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if revMsg.phase == "phase11-udp-reverse-go" {
-                    // Parse "packetSize,packetCount,targetPort"
-                    let parts = (revMsg.detail ?? "").split(separator: ",")
-                    guard parts.count >= 3,
-                          let pktSize = Int(parts[0]),
-                          let pktCount = Int(parts[1]),
-                          let targetPort = Int(parts[2]) else {
-                        logger.error("Node B: bad reverse-go detail: \(revMsg.detail ?? "")")
-                        await sendControl("phase11-udp-reverse-done", detail: "0,0")
-                        break
-                    }
-                    let remoteAddr = try SocketAddress(ipAddress: remoteHost, port: targetPort)
-                    let payload = Data(repeating: 0xBB, count: pktSize)
-                    let blastClock = ContinuousClock()
-                    let blastStart = blastClock.now
-                    var sentBytes: UInt64 = 0
-                    for _ in 1...pktCount {
-                        let buf = echoChannel.allocator.buffer(bytes: payload)
-                        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
-                        try? await echoChannel.writeAndFlush(envelope)
-                        sentBytes += UInt64(pktSize)
-                    }
-                    let blastElapsed = blastClock.now - blastStart
-                    let blastNanos = UInt64(blastElapsed.components.seconds) * 1_000_000_000 + UInt64(blastElapsed.components.attoseconds / 1_000_000_000)
-                    await sendControl("phase11-udp-reverse-done", detail: "\(sentBytes),\(blastNanos)")
-                    logger.info("Node B: B→A sent \(sentBytes) bytes in \(blastNanos)ns")
-                    break
-                }
+            if let stats = nodeBUDPStats {
+                let result = await stats.result()
+                await sendControl("phase11-udp-bw-report", detail: "\(result.bytes),\(result.nanos)")
+                logger.info("Node B: A→B received \(result.bytes) bytes in \(result.nanos)ns")
+            } else {
+                await sendControl("phase11-udp-bw-report", detail: "0,0")
             }
 
-            // Wait for final cleanup signal
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if doneMsg.phase == "phase11-vanilla-done" { break }
+        case "phase11-udp-reverse-go":
+            // B→A reverse blast
+            let parts = (cmd.detail ?? "").split(separator: ",")
+            guard parts.count >= 3,
+                  let pktSize = Int(parts[0]),
+                  let pktCount = Int(parts[1]),
+                  let targetPort = Int(parts[2]),
+                  let channel = nodeBEchoChannel else {
+                logger.error("Node B: bad reverse-go detail or no echo channel")
+                await sendControl("phase11-udp-reverse-done", detail: "0,0")
+                continue
             }
-            try? await echoChannel.close()
-            try? await echoGroup.shutdownGracefully()
+            let remoteAddr = try SocketAddress(ipAddress: remoteHost, port: targetPort)
+            let payload = Data(repeating: 0xBB, count: pktSize)
+            let blastClock = ContinuousClock()
+            let blastStart = blastClock.now
+            var sentBytes: UInt64 = 0
+            for _ in 1...pktCount {
+                let buf = channel.allocator.buffer(bytes: payload)
+                let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
+                try? await channel.writeAndFlush(envelope)
+                sentBytes += UInt64(pktSize)
+            }
+            let blastElapsed = blastClock.now - blastStart
+            let blastNanos = UInt64(blastElapsed.components.seconds) * 1_000_000_000 + UInt64(blastElapsed.components.attoseconds / 1_000_000_000)
+            await sendControl("phase11-udp-reverse-done", detail: "\(sentBytes),\(blastNanos)")
+            logger.info("Node B: B→A sent \(sentBytes) bytes in \(blastNanos)ns")
+
+        case "phase11-vanilla-done":
+            // Clean up echo server
+            if let ch = nodeBEchoChannel { try? await ch.close() }
+            if let g = nodeBEchoGroup { try? await g.shutdownGracefully() }
+            nodeBEchoChannel = nil
+            nodeBEchoGroup = nil
+            nodeBUDPStats = nil
             logger.info("Node B: vanilla echo server closed")
 
         case "phase11-tcp-start":
@@ -1077,38 +1078,40 @@ if !isNodeA {
             let tcpPort = tcpServerChannel.localAddress?.port ?? 0
             logger.info("Node B: TCP server on port \(tcpPort)")
             await sendControl("phase11-tcp-ready", detail: "\(tcpPort)")
+            nodeBTcpServer = tcpServerChannel
+            nodeBTcpGroup = tcpGroup
 
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if doneMsg.phase == "phase11-tcp-done" { break }
-            }
-            try? await tcpServerChannel.close()
-            try? await tcpGroup.shutdownGracefully()
+        case "phase11-tcp-done":
+            if let srv = nodeBTcpServer { try? await srv.close() }
+            if let g = nodeBTcpGroup { try? await g.shutdownGracefully() }
+            nodeBTcpServer = nil
+            nodeBTcpGroup = nil
             logger.info("Node B: TCP server closed")
 
         case "phase12-bw-start":
-            // Receive tunnel data on channel "health-test-bw", count bytes, report total
-            let bwMeasurer = BandwidthMeasurer()
-            await bwMeasurer.start()
-
-            // Wait for Node A to establish the session, then track bytes via latestSession
+            // Receive tunnel data on channel "health-test-bw", count bytes
+            let bwMeasurer12 = BandwidthMeasurer()
+            await bwMeasurer12.start()
             try await Task.sleep(for: .seconds(2))
             if let bwSession = await latestSession.get() {
                 await bwSession.onReceive { data in
-                    await bwMeasurer.addBytes(UInt64(data.count))
+                    await bwMeasurer12.addBytes(UInt64(data.count))
                 }
             }
             logger.info("Node B: waiting for bandwidth data on health-test-bw")
+            nodeBBwMeasurer = bwMeasurer12
 
-            // Wait for Node A to signal done
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if doneMsg.phase == "phase12-bw-done" { break }
+        case "phase12-bw-done":
+            // A→B done — report received bytes
+            try await Task.sleep(for: .milliseconds(200))
+            if let measurer = nodeBBwMeasurer {
+                let bwResult = await measurer.result()
+                let bwDurationNanos = UInt64(bwResult.duration.components.seconds) * 1_000_000_000 + UInt64(bwResult.duration.components.attoseconds / 1_000_000_000)
+                await sendControl("phase12-bw-report", detail: "\(bwResult.bytes),\(bwDurationNanos)")
+                logger.info("Node B: received \(bwResult.bytes) bytes in \(bwDurationNanos)ns for bandwidth test")
+            } else {
+                await sendControl("phase12-bw-report", detail: "0,0")
             }
-            let bwResult = await bwMeasurer.result()
-            let bwDurationNanos = UInt64(bwResult.duration.components.seconds) * 1_000_000_000 + UInt64(bwResult.duration.components.attoseconds / 1_000_000_000)
-            await sendControl("phase12-bw-report", detail: "\(bwResult.bytes),\(bwDurationNanos)")
-            logger.info("Node B: received \(bwResult.bytes) bytes in \(bwDurationNanos)ns for bandwidth test")
 
         case "phase12-bw-reverse-start":
             // Reverse direction: B→A
@@ -1154,16 +1157,19 @@ if !isNodeA {
                     await stepMeasurer12b.addBytes(UInt64(data.count))
                 }
             }
-            // Wait for step done
-            while true {
-                guard let doneMsg = await controlMailbox.receive(timeout: .seconds(60)) else { break }
-                if doneMsg.phase == "phase12b-step-done" { break }
-            }
+            nodeBSweepMeasurer = stepMeasurer12b
+
+        case "phase12b-step-done":
+            // Report step results
             try await Task.sleep(for: .milliseconds(200))
-            let stepResult12b = await stepMeasurer12b.result()
-            let stepNanos12b = UInt64(stepResult12b.duration.components.seconds) * 1_000_000_000 + UInt64(stepResult12b.duration.components.attoseconds / 1_000_000_000)
-            await sendControl("phase12b-step-report", detail: "\(stepResult12b.bytes),\(stepNanos12b)")
-            logger.info("Node B: step received \(stepResult12b.bytes) bytes in \(stepNanos12b)ns")
+            if let measurer = nodeBSweepMeasurer {
+                let stepResult12b = await measurer.result()
+                let stepNanos12b = UInt64(stepResult12b.duration.components.seconds) * 1_000_000_000 + UInt64(stepResult12b.duration.components.attoseconds / 1_000_000_000)
+                await sendControl("phase12b-step-report", detail: "\(stepResult12b.bytes),\(stepNanos12b)")
+                logger.info("Node B: step received \(stepResult12b.bytes) bytes in \(stepNanos12b)ns")
+            } else {
+                await sendControl("phase12b-step-report", detail: "0,0")
+            }
 
         case "phase12b-step-reverse-start":
             let parts12bs = (cmd.detail ?? "").split(separator: ",")
