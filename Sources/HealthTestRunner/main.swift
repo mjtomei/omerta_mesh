@@ -697,12 +697,15 @@ struct PerfSummary {
 }
 
 let latencyBuckets: [(label: String, range: Range<Double>)] = [
-    ("    0-  500 us", 0.0..<500.0),
-    ("  500- 1000 us", 500.0..<1000.0),
-    (" 1000- 2000 us", 1000.0..<2000.0),
-    (" 2000- 5000 us", 2000.0..<5000.0),
-    (" 5000-10000 us", 5000.0..<10000.0),
-    ("10000+     us", 10000.0..<Double.infinity),
+    ("     0-   500 us", 0.0..<500.0),
+    ("   500-  1000 us", 500.0..<1000.0),
+    ("  1000-  2000 us", 1000.0..<2000.0),
+    ("  2000-  5000 us", 2000.0..<5000.0),
+    ("  5000- 10000 us", 5000.0..<10000.0),
+    (" 10000- 20000 us", 10000.0..<20000.0),
+    (" 20000- 50000 us", 20000.0..<50000.0),
+    (" 50000-100000 us", 50000.0..<100000.0),
+    ("100000+      us", 100000.0..<Double.infinity),
 ]
 
 var perfSummary = PerfSummary()
@@ -1594,20 +1597,24 @@ do {
     let vanillaLatCount = await vanillaLatencyCollector.count
     logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
 
-    // Bandwidth: 1000 × 8KB datagrams
-    let bwMeasurer = BandwidthMeasurer()
-    let payload = Data(repeating: 0xAA, count: 8192)
-    await bwMeasurer.start()
-    for _ in 1...1000 {
-        let buf = vanillaChannel.allocator.buffer(bytes: payload)
+    // Bandwidth: 5000 × 1400-byte datagrams (fits in single Ethernet frame, no fragmentation)
+    let bwPayload = Data(repeating: 0xAA, count: 1400)
+    let bwPacketCount = 5000
+    let bwClock = ContinuousClock()
+    let bwStart = bwClock.now
+    for i in 1...bwPacketCount {
+        let buf = vanillaChannel.allocator.buffer(bytes: bwPayload)
         let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
-        try? await vanillaChannel.writeAndFlush(envelope)
+        // Batch: write without flush, flush every 50 packets
+        if i % 50 == 0 || i == bwPacketCount {
+            try? await vanillaChannel.writeAndFlush(envelope)
+        } else {
+            vanillaChannel.write(envelope, promise: nil)
+        }
     }
-    try await Task.sleep(for: .seconds(1))
-    let bwResult = await bwMeasurer.result()
-    // For vanilla bandwidth, measure based on what we sent (1000 * 8KB)
-    let vanillaSendBytes: UInt64 = 1000 * 8192
-    let vanillaDurationSec = Double(bwResult.duration.components.seconds) + Double(bwResult.duration.components.attoseconds) / 1e18
+    let bwElapsed = bwClock.now - bwStart
+    let vanillaSendBytes: UInt64 = UInt64(bwPacketCount) * 1400
+    let vanillaDurationSec = Double(bwElapsed.components.seconds) + Double(bwElapsed.components.attoseconds) / 1e18
     let vanillaMbps = vanillaDurationSec > 0 ? (Double(vanillaSendBytes) * 8.0 / 1_000_000.0 / vanillaDurationSec) : 0
     perfSummary.vanillaBandwidthMbps = vanillaMbps
     logger.info("Vanilla bandwidth: \(String(format: "%.1f", vanillaMbps)) Mbps")
@@ -1633,17 +1640,18 @@ do {
     let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
     try await Task.sleep(for: .seconds(1))
 
-    let payload = Data(repeating: 0xBB, count: 8192)
+    let meshBwPayload = Data(repeating: 0xBB, count: 1400)
+    let meshBwPacketCount = 5000
     let clock = ContinuousClock()
     let start = clock.now
 
-    for _ in 1...1000 {
-        try await bwSession.send(payload)
+    for _ in 1...meshBwPacketCount {
+        try await bwSession.send(meshBwPayload)
     }
 
     let elapsed = clock.now - start
     let elapsedSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-    let sentBytes: UInt64 = 1000 * 8192
+    let sentBytes: UInt64 = UInt64(meshBwPacketCount) * 1400
     let meshMbps = elapsedSec > 0 ? (Double(sentBytes) * 8.0 / 1_000_000.0 / elapsedSec) : 0
     perfSummary.meshBandwidthMbps = meshMbps
 
