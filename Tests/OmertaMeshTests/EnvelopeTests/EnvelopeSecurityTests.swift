@@ -16,17 +16,17 @@ final class EnvelopeSecurityTests: XCTestCase {
         invalidData.append(0x02)  // Correct version
         invalidData.append(Data(repeating: 0x00, count: 100))  // Padding
 
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(invalidData))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(invalidData))
     }
 
     func testEmptyDataRejected() {
         let emptyData = Data()
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(emptyData))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(emptyData))
     }
 
     func testTruncatedMagicRejected() {
         let truncated = Data("OMR".utf8)  // Only 3 bytes
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(truncated))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(truncated))
     }
 
     func testRandomGarbageRejected() {
@@ -38,7 +38,7 @@ final class EnvelopeSecurityTests: XCTestCase {
 
         // Very unlikely to match magic by chance
         // This test is probabilistic but extremely reliable
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(garbage))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(garbage))
     }
 
     // MARK: - Version Rejection Tests
@@ -50,7 +50,7 @@ final class EnvelopeSecurityTests: XCTestCase {
         data.append(Data(repeating: 0x00, count: 100))  // Padding
 
         // isValidPrefix should return false for wrong version
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(data))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(data))
     }
 
     func testFutureVersionRejected() throws {
@@ -58,7 +58,7 @@ final class EnvelopeSecurityTests: XCTestCase {
         data.append(0xFF)  // Future version
         data.append(Data(repeating: 0x00, count: 100))
 
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(data))
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(data))
     }
 
     // MARK: - Network Isolation Tests

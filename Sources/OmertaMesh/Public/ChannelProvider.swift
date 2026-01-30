@@ -43,6 +43,18 @@ public protocol ChannelSender: Sendable {
     /// }
     /// ```
     func sendOnChannel(_ data: Data, toMachine machineId: MachineId, channel: String) async throws
+
+    // MARK: - Buffered Send
+
+    /// Buffer data for batched sending on a channel to a peer.
+    /// Data is accumulated and sent as a single batch on flush or auto-flush timer.
+    func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws
+
+    /// Buffer data for batched sending on a channel to a specific machine.
+    func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws
+
+    /// Flush all buffered data for a channel, sending it as a single batch.
+    func flushChannel(_ channel: String) async throws
 }
 
 /// Protocol for types that provide channel-based messaging.
@@ -82,6 +94,9 @@ public protocol ChannelProvider: ChannelSender {
     ///              with the received machineId to send responses.
     /// - Throws: Error if channel name is invalid or registration fails
     func onChannel(_ channel: String, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws
+
+    /// Register a handler for messages on a specific channel with a batch config override.
+    func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws
 
     /// Unregister a handler for a channel.
     /// - Parameter channel: Channel name to stop listening on

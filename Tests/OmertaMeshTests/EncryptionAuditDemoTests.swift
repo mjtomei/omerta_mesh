@@ -102,19 +102,19 @@ final class EncryptionAuditDemoTests: XCTestCase {
     ///   + fake.append(Data(repeating: 0xAA, count: 100))  // garbage
     ///   + try await socket.sendRaw(fake, to: endpoint)
     func testCatchesSpoofedMagicWithGarbageBody() async throws {
-        var fake = Data("OMRT".utf8)
-        fake.append(0x02)
-        fake.append(Data(repeating: 0xAA, count: 100))
+        var fake = Data("OMR".utf8)
+        fake.append(0x03)
+        fake.append(Data(repeating: 0xAA, count: 300))
 
         // This passes the prefix check but will be caught by decryption in --audit-encryption.
         // In the test observer (prefix-only), it passes — demonstrating why the daemon's
         // full decryption check is important.
-        let prefixValid = BinaryEnvelopeV2.isValidPrefix(fake)
+        let prefixValid = BinaryEnvelope.isValidPrefix(fake)
         XCTAssertTrue(prefixValid, "Spoofed magic should pass prefix check")
 
         // But decryption must fail
         let testKey = Data(repeating: 0x42, count: 32)
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(fake, networkKey: testKey),
+        XCTAssertThrowsError(try BinaryEnvelope.decode(fake, networkKey: testKey),
                             "Garbage body must fail decryption")
     }
 
@@ -145,8 +145,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
         corrupted.replaceSubrange(start..<corrupted.count,
                                   with: Data(repeating: 0x00, count: 32))
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(corrupted), "Prefix still valid")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(corrupted, networkKey: testKey),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(corrupted), "Prefix still valid")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(corrupted, networkKey: testKey),
                             "Corrupted payload must fail decryption")
     }
 
@@ -174,8 +174,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
 
         let sealed = try envelope.encodeV2(networkKey: wrongKey)
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(sealed.data), "Prefix valid regardless of key")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(sealed.data, networkKey: correctKey),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(sealed.data), "Prefix valid regardless of key")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(sealed.data, networkKey: correctKey),
                             "Wrong-key packet must fail decryption with correct key")
     }
 
@@ -202,8 +202,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
             tampered[i] ^= 0xFF
         }
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(tampered), "Prefix unaffected by nonce change")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(tampered, networkKey: testKey),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(tampered), "Prefix unaffected by nonce change")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(tampered, networkKey: testKey),
                             "Tampered nonce must fail authentication")
     }
 
@@ -227,8 +227,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
         // Truncate to just the prefix + nonce (17 bytes)
         let truncated = sealed.data.prefix(17)
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(Data(truncated)), "Prefix valid on truncated data")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(Data(truncated), networkKey: testKey),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(Data(truncated)), "Prefix valid on truncated data")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(Data(truncated), networkKey: testKey),
                             "Truncated packet must fail decryption")
     }
 
@@ -253,8 +253,8 @@ final class EncryptionAuditDemoTests: XCTestCase {
         let tagOffset = 17
         tampered[tagOffset] ^= 0x01
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(tampered), "Prefix unaffected")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(tampered, networkKey: testKey),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(tampered), "Prefix unaffected")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(tampered, networkKey: testKey),
                             "Flipped header tag bit must fail authentication")
     }
 
@@ -263,18 +263,18 @@ final class EncryptionAuditDemoTests: XCTestCase {
     /// Simulates sending just the magic + version with nothing else.
     /// A minimal "looks encrypted" packet.
     func testCatchesMinimalFakePacket() async throws {
-        var minimal = Data("OMRT".utf8)
-        minimal.append(0x02)
+        var minimal = Data("OMR".utf8)
+        minimal.append(0x03)
 
-        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(minimal), "Exactly prefix-sized data passes prefix check")
-        XCTAssertThrowsError(try BinaryEnvelopeV2.decode(minimal, networkKey: Data(repeating: 0x42, count: 32)),
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(minimal), "Exactly prefix-sized data passes prefix check")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(minimal, networkKey: Data(repeating: 0x42, count: 32)),
                             "Prefix-only packet must fail decryption")
     }
 
     // MARK: - Scenario 10: Legacy MessageEncryption format
 
     /// Simulates old code that used the legacy MessageEncryption.encrypt()
-    /// path instead of BinaryEnvelopeV2. This is the exact regression that
+    /// path instead of BinaryEnvelope. This is the exact regression that
     /// the SealedEnvelope type system prevents at compile time, but we
     /// verify the runtime audit catches it too.
     func testCatchesLegacyEncryptionFormat() async throws {
@@ -290,7 +290,7 @@ final class EncryptionAuditDemoTests: XCTestCase {
         let legacyEncrypted = try MessageEncryption.encrypt(jsonData, key: testKey)
 
         // Legacy format doesn't have OMRT prefix
-        XCTAssertFalse(BinaryEnvelopeV2.isValidPrefix(legacyEncrypted),
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(legacyEncrypted),
                       "Legacy encryption format must not pass prefix check")
 
         let caught = await attemptRawSend(legacyEncrypted)

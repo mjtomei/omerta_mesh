@@ -21,7 +21,7 @@ index 3474e9e..63e31ae 100644
 +        try await socket.send(sealed, to: dest)
 +        try await Task.sleep(nanoseconds: 10_000_000)
 +        // Passes prefix and type system -- caught only by daemon decryption audit
-+        XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(sealed.data),
++        XCTAssertTrue(BinaryEnvelope.isValidPrefix(sealed.data),
 +            "Wrong-key packet passes prefix -- needs decryption audit")
 +    }
 +

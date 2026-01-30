@@ -45,6 +45,22 @@ public struct MeshDaemonConfig: Codable, Sendable {
     /// LAN mode - bind to IPv4 (0.0.0.0) instead of specific IPv6 for cross-machine LAN testing
     public var lanMode: Bool
 
+    /// Batch configuration settings
+    public var batchSettings: BatchSettings?
+
+    /// Batch settings for daemon config file
+    public struct BatchSettings: Codable, Sendable {
+        public var maxFlushDelayMs: Int?
+        public var maxBufferSize: Int?
+
+        public func toBatchConfig() -> BatchConfig {
+            BatchConfig(
+                maxFlushDelay: .milliseconds(maxFlushDelayMs ?? 1),
+                maxBufferSize: maxBufferSize ?? 0
+            )
+        }
+    }
+
     /// Default configuration
     public static var `default`: MeshDaemonConfig {
         MeshDaemonConfig(
@@ -59,7 +75,8 @@ public struct MeshDaemonConfig: Codable, Sendable {
             identityPath: nil,
             foreground: true,
             pidFile: nil,
-            lanMode: false
+            lanMode: false,
+            batchSettings: nil
         )
     }
 
@@ -75,7 +92,8 @@ public struct MeshDaemonConfig: Codable, Sendable {
         identityPath: String? = nil,
         foreground: Bool = true,
         pidFile: String? = nil,
-        lanMode: Bool = false
+        lanMode: Bool = false,
+        batchSettings: BatchSettings? = nil
     ) {
         self.networkId = networkId
         self.port = port
@@ -89,6 +107,7 @@ public struct MeshDaemonConfig: Codable, Sendable {
         self.foreground = foreground
         self.pidFile = pidFile
         self.lanMode = lanMode
+        self.batchSettings = batchSettings
     }
 }
 

@@ -44,7 +44,7 @@ final class EncryptionEnforcementTests: XCTestCase {
             let sealed = try envelope.encodeV2(networkKey: testKey)
 
             // The sealed envelope should contain valid encrypted data
-            XCTAssertTrue(BinaryEnvelopeV2.isValidPrefix(sealed.data),
+            XCTAssertTrue(BinaryEnvelope.isValidPrefix(sealed.data),
                          "SealedEnvelope from encodeV2 must have valid prefix")
         } catch {
             XCTFail("Unexpected error: \(error)")
@@ -52,7 +52,7 @@ final class EncryptionEnforcementTests: XCTestCase {
     }
 
     #if DEBUG
-    /// Verify that all packets sent through UDPSocket have the BinaryEnvelopeV2 prefix.
+    /// Verify that all packets sent through UDPSocket have the BinaryEnvelope prefix.
     func testAllTrafficIsEncrypted() async throws {
         let testKey = Data(repeating: 0x42, count: 32)
         GlobalEncryptionObserver.registerNetworkKey(testKey)

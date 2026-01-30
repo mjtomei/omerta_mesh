@@ -112,6 +112,8 @@ public actor TunnelManager {
         // Both sides run monitors and send probes independently. No echo response needed.
         try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
             guard let self else { return }
+            let hasMonitor = await self.healthMonitors[machineId] != nil
+            await self.logger.debug("Health probe received from \(machineId.prefix(8)), monitor exists: \(hasMonitor)")
             await self.notifyPacketReceived(from: machineId)
         }
 

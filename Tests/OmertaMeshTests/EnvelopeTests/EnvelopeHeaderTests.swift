@@ -1,171 +1,260 @@
-// EnvelopeHeaderTests.swift - Tests for EnvelopeHeader binary encoding
+// EnvelopeHeaderTests.swift - Tests for split RoutingHeader + AuthHeader format
 
 import XCTest
 @testable import OmertaMesh
 
 final class EnvelopeHeaderTests: XCTestCase {
 
-    // MARK: - Basic Encode/Decode
+    // MARK: - Helpers
 
-    func testEncodeDecodeRoundTrip() throws {
-        let networkHash = Data(repeating: 0x12, count: 8)
+    private func makeNetworkHash() -> Data {
+        Data(repeating: 0x12, count: 8)
+    }
+
+    private func makeSignature() -> Data {
+        Data(repeating: 0xAB, count: 64)
+    }
+
+    // MARK: - 1. RoutingHeader Encode/Decode Round Trip
+
+    func testRoutingHeaderRoundTrip() throws {
+        let networkHash = makeNetworkHash()
+        let fromPeerId = Data(repeating: 0x01, count: 16)
+        let toPeerId = Data(repeating: 0x02, count: 16)
+
+        let header = RoutingHeader(
+            networkHash: networkHash,
+            fromPeerId: fromPeerId,
+            toPeerId: toPeerId,
+            flags: 0,
+            hopCount: 5,
+            channel: 0x1234
+        )
+
+        let encoded = try header.encode()
+        XCTAssertEqual(encoded.count, 44)
+
+        let decoded = try RoutingHeader.decode(from: encoded)
+        XCTAssertEqual(decoded.networkHash, networkHash)
+        XCTAssertEqual(decoded.fromPeerId, fromPeerId)
+        XCTAssertEqual(decoded.toPeerId, toPeerId)
+        XCTAssertEqual(decoded.flags, 0)
+        XCTAssertEqual(decoded.hopCount, 5)
+        XCTAssertEqual(decoded.channel, 0x1234)
+    }
+
+    // MARK: - 2. AuthHeader Encode/Decode Round Trip
+
+    func testAuthHeaderRoundTrip() throws {
         let keypair = IdentityKeypair()
         let messageId = UUID()
-        let channelHash = ChannelHash.hash("test-channel")
-        let signature = Data(repeating: 0xAB, count: 64)
+        let machineId = UUID()
+        let timestamp = Date()
+        let signature = makeSignature()
 
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: "recipient-peer-id-12345",
-            channel: channelHash,
-            hopCount: 5,
-            timestamp: Date(),
+        let header = AuthHeader(
+            timestamp: timestamp,
             messageId: messageId,
-            machineId: UUID().uuidString,
+            machineId: machineId,
             publicKey: keypair.publicKeyData,
             signature: signature
         )
 
         let encoded = try header.encode()
-        let decoded = try EnvelopeHeader.decode(from: encoded)
+        XCTAssertEqual(encoded.count, 136)
 
-        XCTAssertEqual(decoded.networkHash, header.networkHash)
-        XCTAssertEqual(decoded.fromPeerId, header.fromPeerId)
-        XCTAssertEqual(decoded.toPeerId, header.toPeerId)
-        XCTAssertEqual(decoded.channel, header.channel)
-        XCTAssertEqual(decoded.hopCount, header.hopCount)
-        XCTAssertEqual(decoded.messageId, header.messageId)
-        XCTAssertEqual(decoded.machineId, header.machineId)
-        XCTAssertEqual(decoded.publicKey, header.publicKey)
-        XCTAssertEqual(decoded.signature, header.signature)
-
-        // Timestamp should be very close (within millisecond precision)
-        XCTAssertEqual(decoded.timestamp.timeIntervalSinceReferenceDate,
-                       header.timestamp.timeIntervalSinceReferenceDate,
+        let decoded = try AuthHeader.decode(from: encoded)
+        XCTAssertEqual(decoded.messageId, messageId)
+        XCTAssertEqual(decoded.machineId, machineId)
+        XCTAssertEqual(decoded.publicKey, keypair.publicKeyData)
+        XCTAssertEqual(decoded.signature, signature)
+        XCTAssertEqual(decoded.timestamp.timeIntervalSince1970,
+                       timestamp.timeIntervalSince1970,
                        accuracy: 0.001)
     }
 
-    func testEncodeDecodeWithoutRecipient() throws {
-        let networkHash = Data(repeating: 0x34, count: 8)
-        let keypair = IdentityKeypair()
-        let channelHash = ChannelHash.hash("broadcast-channel")
+    // MARK: - 3. Broadcast Uses All-Zero toPeerId
 
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,  // Broadcast
-            channel: channelHash,
+    func testBroadcastUsesAllZeroToPeerId() throws {
+        let header = RoutingHeader(
+            networkHash: makeNetworkHash(),
+            fromPeerId: Data(repeating: 0x01, count: 16),
+            toPeerId: RoutingHeader.broadcastPeerId,
             hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0xCD, count: 64)
+            channel: 100
         )
 
-        let encoded = try header.encode()
-        let decoded = try EnvelopeHeader.decode(from: encoded)
+        XCTAssertTrue(header.isBroadcast)
+        XCTAssertEqual(header.toPeerId, Data(repeating: 0, count: 16))
 
-        XCTAssertNil(decoded.toPeerId)
-        XCTAssertEqual(decoded.fromPeerId, header.fromPeerId)
-        XCTAssertEqual(decoded.channel, channelHash)
+        let encoded = try header.encode()
+        let decoded = try RoutingHeader.decode(from: encoded)
+        XCTAssertTrue(decoded.isBroadcast)
     }
 
-    // MARK: - Edge Cases
-
-    func testZeroChannelHash() throws {
-        let networkHash = Data(repeating: 0x56, count: 8)
-        let keypair = IdentityKeypair()
-
-        // Channel hash 0 is used for default mesh protocol messages
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0,  // Zero channel for mesh protocol
+    func testNonBroadcastIsNotBroadcast() {
+        let header = RoutingHeader(
+            networkHash: makeNetworkHash(),
+            fromPeerId: Data(repeating: 0x01, count: 16),
+            toPeerId: Data(repeating: 0x02, count: 16),
             hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0xEF, count: 64)
+            channel: 100
         )
 
-        let encoded = try header.encode()
-        let decoded = try EnvelopeHeader.decode(from: encoded)
-
-        XCTAssertEqual(decoded.channel, 0)
+        XCTAssertFalse(header.isBroadcast)
     }
 
-    func testMaxChannelHash() throws {
-        let networkHash = Data(repeating: 0x78, count: 8)
-        let keypair = IdentityKeypair()
+    // MARK: - 4. RoutingHeader Fixed Size Validation
 
-        // Test with maximum UInt16 value
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: UInt16.max,
-            hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0x12, count: 64)
-        )
+    func testRoutingHeaderFixedSize() throws {
+        // Different field values should always produce exactly 44 bytes
+        let headers = [
+            RoutingHeader(networkHash: Data(repeating: 0x00, count: 8),
+                          fromPeerId: Data(repeating: 0x00, count: 16),
+                          toPeerId: Data(repeating: 0x00, count: 16),
+                          hopCount: 0, channel: 0),
+            RoutingHeader(networkHash: Data(repeating: 0xFF, count: 8),
+                          fromPeerId: Data(repeating: 0xFF, count: 16),
+                          toPeerId: Data(repeating: 0xFF, count: 16),
+                          flags: 0xFF, hopCount: 255, channel: UInt16.max),
+        ]
 
-        let encoded = try header.encode()
-        let decoded = try EnvelopeHeader.decode(from: encoded)
-
-        XCTAssertEqual(decoded.channel, UInt16.max)
+        for header in headers {
+            let encoded = try header.encode()
+            XCTAssertEqual(encoded.count, RoutingHeader.encodedSize,
+                           "RoutingHeader must always be exactly \(RoutingHeader.encodedSize) bytes")
+        }
     }
+
+    // MARK: - 5. AuthHeader Fixed Size Validation
+
+    func testAuthHeaderFixedSize() throws {
+        let headers = [
+            AuthHeader(timestamp: Date(timeIntervalSince1970: 0),
+                       messageId: UUID(),
+                       machineId: UUID(),
+                       publicKey: Data(repeating: 0x00, count: 32),
+                       signature: Data(repeating: 0x00, count: 64)),
+            AuthHeader(timestamp: Date(timeIntervalSince1970: Double(UInt32.max)),
+                       messageId: UUID(),
+                       machineId: UUID(),
+                       publicKey: Data(repeating: 0xFF, count: 32),
+                       signature: Data(repeating: 0xFF, count: 64)),
+        ]
+
+        for header in headers {
+            let encoded = try header.encode()
+            XCTAssertEqual(encoded.count, AuthHeader.encodedSize,
+                           "AuthHeader must always be exactly \(AuthHeader.encodedSize) bytes")
+        }
+    }
+
+    // MARK: - 6. HopCount Range
 
     func testHopCountRange() throws {
-        let networkHash = Data(repeating: 0x9A, count: 8)
-        let keypair = IdentityKeypair()
-
-        for hopCount in [0, 1, 127, 128, 254, 255] as [UInt8] {
-            let header = EnvelopeHeader(
-                networkHash: networkHash,
-                fromPeerId: keypair.peerId,
-                toPeerId: nil,
-                channel: 0x1234,
+        for hopCount: UInt8 in [0, 1, 127, 255] {
+            let header = RoutingHeader(
+                networkHash: makeNetworkHash(),
+                fromPeerId: Data(repeating: 0x01, count: 16),
+                toPeerId: Data(repeating: 0x02, count: 16),
                 hopCount: hopCount,
-                timestamp: Date(),
-                messageId: UUID(),
-                machineId: UUID().uuidString,
-                publicKey: keypair.publicKeyData,
-                signature: Data(repeating: 0x34, count: 64)
+                channel: 100
             )
 
             let encoded = try header.encode()
-            let decoded = try EnvelopeHeader.decode(from: encoded)
-
+            let decoded = try RoutingHeader.decode(from: encoded)
             XCTAssertEqual(decoded.hopCount, hopCount, "Hop count \(hopCount) should round-trip")
         }
     }
 
-    // MARK: - Error Cases
+    // MARK: - 7. Channel Hash Consistency
 
-    func testInvalidNetworkHash() throws {
+    func testChannelHashConsistency() {
+        let channel = "health-request"
+        let hash1 = ChannelHash.hash(channel)
+        let hash2 = ChannelHash.hash(channel)
+        XCTAssertEqual(hash1, hash2, "Same channel should produce same hash")
+    }
+
+    // MARK: - 8. Different Channels Produce Different Hashes
+
+    func testChannelHashDifferentChannels() {
+        let hash1 = ChannelHash.hash("health-request")
+        let hash2 = ChannelHash.hash("health-response")
+        XCTAssertNotEqual(hash1, hash2, "Different channels should produce different hashes")
+    }
+
+    // MARK: - 9. Empty Channel Hashes to 0
+
+    func testChannelHashEmptyChannel() {
+        let hash = ChannelHash.hash("")
+        XCTAssertEqual(hash, 0, "Empty channel should hash to 0")
+    }
+
+    func testChannelHashNonZeroForNonEmpty() {
+        let hash = ChannelHash.hash("test")
+        XCTAssertNotEqual(hash, 0, "Non-empty channel should not hash to 0")
+    }
+
+    // MARK: - 10. PeerIdCompact Truncation and Matching
+
+    func testPeerIdCompactTruncation() {
         let keypair = IdentityKeypair()
+        let truncated = PeerIdCompact.truncate(keypair.peerId)
+        XCTAssertEqual(truncated.count, 16, "Truncated peer ID must be 16 bytes")
+    }
 
-        // Network hash must be exactly 8 bytes
-        let invalidHash = Data(repeating: 0x12, count: 4)  // Only 4 bytes
+    func testPeerIdCompactMatching() {
+        let keypair = IdentityKeypair()
+        let truncated = PeerIdCompact.truncate(keypair.peerId)
+        XCTAssertTrue(PeerIdCompact.matches(truncated: truncated, full: keypair.peerId),
+                      "Truncated peer ID should match its source")
+    }
 
-        let header = EnvelopeHeader(
-            networkHash: invalidHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0,
+    func testPeerIdCompactDifferentKeysDoNotMatch() {
+        let keypair1 = IdentityKeypair()
+        let keypair2 = IdentityKeypair()
+        let truncated1 = PeerIdCompact.truncate(keypair1.peerId)
+        XCTAssertFalse(PeerIdCompact.matches(truncated: truncated1, full: keypair2.peerId),
+                       "Truncated peer ID should not match a different peer")
+    }
+
+    func testPeerIdCompactConsistency() {
+        let keypair = IdentityKeypair()
+        let t1 = PeerIdCompact.truncate(keypair.peerId)
+        let t2 = PeerIdCompact.truncate(keypair.peerId)
+        XCTAssertEqual(t1, t2, "Same peer ID should always truncate the same way")
+    }
+
+    // MARK: - 11. MachineIdCompact Round Trip
+
+    func testMachineIdCompactRoundTrip() {
+        let originalId = UUID()
+        let machineIdString = originalId.uuidString
+
+        let uuid = MachineIdCompact.toUUID(machineIdString)
+        XCTAssertNotNil(uuid)
+
+        let restored = MachineIdCompact.toString(uuid!)
+        // UUID strings are uppercased
+        XCTAssertEqual(restored.lowercased(), machineIdString.lowercased(),
+                       "MachineId should round-trip through UUID conversion")
+    }
+
+    func testMachineIdCompactInvalidString() {
+        let result = MachineIdCompact.toUUID("not-a-uuid")
+        XCTAssertNil(result, "Invalid UUID string should return nil")
+    }
+
+    // MARK: - 12. Error: Invalid Network Hash Size
+
+    func testInvalidNetworkHashSize() {
+        let header = RoutingHeader(
+            networkHash: Data(repeating: 0x12, count: 4), // Wrong size
+            fromPeerId: Data(repeating: 0x01, count: 16),
+            toPeerId: Data(repeating: 0x02, count: 16),
             hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0x56, count: 64)
+            channel: 0
         )
 
         XCTAssertThrowsError(try header.encode()) { error in
@@ -176,24 +265,15 @@ final class EnvelopeHeaderTests: XCTestCase {
         }
     }
 
-    func testInvalidPublicKeySize() throws {
-        let networkHash = Data(repeating: 0x12, count: 8)
-        let keypair = IdentityKeypair()
+    // MARK: - 13. Error: Invalid Public Key Size
 
-        // Public key must be exactly 32 bytes
-        let invalidPublicKey = Data(repeating: 0x42, count: 16)  // Only 16 bytes
-
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0,
-            hopCount: 0,
+    func testInvalidPublicKeySize() {
+        let header = AuthHeader(
             timestamp: Date(),
             messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: invalidPublicKey,
-            signature: Data(repeating: 0x78, count: 64)
+            machineId: UUID(),
+            publicKey: Data(repeating: 0x42, count: 16), // Wrong size
+            signature: Data(repeating: 0xAB, count: 64)
         )
 
         XCTAssertThrowsError(try header.encode()) { error in
@@ -204,24 +284,15 @@ final class EnvelopeHeaderTests: XCTestCase {
         }
     }
 
-    func testInvalidSignatureSize() throws {
-        let networkHash = Data(repeating: 0x12, count: 8)
-        let keypair = IdentityKeypair()
+    // MARK: - 14. Error: Invalid Signature Size
 
-        // Signature must be exactly 64 bytes
-        let invalidSignature = Data(repeating: 0x9A, count: 32)  // Only 32 bytes
-
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0,
-            hopCount: 0,
+    func testInvalidSignatureSize() {
+        let header = AuthHeader(
             timestamp: Date(),
             messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: invalidSignature
+            machineId: UUID(),
+            publicKey: Data(repeating: 0x42, count: 32),
+            signature: Data(repeating: 0xAB, count: 32) // Wrong size
         )
 
         XCTAssertThrowsError(try header.encode()) { error in
@@ -232,29 +303,12 @@ final class EnvelopeHeaderTests: XCTestCase {
         }
     }
 
-    func testTruncatedData() throws {
-        let networkHash = Data(repeating: 0xBC, count: 8)
-        let keypair = IdentityKeypair()
+    // MARK: - 15. Error: Truncated Routing Header Data
 
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0,
-            hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0xDE, count: 64)
-        )
+    func testTruncatedRoutingHeaderData() {
+        let truncatedData = Data(repeating: 0x00, count: 10) // Less than 44 bytes
 
-        let encoded = try header.encode()
-
-        // Try decoding truncated data
-        let truncated = encoded.prefix(10)
-
-        XCTAssertThrowsError(try EnvelopeHeader.decode(from: Data(truncated))) { error in
+        XCTAssertThrowsError(try RoutingHeader.decode(from: truncatedData)) { error in
             guard case BinaryEnvelopeError.truncatedData = error else {
                 XCTFail("Expected truncatedData error, got \(error)")
                 return
@@ -262,180 +316,201 @@ final class EnvelopeHeaderTests: XCTestCase {
         }
     }
 
-    // MARK: - Equatable
+    // MARK: - 16. Error: Truncated Auth Header Data
 
-    func testHeaderEquality() {
-        let networkHash = Data(repeating: 0xDE, count: 8)
-        let keypair = IdentityKeypair()
-        let timestamp = Date()
+    func testTruncatedAuthHeaderData() {
+        let truncatedData = Data(repeating: 0x00, count: 64) // Less than 128 bytes
+
+        XCTAssertThrowsError(try AuthHeader.decode(from: truncatedData)) { error in
+            guard case BinaryEnvelopeError.truncatedData = error else {
+                XCTFail("Expected truncatedData error, got \(error)")
+                return
+            }
+        }
+    }
+
+    // MARK: - 17. UUID Round Trip in Auth Header
+
+    func testUUIDRoundTripInAuthHeader() throws {
         let messageId = UUID()
-        let machineId = UUID().uuidString
-        let channelHash: UInt16 = 0x5678
-        let signature = Data(repeating: 0xF0, count: 64)
+        let machineId = UUID()
 
-        let header1 = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: "peer-123",
-            channel: channelHash,
-            hopCount: 5,
-            timestamp: timestamp,
+        let header = AuthHeader(
+            timestamp: Date(),
             messageId: messageId,
             machineId: machineId,
-            publicKey: keypair.publicKeyData,
-            signature: signature
-        )
-
-        let header2 = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: "peer-123",
-            channel: channelHash,
-            hopCount: 5,
-            timestamp: timestamp,
-            messageId: messageId,
-            machineId: machineId,
-            publicKey: keypair.publicKeyData,
-            signature: signature
-        )
-
-        XCTAssertEqual(header1, header2)
-    }
-
-    func testHeaderInequalityDifferentChannel() {
-        let networkHash = Data(repeating: 0xEF, count: 8)
-        let keypair = IdentityKeypair()
-        let timestamp = Date()
-        let messageId = UUID()
-        let signature = Data(repeating: 0x11, count: 64)
-
-        let header1 = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: ChannelHash.hash("channel-a"),
-            hopCount: 0,
-            timestamp: timestamp,
-            messageId: messageId,
-            machineId: "machine-1",
-            publicKey: keypair.publicKeyData,
-            signature: signature
-        )
-
-        let header2 = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: ChannelHash.hash("channel-b"),  // Different channel
-            hopCount: 0,
-            timestamp: timestamp,
-            messageId: messageId,
-            machineId: "machine-1",
-            publicKey: keypair.publicKeyData,
-            signature: signature
-        )
-
-        XCTAssertNotEqual(header1, header2)
-    }
-
-    // MARK: - Size Efficiency
-
-    func testEncodedSize() throws {
-        let networkHash = Data(repeating: 0x11, count: 8)
-        let keypair = IdentityKeypair()
-
-        // Minimal header (short strings, no recipient)
-        let minimalHeader = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: "peer",
-            toPeerId: nil,
-            channel: 0,
-            hopCount: 0,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: "m",
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0x22, count: 64)
-        )
-
-        let minimalEncoded = try minimalHeader.encode()
-
-        // Header should be reasonably compact
-        // Fixed fields: 8 (network hash) + 1 (flags) + 44 (fromPeerId) + 2 (channel) + 64 (channelString) +
-        // 1 (hop) + 8 (timestamp) + 16 (messageId) + 36 (machineId) + 32 (pubkey) + 64 (sig) = 276 bytes (without toPeerId)
-        XCTAssertLessThan(minimalEncoded.count, 280, "Minimal header should be compact")
-
-        // Larger header
-        let largerHeader = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: "recipient-" + String(repeating: "x", count: 40),
-            channel: 0xFFFF,
-            hopCount: 255,
-            timestamp: Date(),
-            messageId: UUID(),
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0x33, count: 64)
-        )
-
-        let largerEncoded = try largerHeader.encode()
-
-        // Should still be reasonable size (fixed fields + variable strings)
-        XCTAssertLessThan(largerEncoded.count, 400, "Larger header should fit in reasonable size")
-    }
-
-    // MARK: - Channel Hash Tests
-
-    func testChannelHashConsistency() {
-        let channel = "health-request"
-        let hash1 = ChannelHash.hash(channel)
-        let hash2 = ChannelHash.hash(channel)
-
-        XCTAssertEqual(hash1, hash2, "Same channel should produce same hash")
-    }
-
-    func testChannelHashDifferentChannels() {
-        let hash1 = ChannelHash.hash("health-request")
-        let hash2 = ChannelHash.hash("health-response")
-
-        XCTAssertNotEqual(hash1, hash2, "Different channels should produce different hashes")
-    }
-
-    func testChannelHashEmptyChannel() {
-        let hash = ChannelHash.hash("")
-        XCTAssertEqual(hash, 0, "Empty channel should hash to 0")
-    }
-
-    func testChannelHashNonZeroForNonEmpty() {
-        // The hash function ensures non-empty channels don't hash to 0
-        let hash = ChannelHash.hash("test")
-        XCTAssertNotEqual(hash, 0, "Non-empty channel should not hash to 0")
-    }
-
-    // MARK: - UUID Round Trip
-
-    func testUUIDRoundTrip() throws {
-        let networkHash = Data(repeating: 0x44, count: 8)
-        let keypair = IdentityKeypair()
-        let originalUUID = UUID()
-
-        let header = EnvelopeHeader(
-            networkHash: networkHash,
-            fromPeerId: keypair.peerId,
-            toPeerId: nil,
-            channel: 0x1234,
-            hopCount: 0,
-            timestamp: Date(),
-            messageId: originalUUID,
-            machineId: UUID().uuidString,
-            publicKey: keypair.publicKeyData,
-            signature: Data(repeating: 0x55, count: 64)
+            publicKey: Data(repeating: 0x42, count: 32),
+            signature: Data(repeating: 0xAB, count: 64)
         )
 
         let encoded = try header.encode()
-        let decoded = try EnvelopeHeader.decode(from: encoded)
+        let decoded = try AuthHeader.decode(from: encoded)
 
-        XCTAssertEqual(decoded.messageId, originalUUID, "UUID should round-trip exactly")
+        XCTAssertEqual(decoded.messageId, messageId, "messageId UUID should round-trip exactly")
+        XCTAssertEqual(decoded.machineId, machineId, "machineId UUID should round-trip exactly")
+    }
+
+    // MARK: - 18. Timestamp Millisecond Precision Preserved
+
+    func testTimestampMillisecondPrecision() throws {
+        // Use a timestamp with specific millisecond value
+        let timestampMs: UInt64 = 1_700_000_000_123 // 123 ms component
+        let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
+
+        let header = AuthHeader(
+            timestamp: timestamp,
+            messageId: UUID(),
+            machineId: UUID(),
+            publicKey: Data(repeating: 0x42, count: 32),
+            signature: Data(repeating: 0xAB, count: 64)
+        )
+
+        let encoded = try header.encode()
+        let decoded = try AuthHeader.decode(from: encoded)
+
+        // Convert both back to milliseconds and compare exactly
+        let originalMs = UInt64(timestamp.timeIntervalSince1970 * 1000)
+        let decodedMs = UInt64(decoded.timestamp.timeIntervalSince1970 * 1000)
+        XCTAssertEqual(decodedMs, originalMs,
+                       "Timestamp millisecond precision must be preserved")
+    }
+
+    // MARK: - EnvelopeHeader Convenience Wrapper
+
+    func testEnvelopeHeaderConvenienceInit() throws {
+        let keypair = IdentityKeypair()
+        let messageId = UUID()
+        let machineId = UUID()
+        let channelHash = ChannelHash.hash("test-channel")
+
+        let header = EnvelopeHeader(
+            networkHash: makeNetworkHash(),
+            fromPeerId: keypair.peerId,
+            toPeerId: nil, // broadcast
+            channel: channelHash,
+            channelString: "test-channel",
+            hopCount: 3,
+            timestamp: Date(),
+            messageId: messageId,
+            machineId: machineId.uuidString,
+            publicKey: keypair.publicKeyData,
+            signature: makeSignature()
+        )
+
+        XCTAssertEqual(header.channelString, "test-channel")
+        XCTAssertEqual(header.fromPeerIdFull, keypair.peerId)
+        XCTAssertNil(header.toPeerIdFull)
+        XCTAssertEqual(header.machineIdString, machineId.uuidString)
+        XCTAssertEqual(header.channel, channelHash)
+        XCTAssertEqual(header.hopCount, 3)
+        XCTAssertTrue(header.routing.isBroadcast)
+
+        // Routing and auth should encode independently
+        let routingData = try header.encodeRouting()
+        XCTAssertEqual(routingData.count, RoutingHeader.encodedSize)
+
+        let authData = try header.encodeAuth()
+        XCTAssertEqual(authData.count, AuthHeader.encodedSize)
+    }
+
+    func testEnvelopeHeaderWithRecipient() throws {
+        let keypair = IdentityKeypair()
+        let recipientKeypair = IdentityKeypair()
+
+        let header = EnvelopeHeader(
+            networkHash: makeNetworkHash(),
+            fromPeerId: keypair.peerId,
+            toPeerId: recipientKeypair.peerId,
+            channel: ChannelHash.hash("direct"),
+            hopCount: 1,
+            timestamp: Date(),
+            messageId: UUID(),
+            machineId: UUID().uuidString,
+            publicKey: keypair.publicKeyData,
+            signature: makeSignature()
+        )
+
+        XCTAssertFalse(header.routing.isBroadcast)
+        XCTAssertEqual(header.toPeerIdFull, recipientKeypair.peerId)
+
+        // The truncated toPeerId in routing should match the recipient
+        XCTAssertTrue(PeerIdCompact.matches(truncated: header.routing.toPeerId,
+                                            full: recipientKeypair.peerId))
+    }
+
+    // MARK: - 19. Field Alignment in Routing Header
+
+    func testFieldAlignment() throws {
+        let networkHash = makeNetworkHash()
+        let fromPeerId = Data(repeating: 0xAA, count: 16)
+        let toPeerId = Data(repeating: 0xBB, count: 16)
+        let flags: UInt8 = 0x07
+        let hopCount: UInt8 = 42
+        let channel: UInt16 = 0xCAFE
+
+        let header = RoutingHeader(
+            networkHash: networkHash,
+            fromPeerId: fromPeerId,
+            toPeerId: toPeerId,
+            flags: flags,
+            hopCount: hopCount,
+            channel: channel
+        )
+
+        let encoded = try header.encode()
+
+        // networkHash at offset 0, length 8
+        XCTAssertEqual(Data(encoded[0..<8]), networkHash)
+        // fromPeerId at offset 8, length 16
+        XCTAssertEqual(Data(encoded[8..<24]), fromPeerId)
+        // toPeerId at offset 24, length 16
+        XCTAssertEqual(Data(encoded[24..<40]), toPeerId)
+        // flags at offset 40, length 1
+        XCTAssertEqual(encoded[40], flags)
+        // hopCount at offset 41, length 1
+        XCTAssertEqual(encoded[41], hopCount)
+        // channel at offset 42, length 2 (big-endian)
+        let channelBytes = Data(encoded[42..<44])
+        let decodedChannel = UInt16(channelBytes[channelBytes.startIndex]) << 8 |
+                             UInt16(channelBytes[channelBytes.startIndex + 1])
+        XCTAssertEqual(decodedChannel, channel)
+    }
+
+    // MARK: - 20. Truncated PeerId Collision Resistance
+
+    func testTruncatedPeerIdCollisionResistance() {
+        // Generate 1000 unique peer IDs and verify no collisions after truncation
+        var truncatedSet: Set<Data> = []
+        let peerCount = 1000
+
+        for _ in 0..<peerCount {
+            let keypair = IdentityKeypair()
+            let truncated = PeerIdCompact.truncate(keypair.peerId)
+            truncatedSet.insert(truncated)
+        }
+
+        XCTAssertEqual(truncatedSet.count, peerCount,
+                       "No collisions expected among \(peerCount) truncated peer IDs (16 bytes = 128 bits)")
+    }
+
+    // MARK: - 21. Compact MachineId Round Trip via Raw UUID
+
+    func testCompactMachineId() {
+        let originalUUID = UUID()
+
+        // Convert UUID -> string -> UUID -> string and verify round-trip
+        let asString = MachineIdCompact.toString(originalUUID)
+        let backToUUID = MachineIdCompact.toUUID(asString)
+        XCTAssertNotNil(backToUUID)
+        XCTAssertEqual(backToUUID, originalUUID,
+                       "Raw UUID should round-trip through MachineIdCompact.toString -> toUUID")
+
+        // Also verify the reverse direction: string -> UUID -> string
+        let originalString = originalUUID.uuidString
+        let uuid = MachineIdCompact.toUUID(originalString)
+        XCTAssertNotNil(uuid)
+        let restored = MachineIdCompact.toString(uuid!)
+        XCTAssertEqual(restored.uppercased(), originalString.uppercased(),
+                       "String UUID should round-trip through MachineIdCompact.toUUID -> toString")
     }
 }

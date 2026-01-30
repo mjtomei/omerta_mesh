@@ -4,7 +4,7 @@ import XCTest
 @testable import OmertaMesh
 
 #if DEBUG
-/// Tracks packets sent during tests and flags any that lack the BinaryEnvelopeV2 prefix
+/// Tracks packets sent during tests and flags any that lack the BinaryEnvelope prefix
 /// or fail decryption against registered network keys.
 /// Install once via `GlobalEncryptionObserver.install()`.
 final class GlobalEncryptionObserver: NSObject, XCTestObservation {
@@ -43,7 +43,7 @@ final class GlobalEncryptionObserver: NSObject, XCTestObservation {
             guard !suppressHook else { return }
 
             // Layer 1: prefix check
-            guard BinaryEnvelopeV2.isValidPrefix(data) else {
+            guard BinaryEnvelope.isValidPrefix(data) else {
                 observer.recordViolation(data: data, dest: dest, reason: "missing encrypted envelope prefix")
                 return
             }
@@ -58,7 +58,7 @@ final class GlobalEncryptionObserver: NSObject, XCTestObservation {
             var decryptedWithAny = false
             for key in keys {
                 do {
-                    _ = try BinaryEnvelopeV2.decode(data, networkKey: key)
+                    _ = try BinaryEnvelope.decode(data, networkKey: key)
                     decryptedWithAny = true
                     break
                 } catch {

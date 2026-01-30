@@ -6,7 +6,7 @@ This document describes the cryptographic protocols used in OmertaMesh for packe
 
 OmertaMesh uses three main cryptographic protocols:
 
-1. **Packet Encryption (Wire Format v2)** - Layered ChaCha20-Poly1305 encryption
+1. **Packet Encryption (Wire Format v3)** - Split-header ChaCha20-Poly1305 encryption with chunked payloads
 2. **Network Key Negotiation** - X25519 key exchange for creating new private networks
 3. **Network Invite Sharing** - X25519 key exchange for sharing existing network keys
 
@@ -23,7 +23,7 @@ All cryptographic operations use Apple's [CryptoKit](https://developer.apple.com
 
 | Component | File |
 |-----------|------|
-| Wire Format v2 encoding/decoding | `Envelope/BinaryEnvelopeV2.swift` |
+| Wire Format v2 encoding/decoding | `Envelope/BinaryEnvelope.swift` |
 | Envelope header structure | `Envelope/EnvelopeHeader.swift` |
 | Key exchange state machine | `Services/Cloister/KeyExchange.swift` |
 | Network negotiation client | `Services/Cloister/CloisterClient.swift` |
@@ -34,27 +34,44 @@ All cryptographic operations use Apple's [CryptoKit](https://developer.apple.com
 
 ---
 
-## 1. Wire Format v2 - Packet Encryption
+## 1. Wire Format v3 - Packet Encryption
 
-**Implementation:** `Envelope/BinaryEnvelopeV2.swift`, `Envelope/EnvelopeHeader.swift`
+**Implementation:** `Envelope/BinaryEnvelope.swift`, `Envelope/EnvelopeHeader.swift`
 
 ### Structure
 
+The v3 wire format splits the header into two independently encrypted sections: a **RoutingHeader** (encrypted with the header key) and an **AuthHeader** (encrypted with the payload key). This allows relay nodes to decrypt only the routing information needed for forwarding without accessing authentication data or payload contents.
+
 ```
-UNENCRYPTED PREFIX (5 bytes):
-  [4 bytes] magic "OMRT"
-  [1 byte]  version 0x02
+UNENCRYPTED PREFIX (4 bytes):
+  [3 bytes] magic "OMR"
+  [1 byte]  version 0x03
 
-HEADER SECTION (encrypted):
-  [12 bytes] nonce
-  [16 bytes] header_tag (Poly1305)
-  [2 bytes]  header_length
-  [N bytes]  encrypted header data
+BASE NONCE (12 bytes):
+  [12 bytes] base_nonce (random, used to derive all section nonces)
 
-PAYLOAD SECTION (encrypted):
-  [4 bytes]  payload_length
-  [M bytes]  encrypted payload data
-  [16 bytes] payload_tag (Poly1305)
+ROUTING HEADER (44 bytes plaintext + 16 bytes tag, encrypted with headerKey):
+  [8 bytes]  networkHash        SHA256(networkKey)[0:8]
+  [16 bytes] fromPeerId         truncated peer ID
+  [16 bytes] toPeerId           truncated peer ID
+  [1 byte]   flags
+  [1 byte]   hopCount
+  [2 bytes]  channel            UInt16 hash of channel name
+  [16 bytes] poly1305 tag
+
+AUTH HEADER (136 bytes plaintext + 16 bytes tag, encrypted with payloadKey):
+  [8 bytes]  timestamp          Unix timestamp
+  [16 bytes] messageId          UUID
+  [16 bytes] machineId          raw 16-byte UUID
+  [32 bytes] publicKey          Ed25519 public key
+  [64 bytes] signature          Ed25519 signature
+  [16 bytes] poly1305 tag
+
+CHUNKED PAYLOAD (encrypted with payloadKey):
+  [4 bytes]  total_payload_length   (unencrypted total plaintext size)
+  For each chunk (count = ceil(total_payload_length / 512), chunk size 512):
+    [N bytes]  encrypted chunk data (512 bytes for all but last)
+    [16 bytes] chunk_tag (Poly1305)
 ```
 
 ### Key Derivation
@@ -64,7 +81,7 @@ networkKey (32 bytes) - shared by all network participants
 
 headerKey = HKDF-SHA256(
     inputKeyMaterial: networkKey,
-    info: "omerta-header-v2",
+    info: "omerta-header-v3",
     outputByteCount: 32
 )
 
@@ -73,21 +90,35 @@ payloadKey = networkKey (used directly)
 
 ### Nonce Derivation
 
-A single random nonce is generated per packet. The payload nonce is derived by XORing:
+A single random 12-byte base nonce is generated per packet. Each section derives its nonce by XORing the base nonce with a section-specific constant:
 
 ```
-headerNonce = random(12 bytes)
-payloadNonce = headerNonce XOR [0x00, 0x00, ..., 0x01]
+base_nonce          = random(12 bytes)
+
+routing_nonce       = base_nonce XOR 0x00           (effectively unchanged)
+auth_nonce          = base_nonce XOR 0x01           (last byte flipped)
+payload_chunk_nonce = base_nonce XOR (0x02 | (chunk_index << 8))
 ```
 
-This ensures header and payload use different nonces with distinct keys.
+For payload chunks, `chunk_index` is a zero-based index encoded into the second-to-last byte, allowing up to 256 chunks per packet. This ensures every encryption operation across all three sections uses a unique nonce.
+
+### Chunked Payload
+
+The payload is split into 512-byte blocks, each independently encrypted with its own nonce and authentication tag. This design enables:
+
+- **Parallel decryption using standard APIs**: While ChaCha20 is theoretically parallelizable by block counter, CryptoKit's `ChaChaPoly.open()` is an opaque single-call API with no way to decrypt a sub-range of the ciphertext on a separate thread. Chunking allows each chunk to be handed to a standard `ChaChaPoly.open()` call independently, enabling parallel decryption without custom crypto code or dropping to a lower-level library.
+- **Parallel authentication**: Poly1305 authentication of a single large message is inherently serial (sequential polynomial evaluation). Parallelizing it over a single message requires precomputed powers of `r` and more complex evaluation schemes. Independent chunks give trivially parallel, independent Poly1305 verifications with no additional implementation complexity.
+- **Granular integrity**: Corruption in one chunk does not prevent decryption of other chunks.
+- **Bounded memory**: Chunks can be processed in a streaming fashion without buffering the entire payload.
 
 ### Security Properties
 
 - **Authenticated encryption (AEAD)**: ChaCha20-Poly1305 provides confidentiality and integrity per [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439.html)
 - **Fast rejection**: Invalid magic/version rejected in O(1) without crypto operations
 - **Network isolation**: Network hash check ensures packets are for correct network
-- **Domain separation**: HKDF info string separates header key derivation
+- **Domain separation**: HKDF info string "omerta-header-v3" separates header key derivation
+- **Relay privacy**: Split headers allow relay nodes to route packets using only the headerKey, without accessing authentication data or payload contents
+- **Nonce uniqueness**: XOR-differentiated nonces from a single base nonce guarantee no nonce reuse across sections within a packet
 
 ---
 

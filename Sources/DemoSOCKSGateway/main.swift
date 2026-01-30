@@ -34,6 +34,22 @@ actor E2EChannelProvider: ChannelProvider {
         sentMessages.append((data, machineId, channel))
     }
 
+    func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        try await sendOnChannel(data, to: peerId, channel: channel)
+    }
+
+    func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+
+    func flushChannel(_ channel: String) async throws {
+        // No-op for mock
+    }
+
+    func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        try await onChannel(channel, handler: handler)
+    }
+
     func deliverMessage(_ data: Data, from senderMachineId: MachineId, on channel: String) async {
         if let handler = handlers[channel] {
             await handler(senderMachineId, data)

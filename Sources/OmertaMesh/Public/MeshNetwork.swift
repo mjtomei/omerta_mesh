@@ -421,6 +421,62 @@ public actor MeshNetwork: ChannelProvider {
         try await node.sendOnChannel(data, toMachine: machineId, channel: channel)
     }
 
+    // MARK: - Buffered Channel Send
+
+    /// Buffer data for batched sending on a channel to a peer.
+    public func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        try await node.sendOnChannelBuffered(data, to: peerId, channel: channel)
+    }
+
+    /// Buffer data for batched sending on a channel to a specific machine.
+    public func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        try await node.sendOnChannelBuffered(data, toMachine: machineId, channel: channel)
+    }
+
+    /// Flush all buffered data for a channel.
+    public func flushChannel(_ channel: String) async throws {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        try await node.flushChannel(channel)
+    }
+
+    /// Register a handler with a batch config override.
+    public func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        guard ChannelUtils.isValid(channel) else {
+            throw MeshError.sendFailed(reason: "Invalid channel '\(channel)': must be max 64 chars, alphanumeric/-/_ only")
+        }
+
+        if let node = meshNode {
+            try await node.onChannel(channel, batchConfig: batchConfig, handler: handler)
+        } else {
+            pendingChannelHandlers[channel] = handler
+        }
+    }
+
+    // MARK: - Batch Monitors
+
+    /// Registered batch monitors
+    private var batchMonitors: [any BatchMonitor] = []
+
+    /// Register a batch monitor for dynamic parameter adjustment.
+    public func registerBatchMonitor(_ monitor: any BatchMonitor) async {
+        batchMonitors.append(monitor)
+        await meshNode?.registerBatchMonitor(monitor)
+    }
+
+    /// Unregister a batch monitor.
+    public func unregisterBatchMonitor(_ monitor: any BatchMonitor) async {
+        batchMonitors.removeAll { ($0 as AnyObject) === (monitor as AnyObject) }
+        await meshNode?.unregisterBatchMonitor(monitor)
+    }
+
     /// Access the machine-peer registry for looking up peer identities from machine IDs
     /// Returns nil if the network is not started.
     public var machinePeerRegistry: MachinePeerRegistry? {

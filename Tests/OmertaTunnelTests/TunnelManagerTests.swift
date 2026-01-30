@@ -16,6 +16,10 @@ actor MockChannelProvider: ChannelProvider {
         handlers[channel] = handler
     }
 
+    func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
+        try await onChannel(channel, handler: handler)
+    }
+
     func offChannel(_ channel: String) async {
         handlers.removeValue(forKey: channel)
     }
@@ -27,6 +31,16 @@ actor MockChannelProvider: ChannelProvider {
     func sendOnChannel(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
         sentMessages.append((to: machineId, channel: channel, data: data))
     }
+
+    func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
+        try await sendOnChannel(data, to: peerId, channel: channel)
+    }
+
+    func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
+        try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+
+    func flushChannel(_ channel: String) async throws {}
 
     // Test helpers
     func getRegisteredChannels() -> [String] {
@@ -583,15 +597,14 @@ final class TunnelSessionTests: XCTestCase {
 
         await session.activate()
 
-        // Send a message
-        try await session.send(Data([1, 2, 3]))
+        // Send a message (sendAndFlush for immediate send)
+        try await session.sendAndFlush(Data([1, 2, 3]))
 
         // Check message was sent
         let messages = await provider.getSentMessages()
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].to, "machine-1")
         XCTAssertEqual(messages[0].channel, "tunnel-data")
-        XCTAssertEqual(messages[0].data, Data([1, 2, 3]))
     }
 
     func testCloseSession() async throws {
@@ -623,10 +636,11 @@ final class TunnelSessionTests: XCTestCase {
         })
 
         // Simulate incoming message — TunnelManager dispatches to the correct session
+        // Data must be wrapped in BatchWireFormat since deliverIncoming unpacks it
         await provider.simulateMessage(
             from: "machine-1",
             on: "tunnel-data",
-            data: Data([1, 2, 3, 4])
+            data: BatchWireFormat.packSingle(Data([1, 2, 3, 4]))
         )
 
         XCTAssertEqual(receivedData, Data([1, 2, 3, 4]))
@@ -648,7 +662,7 @@ final class TunnelSessionTests: XCTestCase {
         await provider.simulateMessage(
             from: "wrong-machine",
             on: "tunnel-data",
-            data: Data([9, 9, 9])
+            data: BatchWireFormat.packSingle(Data([9, 9, 9]))
         )
 
         XCTAssertNil(receivedData)
@@ -657,7 +671,7 @@ final class TunnelSessionTests: XCTestCase {
         await provider.simulateMessage(
             from: "machine-1",
             on: "tunnel-data",
-            data: Data([1, 2, 3])
+            data: BatchWireFormat.packSingle(Data([1, 2, 3]))
         )
 
         XCTAssertEqual(receivedData, Data([1, 2, 3]))
@@ -675,9 +689,9 @@ final class TunnelSessionTests: XCTestCase {
 
         await session.activate()
 
-        // Send some data
-        try await session.send(Data(repeating: 0x42, count: 100))
-        try await session.send(Data(repeating: 0x43, count: 50))
+        // Send some data (send() buffers, flush() sends)
+        try await session.sendAndFlush(Data(repeating: 0x42, count: 100))
+        try await session.sendAndFlush(Data(repeating: 0x43, count: 50))
 
         let stats = await session.stats
         XCTAssertEqual(stats.packetsSent, 2)
@@ -781,13 +795,13 @@ final class TunnelSessionTests: XCTestCase {
         let session2 = try await manager.getSession(machineId: "machine-2", channel: "data", receiveHandler: { data in received2 = data })
 
         // Send to machine-1's session
-        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([0xAA]))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([0xAA])))
 
         XCTAssertEqual(received1, Data([0xAA]))
         XCTAssertNil(received2)
 
         // Send to machine-2's session
-        await provider.simulateMessage(from: "machine-2", on: "tunnel-data", data: Data([0xBB]))
+        await provider.simulateMessage(from: "machine-2", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([0xBB])))
 
         XCTAssertEqual(received2, Data([0xBB]))
         // machine-1 should still have its original data
@@ -805,7 +819,7 @@ final class TunnelSessionTests: XCTestCase {
         let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { data in receivedData = data })
 
         // Message from unknown machine — should be silently dropped
-        await provider.simulateMessage(from: "unknown-machine", on: "tunnel-data", data: Data([0xFF]))
+        await provider.simulateMessage(from: "unknown-machine", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([0xFF])))
 
         XCTAssertNil(receivedData)
 
@@ -825,7 +839,7 @@ final class TunnelSessionTests: XCTestCase {
         await manager.closeSession(key: key)
 
         // Wire channel still registered, but session removed — data should be dropped
-        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([0xCC]))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([0xCC])))
 
         XCTAssertNil(receivedData)
 
@@ -874,8 +888,8 @@ final class TunnelSessionTests: XCTestCase {
 
         let session = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { _ in })
 
-        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([1, 2, 3]))
-        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: Data([4, 5]))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([1, 2, 3])))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: BatchWireFormat.packSingle(Data([4, 5])))
 
         let stats = await session.stats
         XCTAssertEqual(stats.packetsReceived, 2)

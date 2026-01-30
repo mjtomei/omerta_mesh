@@ -1,7 +1,7 @@
 import XCTest
 @testable import OmertaMesh
 
-final class BinaryEnvelopeTests: XCTestCase {
+final class BinaryEnvelopeLegacyTests: XCTestCase {
 
     // MARK: - Basic Encoding/Decoding
 

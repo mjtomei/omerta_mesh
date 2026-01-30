@@ -44,6 +44,23 @@ public func getOrCreateMachineId() throws -> MachineId {
     return newId
 }
 
+/// Convert a machine ID string to raw 16-byte UUID data.
+/// Returns nil if the string is not a valid UUID.
+public func machineIdToRawUUID(_ machineId: MachineId) -> Data? {
+    guard let uuid = UUID(uuidString: machineId) else { return nil }
+    return withUnsafeBytes(of: uuid.uuid) { Data($0) }
+}
+
+/// Convert raw 16-byte UUID data back to a machine ID string.
+public func rawUUIDToMachineId(_ data: Data) -> MachineId? {
+    guard data.count == 16 else { return nil }
+    var uuid: uuid_t = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+    withUnsafeMutableBytes(of: &uuid) { ptr in
+        _ = data.copyBytes(to: ptr)
+    }
+    return UUID(uuid: uuid).uuidString
+}
+
 /// Get the machine ID if it exists, without creating one.
 public func getMachineId() -> MachineId? {
     let machineIdPath = getMachineIdPath()

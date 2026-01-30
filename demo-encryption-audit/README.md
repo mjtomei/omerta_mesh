@@ -39,7 +39,7 @@ original repo is never modified.
 Two layers of defense:
 
 1. **Compile-time**: `UDPSocket.send()` only accepts `SealedEnvelope`, which
-   can only be constructed by `BinaryEnvelopeV2.encodeV2()`. Code that tries
+   can only be constructed by `BinaryEnvelope.encodeV2()`. Code that tries
    to send raw `Data` won't compile (unless it uses `sendRaw`, which is
    `internal`-only).
 

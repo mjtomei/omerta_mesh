@@ -109,7 +109,7 @@ struct Start: AsyncParsableCommand {
                 let bt = Thread.callStackSymbols.joined(separator: "\n")
 
                 // Check 1: valid envelope prefix
-                guard BinaryEnvelopeV2.isValidPrefix(data) else {
+                guard BinaryEnvelope.isValidPrefix(data) else {
                     fatalError("""
                         ENCRYPTION AUDIT FAILURE: missing encrypted envelope prefix (\(data.count) bytes) to \(dest)
                         Data prefix: \(hex)
@@ -121,7 +121,7 @@ struct Start: AsyncParsableCommand {
                 // Check 2: if we have the network key, verify decryption succeeds
                 if let networkKey = keyBox.key {
                     do {
-                        _ = try BinaryEnvelopeV2.decode(data, networkKey: networkKey)
+                        _ = try BinaryEnvelope.decode(data, networkKey: networkKey)
                     } catch {
                         fatalError("""
                             ENCRYPTION AUDIT FAILURE: packet has valid prefix but decryption failed (\(data.count) bytes) to \(dest)
