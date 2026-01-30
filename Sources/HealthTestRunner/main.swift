@@ -1082,14 +1082,18 @@ if !isNodeA {
                     if headerParsed && dataReceived >= expectedBytes && !sentReport {
                         sentReport = true
                         let ctx = context
+                        let blastSz = self.blastSize
                         Task {
                             let result = await self.stats.result()
                             let report = "REPORT:\(result.bytes),\(result.nanos)\n"
-                            var buf = ctx.channel.allocator.buffer(capacity: report.count + self.blastSize)
-                            buf.writeString(report)
-                            buf.writeRepeatingByte(0xDD, count: self.blastSize)
-                            ctx.writeAndFlush(self.wrapOutboundOut(buf), promise: nil)
-                            ctx.close(promise: nil)
+                            // Hop back to event loop for channel operations
+                            ctx.eventLoop.execute {
+                                var buf = ctx.channel.allocator.buffer(capacity: report.count + blastSz)
+                                buf.writeString(report)
+                                buf.writeRepeatingByte(0xDD, count: blastSz)
+                                ctx.writeAndFlush(NIOAny(buf), promise: nil)
+                                ctx.close(promise: nil)
+                            }
                         }
                     }
                 }
