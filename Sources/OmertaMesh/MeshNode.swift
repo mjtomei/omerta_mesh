@@ -551,6 +551,26 @@ public actor MeshNode {
         }
         markMessageSeen(envelope.messageId)
 
+        // Resolve channel string from hash if the envelope has an empty channel
+        // (v3 wire format only carries UInt16 hash, not the full string)
+        var envelope = envelope
+        if envelope.channel.isEmpty, let hash = channelHash {
+            if let entry = channelHandlers[hash] {
+                envelope = MeshEnvelope(
+                    messageId: envelope.messageId,
+                    fromPeerId: envelope.fromPeerId,
+                    publicKey: envelope.publicKey,
+                    machineId: envelope.machineId,
+                    toPeerId: envelope.toPeerId,
+                    channel: entry.name,
+                    hopCount: envelope.hopCount,
+                    timestamp: envelope.timestamp,
+                    payload: envelope.payload,
+                    signature: envelope.signature
+                )
+            }
+        }
+
         // Verify signature using embedded public key (also verifies peer ID derivation)
         guard envelope.verifySignature() else {
             logger.warning("Rejecting message with invalid signature",

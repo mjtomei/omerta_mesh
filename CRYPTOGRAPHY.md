@@ -106,9 +106,10 @@ For payload chunks, `chunk_index` is a zero-based index encoded into the second-
 
 The payload is split into 512-byte blocks, each independently encrypted with its own nonce and authentication tag. This design enables:
 
-- **Parallel decryption**: Independent chunks can be decrypted concurrently on multi-core systems
-- **Granular integrity**: Corruption in one chunk does not prevent decryption of other chunks
-- **Bounded memory**: Chunks can be processed in a streaming fashion without buffering the entire payload
+- **Parallel decryption using standard APIs**: While ChaCha20 is theoretically parallelizable by block counter, CryptoKit's `ChaChaPoly.open()` is an opaque single-call API with no way to decrypt a sub-range of the ciphertext on a separate thread. Chunking allows each chunk to be handed to a standard `ChaChaPoly.open()` call independently, enabling parallel decryption without custom crypto code or dropping to a lower-level library.
+- **Parallel authentication**: Poly1305 authentication of a single large message is inherently serial (sequential polynomial evaluation). Parallelizing it over a single message requires precomputed powers of `r` and more complex evaluation schemes. Independent chunks give trivially parallel, independent Poly1305 verifications with no additional implementation complexity.
+- **Granular integrity**: Corruption in one chunk does not prevent decryption of other chunks.
+- **Bounded memory**: Chunks can be processed in a streaming fashion without buffering the entire payload.
 
 ### Security Properties
 
