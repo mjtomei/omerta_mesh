@@ -1,0 +1,32 @@
+name: Notify Parent Repo
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  notify:
+    name: Update Parent Repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if commit is master HEAD
+        id: check
+        run: |
+          REMOTE_SHA=$(git ls-remote https://github.com/mjtomei/omerta_mesh refs/heads/master | cut -f1)
+          if [ "${{ github.sha }}" = "$REMOTE_SHA" ]; then
+            echo "is_head=true" >> $GITHUB_OUTPUT
+          else
+            echo "Commit ${{ github.sha }} is not master HEAD ($REMOTE_SHA) — skipping"
+            echo "is_head=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Dispatch to parent repo
+        if: steps.check.outputs.is_head == 'true'
+        env:
+          TOKEN: ${{ secrets.PARENT_REPO_TOKEN }}
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.github.com/repos/mjtomei/omerta/dispatches \
+            -d '{"event_type":"subrepo-updated","client_payload":{"module":"omerta_mesh","sha":"${{ github.sha }}"}}'
