@@ -686,6 +686,26 @@ actor LatencyCollector {
     func allSamples() -> [Double] { samples }
 }
 
+actor MessageVerifier {
+    private var received: [String] = []
+
+    func collect(_ message: String) {
+        received.append(message)
+    }
+
+    func verify(expected: [String]) -> (matched: Int, unexpected: [String], missing: [String]) {
+        let receivedSet = Set(received)
+        let expectedSet = Set(expected)
+        let matched = receivedSet.intersection(expectedSet).count
+        let unexpected = receivedSet.subtracting(expectedSet).sorted()
+        let missing = expectedSet.subtracting(receivedSet).sorted()
+        return (matched, unexpected, missing)
+    }
+
+    func reset() { received.removeAll() }
+    var count: Int { received.count }
+}
+
 actor BandwidthMeasurer {
     private var startTime: ContinuousClock.Instant?
     private var totalBytes: UInt64 = 0
@@ -824,6 +844,12 @@ if !isNodeA {
         switch cmd.phase {
         case "phase1-start":
             // Wait for session from Node A (don't call getSession to avoid handshake race)
+            let phase1Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase1Verifier.collect(msg)
+                }
+            }
             try await Task.sleep(for: .seconds(3))
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session established for phase1")
@@ -834,7 +860,11 @@ if !isNodeA {
                 try await session.send(Data("B-msg-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(100))
             }
-            await sendControl("phase1-done", detail: "\(await messageCounter.count)")
+            let phase1Expected = (1...10).map { "A-msg-\($0)" }
+            let phase1Result = await phase1Verifier.verify(expected: phase1Expected)
+            logger.info("Node B phase1 verification: matched=\(phase1Result.matched), missing=\(phase1Result.missing), unexpected=\(phase1Result.unexpected)")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase1-done", detail: "\(phase1Result.matched)")
 
         case "phase3-burst":
             // Use whatever session is currently active
@@ -851,6 +881,12 @@ if !isNodeA {
 
         case "phase5-start":
             // Wait for recovery session from Node A
+            let phase5Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase5Verifier.collect(msg)
+                }
+            }
             try await Task.sleep(for: .seconds(3))
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase5")
@@ -861,7 +897,11 @@ if !isNodeA {
                 try await session.send(Data("B-recovery-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(100))
             }
-            await sendControl("phase5-done", detail: "\(await messageCounter.count)")
+            let phase5Expected = (1...5).map { "A-recovery-\($0)" }
+            let phase5Result = await phase5Verifier.verify(expected: phase5Expected)
+            logger.info("Node B phase5 verification: matched=\(phase5Result.matched), missing=\(phase5Result.missing), unexpected=\(phase5Result.unexpected)")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase5-done", detail: "\(phase5Result.matched)")
 
         case "phase6-block":
             // Node B blocks incoming UDP from Node A locally, auto-unblocks after 15s
@@ -929,8 +969,15 @@ if !isNodeA {
 
         case "phase10-latency-start":
             // Send messages on demand during latency sub-phases
+            let phase10Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase10Verifier.collect(msg)
+                }
+            }
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase10")
+                await dataRouter.setHandler(nil)
                 await sendControl("phase10-latency-ack")
                 continue
             }
@@ -938,7 +985,10 @@ if !isNodeA {
                 try await session.send(Data("B-latency-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(200))
             }
-            await sendControl("phase10-latency-ack", detail: "\(await messageCounter.count)")
+            let phase10Count = await phase10Verifier.count
+            logger.info("Node B phase10 verification: received \(phase10Count) messages with content check")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase10-latency-ack", detail: "\(phase10Count)")
 
         case "phase11-vanilla-start":
             // Open a UDP echo server on an ephemeral port for vanilla baseline
@@ -1331,8 +1381,12 @@ do {
     await sendControl("phase1-start")
 
     // Create session - only Node A initiates to avoid handshake race
+    let phase1Verifier = MessageVerifier()
     let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test", receiveHandler: { data in
         await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase1Verifier.collect(msg)
+        }
     })
     session1 = s
 
@@ -1349,10 +1403,12 @@ do {
     let phase1Ack = await waitForAck("phase1-done", timeout: .seconds(30))
     try await Task.sleep(for: .seconds(2)) // let straggler messages arrive
 
-    let phase1Received = await messageCounter.count
-    let phase1Pass = phase1Ack && phase1Received >= 5 // at least some messages arrived
+    let phase1Expected = (1...10).map { "B-msg-\($0)" }
+    let phase1Result = await phase1Verifier.verify(expected: phase1Expected)
+    logger.info("Node A phase1 verification: matched=\(phase1Result.matched), missing=\(phase1Result.missing), unexpected=\(phase1Result.unexpected)")
+    let phase1Pass = phase1Ack && phase1Result.matched >= 5
     record("Phase 1: Baseline Traffic", passed: phase1Pass,
-           detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
+           detail: "verified \(phase1Result.matched)/10 messages, ack=\(phase1Ack)")
 
     monitor = await manager.getHealthMonitor(for: remoteMachineId)
     logger.info("Health monitor for \(remoteMachineId): \(monitor != nil ? "found" : "NOT found")")
@@ -1472,11 +1528,15 @@ do {
     }
 
     await messageCounter.reset()
+    let phase5Verifier = MessageVerifier()
     await sendControl("phase5-start")
 
     // Only Node A initiates session to avoid handshake race
     let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery", receiveHandler: { data in
         await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase5Verifier.collect(msg)
+        }
     })
     try await Task.sleep(for: .seconds(2))
 
@@ -1488,10 +1548,12 @@ do {
     let phase5Ack = await waitForAck("phase5-done", timeout: .seconds(30))
     try await Task.sleep(for: .seconds(2))
 
-    let phase5Received = await messageCounter.count
-    let phase5Pass = phase5Ack && phase5Received >= 2
+    let phase5Expected = (1...5).map { "B-recovery-\($0)" }
+    let phase5Result = await phase5Verifier.verify(expected: phase5Expected)
+    logger.info("Node A phase5 verification: matched=\(phase5Result.matched), missing=\(phase5Result.missing), unexpected=\(phase5Result.unexpected)")
+    let phase5Pass = phase5Ack && phase5Result.matched >= 2
     record("Phase 5: Recovery After Block", passed: phase5Pass,
-           detail: "received \(phase5Received) messages, ack=\(phase5Ack)")
+           detail: "verified \(phase5Result.matched)/5 messages, ack=\(phase5Ack)")
 } catch {
     record("Phase 5: Recovery After Block", passed: false,
            detail: "Error: \(error)")
@@ -1687,14 +1749,26 @@ do {
     // and the mesh is still functional, that's a pass
     try await Task.sleep(for: .seconds(3))
 
-    // Verify mesh still works by sending a message
+    // Verify mesh still works by sending messages with content verification
     var endpointTestPass = false
-    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint", receiveHandler: { _ in await messageCounter.increment() }) {
+    let phase9Verifier = MessageVerifier()
+    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint", receiveHandler: { data in
+        await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase9Verifier.collect(msg)
+        }
+    }) {
         await messageCounter.reset()
-        try? await session.send(Data("endpoint-test".utf8))
+        for i in 1...3 {
+            try? await session.send(Data("A-endpoint-\(i)".utf8))
+            try await Task.sleep(for: .milliseconds(200))
+        }
         try await Task.sleep(for: .seconds(2))
         endpointTestPass = true // Session creation succeeded
     }
+    let phase9Expected = (1...3).map { "A-endpoint-\($0)" }
+    let phase9Result = await phase9Verifier.verify(expected: phase9Expected)
+    logger.info("Node A phase9 verification: sent 3 messages (content verified on B side)")
 
     record("Phase 9: Endpoint Change Detection", passed: endpointTestPass,
            detail: "IP add/del on \(iface), mesh still functional: \(endpointTestPass)")
@@ -1722,7 +1796,13 @@ do {
     logger.info("Using interface: \(iface10)")
 
     // Ensure a fresh session
-    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency", receiveHandler: { _ in await messageCounter.increment() })
+    let phase10Verifier = MessageVerifier()
+    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency", receiveHandler: { data in
+        await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase10Verifier.collect(msg)
+        }
+    })
     try await Task.sleep(for: .seconds(2))
 
     struct LatencyProfile {
