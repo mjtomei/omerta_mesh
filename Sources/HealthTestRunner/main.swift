@@ -1041,17 +1041,46 @@ if !isNodeA {
                 let stats = TCPStats()
                 let blastSize: Int
                 let logger: Logger
+                var expectedBytes: UInt64 = 0
+                var headerParsed = false
+                var headerBuf = Data()
+                var dataReceived: UInt64 = 0
+                var sentReport = false
                 init(blastSize: Int, logger: Logger) {
                     self.blastSize = blastSize
                     self.logger = logger
                 }
                 func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-                    let buf = unwrapInboundIn(data)
-                    let count = buf.readableBytes
-                    Task { await self.stats.addBytes(count) }
-                }
-                func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-                    if (event as? ChannelEvent) == .inputClosed {
+                    var buf = unwrapInboundIn(data)
+                    guard let bytes = buf.readBytes(length: buf.readableBytes) else { return }
+
+                    if !headerParsed {
+                        // Accumulate until we find newline
+                        headerBuf.append(contentsOf: bytes)
+                        if let newlineIdx = headerBuf.firstIndex(of: UInt8(ascii: "\n")) {
+                            let headerData = headerBuf[headerBuf.startIndex..<newlineIdx]
+                            if let headerStr = String(data: headerData, encoding: .utf8),
+                               headerStr.hasPrefix("SIZE:"),
+                               let size = UInt64(headerStr.dropFirst("SIZE:".count)) {
+                                expectedBytes = size
+                                headerParsed = true
+                                // Remaining bytes after header are data
+                                let remaining = headerBuf.count - headerBuf.distance(from: headerBuf.startIndex, to: newlineIdx) - 1
+                                if remaining > 0 {
+                                    dataReceived += UInt64(remaining)
+                                    Task { await self.stats.addBytes(remaining) }
+                                }
+                                logger.debug("TCP server: expecting \(size) bytes")
+                            }
+                        }
+                    } else {
+                        dataReceived += UInt64(bytes.count)
+                        Task { await self.stats.addBytes(bytes.count) }
+                    }
+
+                    // Check if we've received all expected data
+                    if headerParsed && dataReceived >= expectedBytes && !sentReport {
+                        sentReport = true
                         let ctx = context
                         Task {
                             let result = await self.stats.result()
@@ -1069,7 +1098,6 @@ if !isNodeA {
             let tcpBoot = ServerBootstrap(group: tcpGroup)
                 .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
                 .childChannelInitializer { channel in
                     channel.pipeline.addHandler(TCPServerHandler(blastSize: tcpBlastSize, logger: logger))
                 }
@@ -1828,10 +1856,12 @@ do {
     final class VanillaPongHandler: ChannelInboundHandler, @unchecked Sendable {
         typealias InboundIn = AddressedEnvelope<ByteBuffer>
         let collector: LatencyCollector
+        var reverseMeasurer: BandwidthMeasurer?
         let clock = ContinuousClock()
         init(collector: LatencyCollector) { self.collector = collector }
         func channelRead(context: ChannelHandlerContext, data: NIOAny) {
             let envelope = self.unwrapInboundIn(data)
+            let byteCount = envelope.data.readableBytes
             var buf = envelope.data
             if let bytes = buf.readBytes(length: buf.readableBytes) {
                 let msg = String(decoding: Data(bytes), as: UTF8.self)
@@ -1842,6 +1872,10 @@ do {
                     let rttUs = Double(nowNanos - sentNanos) / 1000.0
                     Task { await self.collector.record(rttUs) }
                 }
+            }
+            // Also count bytes for reverse bandwidth measurement
+            if let measurer = reverseMeasurer {
+                Task { await measurer.addBytes(UInt64(byteCount)) }
             }
         }
     }
@@ -1909,33 +1943,15 @@ do {
     }
     logger.info("Vanilla A\u{2192}B aggregate delivered: \(String(format: "%.1f", deliveredAtoBMbps)) Mbps")
 
-    // B→A reverse direction
+    // B→A reverse direction — reuse vanillaChannel (already open and receiving)
     let reverseMeasurer = BandwidthMeasurer()
-
-    // Open a receive-only UDP socket
-    final class ReverseReceiveHandler: ChannelInboundHandler, @unchecked Sendable {
-        typealias InboundIn = AddressedEnvelope<ByteBuffer>
-        let measurer: BandwidthMeasurer
-        init(measurer: BandwidthMeasurer) { self.measurer = measurer }
-        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-            let envelope = self.unwrapInboundIn(data)
-            let count = envelope.data.readableBytes
-            Task { await self.measurer.addBytes(UInt64(count)) }
-        }
-    }
-
-    let reverseGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    let reverseChannel = try await DatagramBootstrap(group: reverseGroup)
-        .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        .channelInitializer { ch in ch.pipeline.addHandler(ReverseReceiveHandler(measurer: reverseMeasurer)) }
-        .bind(host: "0.0.0.0", port: 0)
-        .get()
-    let reversePort = reverseChannel.localAddress?.port ?? 0
+    pongHandler.reverseMeasurer = reverseMeasurer
     await reverseMeasurer.start()
 
     let reversePacketSize = 8192
     let reversePacketCount = Int(bwTargetBytes / UInt64(reversePacketSize))
-    await sendControl("phase11-udp-reverse-go", detail: "\(reversePacketSize),\(reversePacketCount),\(reversePort)")
+    let vanillaPort = vanillaChannel.localAddress?.port ?? 0
+    await sendControl("phase11-udp-reverse-go", detail: "\(reversePacketSize),\(reversePacketCount),\(vanillaPort)")
 
     // Wait for B to finish sending
     var bToASentMbps: Double = 0
@@ -1951,13 +1967,12 @@ do {
     }
     // Wait a bit for trailing packets
     try await Task.sleep(for: .seconds(2))
+    pongHandler.reverseMeasurer = nil
     let reverseResult = await reverseMeasurer.result()
     let bToADeliveredMbps = reverseResult.mbps
     perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: reversePacketSize, direction: "B\u{2192}A", sentMbps: bToASentMbps, deliveredMbps: bToADeliveredMbps))
     logger.info("Vanilla B\u{2192}A: sent=\(String(format: "%.1f", bToASentMbps)) Mbps, delivered=\(String(format: "%.1f", bToADeliveredMbps)) Mbps")
 
-    try? await reverseChannel.close()
-    try? await reverseGroup.shutdownGracefully()
     try? await vanillaChannel.close()
     try? await vanillaGroup.shutdownGracefully()
 
@@ -2043,14 +2058,18 @@ do {
 
     let tcpChannel = try await ClientBootstrap(group: tcpGroup)
         .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
         .channelInitializer { channel in
             channel.pipeline.addHandler(TCPClientHandler(state: clientState))
         }
         .connect(host: remoteHost, port: tcpPort)
         .get()
 
-    // A→B: blast data
+    // A→B: send SIZE header then blast data
+    let sizeHeader = "SIZE:\(tcpTargetBytes)\n"
+    var headerBuf = tcpChannel.allocator.buffer(capacity: sizeHeader.count)
+    headerBuf.writeString(sizeHeader)
+    try await tcpChannel.writeAndFlush(headerBuf)
+
     let sendClock = ContinuousClock()
     let sendStart = sendClock.now
     let chunkSize = 65536
@@ -2065,9 +2084,6 @@ do {
     let sendElapsed = sendClock.now - sendStart
     let sendSec = Double(sendElapsed.components.seconds) + Double(sendElapsed.components.attoseconds) / 1e18
     let tcpSendMbps = sendSec > 0 ? (Double(tcpTargetBytes) * 8.0 / 1_000_000.0 / sendSec) : 0
-
-    // Half-close write side
-    try await tcpChannel.close(mode: .output)
 
     // Wait for B's response + close
     await clientState.waitForDone()
@@ -2117,6 +2133,12 @@ do {
 // MARK: - Phase 12: Mesh Bandwidth
 
 logPhase("Phase 12: Mesh Bandwidth")
+
+// Stop health monitor during bandwidth phases to prevent session kills from missed probes
+if let mon = monitor {
+    await mon.stopMonitoring()
+    logger.info("Health monitor stopped for bandwidth phases")
+}
 
 do {
     await sendControl("phase12-bw-start")
@@ -2290,6 +2312,9 @@ do {
 } catch {
     record("Phase 12b: Batch Config Sweep", passed: false, detail: "Error: \(error)")
 }
+
+// Health monitor remains stopped — Phases 13/14 don't need it and it would
+// kill sessions during the remaining tests.
 
 // MARK: - Phase 13: Mesh Latency (Ping-Pong)
 
