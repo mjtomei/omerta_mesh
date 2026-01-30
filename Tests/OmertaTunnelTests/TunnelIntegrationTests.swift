@@ -396,8 +396,6 @@ final class TunnelIntegrationTests: XCTestCase {
         let count2After = await tunnel2.sessionCount
         XCTAssertEqual(count2After, 0)
 
-        // Verify session count is 0 on mesh2
-        XCTAssertEqual(count2After, 0)
     }
 
     // MARK: - NAT/Relay Tests
@@ -527,6 +525,8 @@ final class TunnelIntegrationTests: XCTestCase {
             if count == 1 { break }
             try await Task.sleep(nanoseconds: 200_000_000)
         }
+        let relaySessionCount = await tunnel2.sessionCount
+        XCTAssertEqual(relaySessionCount, 1, "Inbound session was not created on mesh2")
 
         // Send message via relay
         let testMessage = Data("Hello via relay!".utf8)

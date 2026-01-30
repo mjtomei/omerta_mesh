@@ -382,8 +382,11 @@ public actor TunnelManager {
             if let handler = inboundSessionHandler {
                 receiveHandler = await handler(machineId, channel)
             } else {
-                // Default: accept with no receive handler
-                receiveHandler = { _ in }
+                // Default: accept but log discarded data
+                receiveHandler = { [logger] data in
+                    logger.debug("Received \(data.count) bytes with no inbound handler; discarding",
+                                 metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                }
             }
 
             if receiveHandler != nil {

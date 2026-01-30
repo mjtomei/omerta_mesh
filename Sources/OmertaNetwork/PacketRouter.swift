@@ -78,7 +78,7 @@ public actor PacketRouter {
 
         // Register for inbound tunnel sessions with receive handler
         await tunnelManager.setInboundSessionHandler { [weak self] machineId, channel in
-            guard channel == "packet" else { return { _ in } }
+            guard channel == "packet" else { return nil }
             guard let self else { return nil }
             return { [weak self] packet in
                 await self?.handleInboundPacket(packet, from: machineId)
