@@ -150,6 +150,9 @@ public actor MeshNode {
     /// The UDP socket for network communication
     private let socket: UDPSocket
 
+    /// Auxiliary UDP sockets for multi-endpoint tunnels (port → socket)
+    private var auxiliarySockets: [UInt16: UDPSocket] = [:]
+
     /// Event loop group for NIO
     private let eventLoopGroup: EventLoopGroup
 
@@ -492,8 +495,58 @@ public actor MeshNode {
         }
         pendingResponses.removeAll()
 
+        // Close auxiliary sockets
+        for (_, auxSocket) in auxiliarySockets {
+            await auxSocket.close()
+        }
+        auxiliarySockets.removeAll()
+
         await socket.close()
         logger.info("Mesh node stopped")
+    }
+
+    // MARK: - Auxiliary Sockets (Multi-Endpoint Tunnels)
+
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    /// The auxiliary socket's receive handler feeds into the same `processEnvelope` path.
+    /// Returns the bound port number.
+    public func bindAuxiliaryPort() async throws -> UInt16 {
+        let auxSocket = UDPSocket(eventLoopGroup: eventLoopGroup)
+        try await auxSocket.bind(host: "::", port: 0)
+        guard let port = await auxSocket.port else {
+            await auxSocket.close()
+            throw UDPSocketError.notRunning
+        }
+        let boundPort = UInt16(port)
+
+        // Route incoming data on auxiliary socket through the same envelope processing
+        await auxSocket.onReceive { [weak self] data, address in
+            guard let self else { return }
+            await self.handleIncomingData(data, from: address)
+        }
+
+        auxiliarySockets[boundPort] = auxSocket
+        logger.info("Auxiliary socket bound on port \(boundPort)")
+        return boundPort
+    }
+
+    /// Close and remove an auxiliary socket.
+    public func unbindAuxiliaryPort(_ port: UInt16) async {
+        guard let auxSocket = auxiliarySockets.removeValue(forKey: port) else { return }
+        await auxSocket.close()
+        logger.info("Auxiliary socket unbound from port \(port)")
+    }
+
+    /// Send data to a specific endpoint, optionally via an auxiliary port.
+    /// If `viaPort` is nil or not found, uses the primary socket.
+    public func sendToEndpoint(_ data: Data, endpoint: String, viaPort: UInt16?) async throws {
+        let sendSocket: UDPSocket
+        if let port = viaPort, let auxSocket = auxiliarySockets[port] {
+            sendSocket = auxSocket
+        } else {
+            sendSocket = socket
+        }
+        try await sendSocket.sendRaw(data, to: endpoint)
     }
 
     // MARK: - Message Handling

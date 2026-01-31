@@ -29,6 +29,9 @@ public actor TunnelSession {
     // Receive callback (like ChannelProvider.onChannel pattern)
     private var receiveHandler: (@Sendable (Data) async -> Void)?
 
+    // Multi-endpoint set (nil = single primary endpoint)
+    private var endpointSet: EndpointSet?
+
     // Wire channel name for mesh transport
     private var wireChannel: String {
         "tunnel-\(channel)"
@@ -143,8 +146,21 @@ public actor TunnelSession {
             batchData = BatchWireFormat.packBatch(packets)
         }
 
-        // Send directly (not buffered) since tunnel already batched
-        try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
+        // If we have a multi-endpoint set with >1 endpoint, pick one for this flush
+        if let endpointSet = endpointSet, await endpointSet.count > 1 {
+            if let endpoint = await endpointSet.next(byteCount: batchData.count) {
+                try await provider.sendOnChannel(batchData, toEndpoint: endpoint.address,
+                                                  viaPort: endpoint.localPort,
+                                                  toMachine: remoteMachineId, channel: wireChannel)
+                await endpointSet.recordSend(to: endpoint.address, bytes: batchData.count)
+            } else {
+                // Fallback to primary
+                try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
+            }
+        } else {
+            // Single endpoint — use standard send
+            try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
+        }
 
         let appBytes = packets.reduce(0) { $0 + $1.count }
         stats.packetsSent += UInt64(packets.count)
@@ -216,6 +232,16 @@ public actor TunnelSession {
     /// Replace the receive handler for this session.
     public func onReceive(_ handler: (@Sendable (Data) async -> Void)?) {
         receiveHandler = handler
+    }
+
+    /// Set the endpoint set for multi-endpoint distribution.
+    public func setEndpointSet(_ set: EndpointSet) {
+        endpointSet = set
+    }
+
+    /// Get the endpoint set (for inspection/testing).
+    public func getEndpointSet() -> EndpointSet? {
+        endpointSet
     }
 
     // MARK: - Incoming Data
