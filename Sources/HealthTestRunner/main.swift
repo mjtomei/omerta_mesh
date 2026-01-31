@@ -839,6 +839,9 @@ func rampBandwidth(
         }
     }
 
+    // Let network recover before refinement
+    try await Task.sleep(for: .seconds(2))
+
     // Phase 2: Golden-section refinement around the peak
     // Bracket: one step below peak to one step above peak in the coarse grid
     let lo = peakIdx > 0 ? targetMbpsSteps[peakIdx - 1] : targetMbpsSteps[peakIdx] * 0.5
@@ -2283,8 +2286,9 @@ do {
     try? await vanillaChannel.close()
     try? await vanillaGroup.shutdownGracefully()
 
-    // Clean up Node B
+    // Clean up Node B and let network recover
     await sendControl("phase11-vanilla-done")
+    try await Task.sleep(for: .seconds(3))
 
     let phase11aPass = vanillaLatCount >= 100
     record("Phase 11a: Vanilla UDP Baseline", passed: phase11aPass,
