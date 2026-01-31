@@ -2931,74 +2931,68 @@ do {
     await sendControl("phase15-multiep-start")
     _ = await waitForAck("phase15-multiep-ack", timeout: .seconds(10))
 
-    // Use the existing manager — create a new session on a dedicated channel with 3 extra endpoints
-    let multiEpSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-multiep", extraEndpoints: 3)
-    try await Task.sleep(for: .seconds(2))  // Allow time for endpoint negotiation (request → ack → endpointOffer)
-
-    // Report endpoint count
-    let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: "health-test-multiep")
-    if let epSet = await manager.getEndpointSet(for: epKey) {
-        let epCount = await epSet.count
-        let epAddrs = await epSet.activeAddresses
-        logger.info("Multi-endpoint session has \(epCount) endpoint(s): \(epAddrs)")
-    }
-
-    // Ramp bandwidth on multi-endpoint tunnel (send-side only — no feedback from Node B
-    // because aux socket traffic congests the control channel through the single MeshNode actor)
-    logger.info("Multi-endpoint A\u{2192}B bandwidth ramp (1400B packets, 3 extra endpoints)")
-    let multiEpRampResult = try await rampBandwidth(
-        packetSize: 1400,
-        stepDuration: .seconds(1),
-        targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
-        send: { data in
-            try await multiEpSession.send(data)
-        },
-        flush: { try await multiEpSession.flush() },
-        getDelivered: { (0, 0) },  // No feedback — control channel congested by data traffic
-        resetReceiver: { },
-        logger: logger
-    )
-
-    // Use peak sent rate since delivered feedback is unavailable
-    let multiEpPeak = multiEpRampResult.peakSentMbps
     let singleEpPeak = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }.map(\.deliveredMbps).max() ?? 0
 
-    logger.info("Multi-endpoint peak sent: \(String(format: "%.1f", multiEpPeak)) Mbps vs single-endpoint: \(String(format: "%.1f", singleEpPeak)) Mbps")
-    if singleEpPeak > 0 {
-        logger.info("  Ratio: \(String(format: "%.2fx", multiEpPeak / singleEpPeak))")
-    }
+    // Test multiple endpoint counts: 4, 8, 16, 32 total (3, 7, 15, 31 extra)
+    let endpointCounts = [3, 7, 15, 31]
 
-    // Report per-endpoint stats
-    let rampDuration: Double
-    if let epSet = await manager.getEndpointSet(for: epKey) {
-        let allEps = await epSet.allEndpoints
-        let totalBytesSent = allEps.reduce(UInt64(0)) { $0 + $1.bytesSent }
-        rampDuration = multiEpRampResult.totalDurationSeconds
-        logger.info("Per-endpoint bandwidth breakdown (over \(String(format: "%.1fs", rampDuration)), \(allEps.count) endpoints):")
-        for ep in allEps {
-            let sentMbps = rampDuration > 0 ? Double(ep.bytesSent) * 8.0 / (rampDuration * 1_000_000.0) : 0
-            let pct = totalBytesSent > 0 ? Double(ep.bytesSent) * 100.0 / Double(totalBytesSent) : 0
-            logger.info("  \(ep.address) (local:\(ep.localPort.map { String($0) } ?? "primary")): \(String(format: "%.1f", sentMbps)) Mbps (\(String(format: "%.0f%%", pct)))")
+    for (runIdx, extraCount) in endpointCounts.enumerated() {
+        let totalEps = extraCount + 1
+        let channelName = "health-test-multiep-\(totalEps)"
+
+        logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
+
+        let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
+        try await Task.sleep(for: .seconds(2))  // Allow endpoint negotiation
+
+        let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
+        let actualEpCount: Int
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            actualEpCount = await epSet.count
+            logger.info("  Negotiated \(actualEpCount) endpoint(s)")
+        } else {
+            actualEpCount = 1
         }
+
+        logger.info("  Ramp: 1400B packets, \(actualEpCount) endpoints")
+        let rampResult = try await rampBandwidth(
+            packetSize: 1400,
+            stepDuration: .seconds(1),
+            targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
+            send: { data in try await session.send(data) },
+            flush: { try await session.flush() },
+            getDelivered: { (0, 0) },
+            resetReceiver: { },
+            logger: logger
+        )
+
+        let peak = rampResult.peakSentMbps
+        let duration = rampResult.totalDurationSeconds
+
+        // Per-endpoint breakdown
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            let allEps = await epSet.allEndpoints
+            let totalBytes = allEps.reduce(UInt64(0)) { $0 + $1.bytesSent }
+            logger.info("  Per-endpoint (\(String(format: "%.0fs", duration))):")
+            for ep in allEps {
+                let mbps = duration > 0 ? Double(ep.bytesSent) * 8.0 / (duration * 1_000_000.0) : 0
+                let pct = totalBytes > 0 ? Double(ep.bytesSent) * 100.0 / Double(totalBytes) : 0
+                let label = ep.address == "primary" ? "primary" : "aux:\(ep.localPort ?? 0)"
+                logger.info("    \(label): \(String(format: "%.1f", mbps)) Mbps (\(String(format: "%.0f%%", pct)))")
+            }
+        }
+
+        logger.info("  Peak sent: \(String(format: "%.1f", peak)) Mbps")
+
+        record("Phase 15: \(totalEps)-EP BW", passed: peak > 0,
+               detail: "endpoints=\(actualEpCount), peak-sent=\(String(format: "%.1f", peak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", peak / singleEpPeak) : "N/A")")
+
+        // Close session before next run to free aux ports
+        await manager.closeSession(key: epKey)
+        try await Task.sleep(for: .seconds(1))
     }
 
     await sendControl("phase15-multiep-done")
-
-    // Build detail string with endpoint count and per-endpoint breakdown
-    var epDetail = ""
-    if let epSet = await manager.getEndpointSet(for: epKey) {
-        let epCount = await epSet.count
-        let allEps = await epSet.allEndpoints
-        let perEp = allEps.map { ep -> String in
-            let mb = Double(ep.bytesSent) * 8.0 / 1_000_000.0
-            let label = ep.address == "primary" ? "primary" : "aux:\(ep.localPort ?? 0)"
-            return "\(label)=\(String(format: "%.0f", mb))Mb"
-        }.joined(separator: " ")
-        epDetail = "endpoints=\(epCount), \(perEp), "
-    }
-
-    record("Phase 15: Multi-Endpoint BW", passed: multiEpPeak > 0,
-           detail: "\(epDetail)peak-sent=\(String(format: "%.1f", multiEpPeak))Mbps, single-ep=\(String(format: "%.1f", singleEpPeak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", multiEpPeak / singleEpPeak) : "N/A")")
 } catch {
     record("Phase 15: Multi-Endpoint BW", passed: false, detail: "Error: \(error)")
 }
