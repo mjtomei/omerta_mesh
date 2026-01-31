@@ -2145,6 +2145,13 @@ record("Phase 10: Latency & Jitter", passed: true,
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
 do {
+    // Suspend health monitoring during bandwidth tests to prevent false failures
+    // from network saturation starving probe packets
+    if let mon = monitor {
+        await mon.stopMonitoring()
+        logger.info("Health monitoring suspended for bandwidth phases")
+    }
+
     // Tell Node B to start vanilla echo server
     await sendControl("phase11-vanilla-start")
     guard let readyMsg = await waitForPhase("phase11-vanilla-ready", timeout: .seconds(30)),
