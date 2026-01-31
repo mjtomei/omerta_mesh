@@ -116,3 +116,21 @@ public extension ChannelSender {
         try await sendOnChannel(data, toMachine: machineId, channel: channel)
     }
 }
+
+// MARK: - Auxiliary Port Provider
+
+/// Protocol for providers that can bind auxiliary UDP ports for multi-endpoint tunnels.
+/// Conforming types can create extra sockets on OS-assigned ports and send envelope-wrapped
+/// data through them.
+public protocol AuxiliaryPortProvider: AnyObject, Sendable {
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    /// Returns the bound port number.
+    func bindAuxiliaryPort() async throws -> UInt16
+
+    /// Close and remove an auxiliary socket.
+    func unbindAuxiliaryPort(_ port: UInt16) async
+
+    /// Get the local address (host) that a given remote machine can reach us on.
+    /// Returns "host:primaryPort" or just "host", depending on implementation.
+    func localAddressForMachine(_ machineId: MachineId) async -> String?
+}

@@ -549,6 +549,48 @@ public actor MeshNode {
         try await sendSocket.sendRaw(data, to: endpoint)
     }
 
+    /// Send an envelope-wrapped message to a specific endpoint via an auxiliary socket.
+    /// This wraps data in a signed/encrypted envelope (same as normal send) but routes
+    /// through the specified auxiliary socket instead of the primary.
+    public func sendEnvelope(_ message: MeshMessage, to endpoint: String, channel: String = "", viaPort: UInt16?) async throws {
+        let envelope = try MeshEnvelope.signed(
+            from: identity,
+            machineId: machineId,
+            to: nil,
+            channel: channel,
+            payload: message
+        )
+        let encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+
+        let sendSocket: UDPSocket
+        if let port = viaPort, let auxSocket = auxiliarySockets[port] {
+            sendSocket = auxSocket
+        } else {
+            sendSocket = socket
+        }
+        try await sendSocket.send(encryptedData, to: endpoint)
+    }
+
+    /// Get the local address that a remote machine can use to reach us.
+    /// Returns the host portion (e.g. "192.0.2.1") or nil if unknown.
+    public func localAddressForMachine(_ machineId: MachineId) async -> String? {
+        // Look up the peer for this machine
+        guard let peerId = await machinePeerRegistry.getMostRecentPeer(for: machineId) else { return nil }
+
+        // Get the peer's endpoint (this is THEIR address)
+        let endpoints = await endpointManager.getEndpoints(peerId: peerId, machineId: machineId)
+        guard let endpoint = EndpointUtils.preferredEndpoint(from: endpoints),
+              let remoteHost = EndpointUtils.hostFromEndpoint(endpoint) else { return nil }
+
+        // For IPv4 LAN: find our local address on the same subnet
+        if EndpointUtils.isIPv4(endpoint) {
+            return EndpointUtils.localIPv4OnSameSubnet(as: remoteHost)
+        }
+
+        // For IPv6: use our best local IPv6 address
+        return EndpointUtils.getBestLocalIPv6Address()
+    }
+
     // MARK: - Message Handling
 
     /// Register a handler for incoming messages
@@ -2373,6 +2415,16 @@ extension MeshNode: MeshNodeServices {
 
         let message = MeshMessage.data(data)
         try await send(message, to: endpoint, channel: channel)
+    }
+
+    /// Send data on a channel to a specific endpoint via an optional auxiliary port.
+    /// Wraps in a signed/encrypted envelope and sends via the auxiliary socket if specified.
+    public func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        guard ChannelUtils.isValid(channel) else {
+            throw MeshNodeError.invalidChannel(channel)
+        }
+        let message = MeshMessage.data(data)
+        try await sendEnvelope(message, to: endpoint, channel: channel, viaPort: localPort)
     }
 
     /// Handle incoming message on a channel (string-based, for v1 compatibility)

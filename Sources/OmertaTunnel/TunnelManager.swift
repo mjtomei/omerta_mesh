@@ -206,7 +206,7 @@ public actor TunnelManager {
     ///   - machineId: The remote machine ID
     ///   - channel: The logical channel name (defaults to "data")
     /// - Returns: The tunnel session (existing or newly created)
-    public func getSession(machineId: MachineId, channel: String = "data", receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
+    public func getSession(machineId: MachineId, channel: String = "data", extraEndpoints: Int? = nil, receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
         guard isRunning else {
             throw TunnelError.notConnected
         }
@@ -232,7 +232,8 @@ public actor TunnelManager {
         let sid = UUID().uuidString.prefix(8).lowercased()
 
         // Send handshake with channel info (include extra endpoints request if configured)
-        let extraRequested = config.extraEndpoints > 0 ? config.extraEndpoints : nil
+        let effectiveExtra = extraEndpoints ?? config.extraEndpoints
+        let extraRequested = effectiveExtra > 0 ? effectiveExtra : nil
         let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid),
                                          extraEndpointsRequested: extraRequested)
         let data = try JSONEncoder().encode(handshake)
@@ -251,7 +252,7 @@ public actor TunnelManager {
         sessionIds[key] = String(sid)
         await ensureWireChannelRegistered(for: channel)
 
-        // Initialize endpoint set with primary endpoint
+        // Initialize endpoint set (primary endpoint will be added when ack arrives with extras)
         let endpointSet = EndpointSet()
         endpointSets[key] = endpointSet
         await newSession.setEndpointSet(endpointSet)
@@ -468,8 +469,34 @@ public actor TunnelManager {
                 endpointSets[key] = endpointSet
                 await newSession.setEndpointSet(endpointSet)
 
-                // Send ack (with extra endpoints if requested)
-                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
+                // Bind auxiliary ports if requested and provider supports it
+                var extraEndpointAddrs: [String]? = nil
+                if let requested = handshake.extraEndpointsRequested, requested > 0,
+                   let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var addrs: [String] = []
+                        for _ in 0..<requested {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                addrs.append(addr)
+                                await endpointSet.add(address: addr, localPort: auxPort)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                logger.info("Bound auxiliary port \(auxPort) for inbound session")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !addrs.isEmpty {
+                            extraEndpointAddrs = addrs
+                        }
+                    }
+                }
+
+                // Send ack (with extra endpoints if we bound any)
+                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId,
+                                           extraEndpoints: extraEndpointAddrs)
                 if let ackData = try? JSONEncoder().encode(ack) {
                     try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
                 }
@@ -508,10 +535,46 @@ public actor TunnelManager {
             // If ack includes extra endpoints, add them to our EndpointSet
             if let extras = handshake.extraEndpoints, !extras.isEmpty,
                let endpointSet = endpointSets[key] {
+                // Add primary endpoint first (localPort nil = primary socket, address "primary" = sentinel)
+                await endpointSet.add(address: "primary", localPort: nil)
+
                 for ep in extras {
                     await endpointSet.add(address: ep, localPort: nil)
                 }
-                logger.info("Received \(extras.count) extra endpoint(s) from ack", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from ack, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+
+                // Bind our own auxiliary ports (one per remote extra endpoint)
+                // and pair each with a remote endpoint for sending.
+                // Also send our aux port addresses back so the remote can send to us.
+                if let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var ourAddrs: [String] = []
+                        // Re-add remote extras with paired local aux ports
+                        for remoteEp in extras {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                ourAddrs.append(addr)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                // Update the endpoint entry with the local port for sending
+                                await endpointSet.updateLocalPort(for: remoteEp, localPort: auxPort)
+                                logger.info("Bound auxiliary port \(auxPort) → remote \(remoteEp)")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !ourAddrs.isEmpty {
+                            let offer = SessionHandshake(type: .endpointOffer, channel: channel,
+                                                          sessionId: handshake.sessionId,
+                                                          extraEndpoints: ourAddrs)
+                            if let offerData = try? JSONEncoder().encode(offer) {
+                                try? await provider.sendOnChannel(offerData, toMachine: machineId, channel: handshakeChannel)
+                            }
+                        }
+                    }
+                }
             }
             logger.debug("Session ack received", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
 
@@ -519,10 +582,21 @@ public actor TunnelManager {
             let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
             if let extras = handshake.extraEndpoints, !extras.isEmpty,
                let endpointSet = endpointSets[key] {
-                for ep in extras {
-                    await endpointSet.add(address: ep, localPort: nil)
+                // Add primary endpoint first
+                await endpointSet.add(address: "primary", localPort: nil)
+
+                // The responder already has its own aux ports bound (from the .request handler).
+                // Now pair each remote extra endpoint with one of our local aux ports.
+                let ourAuxPorts = auxiliaryPorts.keys.filter { port in
+                    auxiliaryPorts[port]?.contains(key) == true
+                }.sorted()
+
+                for (i, ep) in extras.enumerated() {
+                    let localPort = i < ourAuxPorts.count ? ourAuxPorts[i] : nil
+                    await endpointSet.add(address: ep, localPort: localPort)
                 }
-                logger.info("Received \(extras.count) extra endpoint(s) from offer", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from offer, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
             }
 
         case .reject:

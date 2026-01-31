@@ -52,6 +52,22 @@ public actor EndpointSet {
         ))
     }
 
+    /// Update the local port for an existing endpoint (used when pairing local aux with remote aux).
+    public func updateLocalPort(for address: String, localPort: UInt16) {
+        guard let idx = endpoints.firstIndex(where: { $0.address == address }) else { return }
+        var ep = endpoints[idx]
+        endpoints[idx] = ActiveEndpoint(
+            address: ep.address,
+            localPort: localPort,
+            weight: ep.weight,
+            bytesSent: ep.bytesSent,
+            bytesAcked: ep.bytesAcked,
+            deficit: ep.deficit,
+            consecutiveFailures: ep.consecutiveFailures,
+            lastSuccess: ep.lastSuccess
+        )
+    }
+
     /// Remove an endpoint from the set. Returns true if any endpoints remain.
     @discardableResult
     public func prune(address: String) -> Bool {
