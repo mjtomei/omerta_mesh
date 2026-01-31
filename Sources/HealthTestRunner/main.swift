@@ -842,11 +842,16 @@ func rampBandwidth(
     // Phase 2: Golden-section refinement around the peak
     // Bracket: one step below peak to one step above peak in the coarse grid
     let lo = peakIdx > 0 ? targetMbpsSteps[peakIdx - 1] : targetMbpsSteps[peakIdx] * 0.5
-    let hi: Double
+    var hi: Double
     if peakIdx + 1 < targetMbpsSteps.count && peakIdx + 1 < steps.count + 1 {
         hi = targetMbpsSteps[peakIdx + 1]
     } else {
         hi = targetMbpsSteps[peakIdx] * 1.5
+    }
+    // Cap upper bound at what the sender could actually achieve (avoid flooding)
+    let peakSentMbps = steps.map(\.sentMbps).max() ?? hi
+    if hi > peakSentMbps * 1.2 {
+        hi = peakSentMbps * 1.2
     }
 
     // Only refine if the bracket is wide enough to be worth it (>20% of peak)
