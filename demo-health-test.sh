@@ -21,16 +21,30 @@
 
 set -euo pipefail
 
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 <ssh-host> <remote-path>"
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <ssh-host> <remote-path> [--phase N]"
     echo ""
     echo "  ssh-host     SSH destination (e.g. 'mac', 'user@192.0.2.10')"
     echo "  remote-path  Absolute path on remote to clone into (must not exist)"
+    echo "  --phase N    Run only phase N (and setup phase 1)"
     exit 1
 fi
 
 REMOTE_HOST="$1"
 REMOTE_PATH="$2"
+shift 2
+PHASE_ARG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --phase)
+            PHASE_ARG="--phase $2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 # Validate remote-path is absolute
 if [[ "$REMOTE_PATH" != /* ]]; then
@@ -154,7 +168,7 @@ ssh "$REMOTE_HOST" "command -v codesign >/dev/null 2>&1 && codesign -s - --force
 
 # --- Step 6: Start Node B (remote) ---
 echo "[6/7] Starting Node B on $REMOTE_HOST..."
-ssh "$REMOTE_HOST" "sudo -n $REMOTE_BIN --role nodeB --port $PORT --lan --remote-host $LOCAL_IP" > "$NODE_B_LOG" 2>&1 &
+ssh "$REMOTE_HOST" "sudo -n $REMOTE_BIN --role nodeB --port $PORT --lan --remote-host $LOCAL_IP $PHASE_ARG" > "$NODE_B_LOG" 2>&1 &
 NODE_B_PID=$!
 sleep 3
 
@@ -168,7 +182,7 @@ echo "  Node B running (PID $NODE_B_PID)"
 
 # --- Step 7: Start Node A (local, orchestrator) ---
 echo "[7/7] Starting Node A locally..."
-sudo -n "$LOCAL_BIN" --role nodeA --port "$PORT" --lan --remote-host "$REMOTE_IP" > "$NODE_A_LOG" 2>&1 &
+sudo -n "$LOCAL_BIN" --role nodeA --port "$PORT" --lan --remote-host "$REMOTE_IP" $PHASE_ARG > "$NODE_A_LOG" 2>&1 &
 NODE_A_PID=$!
 
 # Wait for Node A to finish (it's the orchestrator)

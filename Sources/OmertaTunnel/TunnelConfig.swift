@@ -67,6 +67,9 @@ public struct TunnelManagerConfig: Sendable {
     /// Batch configuration for tunnel traffic (overrides channel-level config)
     public var batchConfig: BatchConfig?
 
+    /// Number of extra endpoints to negotiate per tunnel session (0 = single endpoint)
+    public var extraEndpoints: Int = 0
+
     public static let `default` = TunnelManagerConfig()
 
     public init(
@@ -76,7 +79,8 @@ public struct TunnelManagerConfig: Sendable {
         healthProbeMaxInterval: Duration = .seconds(15),
         healthFailureThreshold: Int = 3,
         healthGraceIntervals: Int = 3,
-        batchConfig: BatchConfig? = nil
+        batchConfig: BatchConfig? = nil,
+        extraEndpoints: Int = 0
     ) {
         self.maxSessionsPerMachine = maxSessionsPerMachine
         self.maxTotalSessions = maxTotalSessions
@@ -85,5 +89,6 @@ public struct TunnelManagerConfig: Sendable {
         self.healthFailureThreshold = healthFailureThreshold
         self.healthGraceIntervals = healthGraceIntervals
         self.batchConfig = batchConfig
+        self.extraEndpoints = extraEndpoints
     }
 }
