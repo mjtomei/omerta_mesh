@@ -64,7 +64,8 @@ public struct NetworkKey: Sendable, Codable, Equatable {
         self.bootstrapPeers = bootstrapPeers
         self.createdAt = createdAt
         let keyBytes = [UInt8](networkKey)
-        // AEADContext init only fails for wrong key size; 32-byte keys always succeed
+        precondition(keyBytes.count == 32, "NetworkKey must be exactly 32 bytes (256 bits); got \(keyBytes.count)")
+        // AEADContext init only fails for wrong key size; precondition above guarantees 32 bytes
         self.aeadContext = try! AEADContext(key: keyBytes)
         self.headerAeadContext = try! AEADContext(key: Self.deriveHeaderKeyBytes(from: networkKey))
     }
@@ -75,8 +76,22 @@ public struct NetworkKey: Sendable, Codable, Equatable {
         self.networkName = try container.decode(String.self, forKey: .networkName)
         self.bootstrapPeers = try container.decode([String].self, forKey: .bootstrapPeers)
         self.createdAt = try container.decode(Date.self, forKey: .createdAt)
-        self.aeadContext = try! AEADContext(key: [UInt8](networkKey))
-        self.headerAeadContext = try! AEADContext(key: Self.deriveHeaderKeyBytes(from: networkKey))
+        let keyBytes = [UInt8](networkKey)
+        guard keyBytes.count == 32 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .networkKey,
+                in: container,
+                debugDescription: "networkKey must be 32 bytes (256 bits); got \(keyBytes.count)")
+        }
+        do {
+            self.aeadContext = try AEADContext(key: keyBytes)
+            self.headerAeadContext = try AEADContext(key: Self.deriveHeaderKeyBytes(from: networkKey))
+        } catch {
+            throw DecodingError.dataCorruptedError(
+                forKey: .networkKey,
+                in: container,
+                debugDescription: "Failed to initialize AEADContext: \(error)")
+        }
     }
 
     public static func == (lhs: NetworkKey, rhs: NetworkKey) -> Bool {
