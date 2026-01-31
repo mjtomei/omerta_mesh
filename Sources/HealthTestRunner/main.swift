@@ -1430,6 +1430,14 @@ if !isNodeA {
             await sendControl("phase12-bw-reverse-done", detail: "\(revSentBytes12),\(revNanos12)")
             logger.info("Node B: B→A sent \(revSentBytes12) bytes in \(revNanos12)ns")
 
+        case "suspend-health":
+            // Suspend health monitoring on Node B during bandwidth phases
+            if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+                await mon.stopMonitoring()
+                logger.info("Node B: health monitoring suspended")
+            }
+            await sendControl("suspend-health-ack")
+
         case "ramp-step-reset":
             // Reset the active BandwidthMeasurer for a new ramp step
             if let measurer = nodeBBwMeasurer {
@@ -2145,12 +2153,14 @@ record("Phase 10: Latency & Jitter", passed: true,
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
 do {
-    // Suspend health monitoring during bandwidth tests to prevent false failures
-    // from network saturation starving probe packets
+    // Suspend health monitoring on both nodes during bandwidth tests to prevent
+    // false failures from network saturation starving probe packets
     if let mon = monitor {
         await mon.stopMonitoring()
         logger.info("Health monitoring suspended for bandwidth phases")
     }
+    await sendControl("suspend-health")
+    _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
 
     // Tell Node B to start vanilla echo server
     await sendControl("phase11-vanilla-start")
