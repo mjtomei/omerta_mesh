@@ -750,6 +750,7 @@ struct PerfSummary {
     var meshHistogram: [(label: String, count: Int)] = []
     var batchSweep: [BatchSweepResult] = []
     var tcpBandwidth: [BandwidthResult] = []
+    var probeDeliveredMbps: Double = 0
     var recoveryPreSwapMedian: Double = 0
     var recoveryPeakLatency: Double = 0
     var recoveryTimeSeconds: Double = 0
@@ -2275,9 +2276,25 @@ do {
     perfSummary.meshBandwidth.append(BandwidthResult(packetSize: meshRevPktSize, direction: "B\u{2192}A", sentMbps: meshBToASentMbps, deliveredMbps: meshBToADeliveredMbps))
     logger.info("Mesh B\u{2192}A: sent=\(String(format: "%.1f", meshBToASentMbps)) Mbps, delivered=\(String(format: "%.1f", meshBToADeliveredMbps)) Mbps")
 
+    // Query health-probe-reported delivered bandwidth and compare to side-channel measurement
+    let bwKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: "health-test-bw")
+    let probeStats = await manager.deliveredTrafficStats(for: bwKey)
+    let probeMbps: Double
+    if let probeStats {
+        probeMbps = Double(probeStats.bytesPerSecond) * 8.0 / 1_000_000.0
+    } else {
+        probeMbps = 0
+    }
+    logger.info("Bandwidth comparison: side-channel=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps, health-probe=\(String(format: "%.1f", probeMbps))Mbps")
+    if meshDeliveredAtoBMbps > 0 && probeMbps > 0 {
+        let ratio = probeMbps / meshDeliveredAtoBMbps
+        logger.info("  health-probe / side-channel = \(String(format: "%.2f", ratio))x")
+    }
+    perfSummary.probeDeliveredMbps = probeMbps
+
     let bestMeshMbps = perfSummary.meshBandwidthMbps
     record("Phase 12: Mesh Bandwidth", passed: bestMeshMbps > 0,
-           detail: "best A\u{2192}B sent=\(String(format: "%.1f", bestMeshMbps))Mbps delivered=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
+           detail: "best A\u{2192}B sent=\(String(format: "%.1f", bestMeshMbps))Mbps delivered=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps probe=\(String(format: "%.1f", probeMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
 }
@@ -2658,6 +2675,19 @@ do {
         }
         for r in meshBtoA {
             logger.info("Mesh Tunnel     \(String(format: "%10.1f", r.sentMbps))     \(String(format: "%10.1f", r.deliveredMbps))")
+        }
+    }
+
+    // Health probe vs side-channel bandwidth comparison
+    if perfSummary.probeDeliveredMbps > 0 {
+        let sideChannelMbps = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }.map(\.deliveredMbps).max() ?? 0
+        logger.info("")
+        logger.info("=== DELIVERED BANDWIDTH: PROBE vs SIDE-CHANNEL ===")
+        logger.info("Side-channel (B reports via control):  \(String(format: "%8.1f", sideChannelMbps)) Mbps")
+        logger.info("Health probe (B reports via probe):    \(String(format: "%8.1f", perfSummary.probeDeliveredMbps)) Mbps")
+        if sideChannelMbps > 0 {
+            let ratio = perfSummary.probeDeliveredMbps / sideChannelMbps
+            logger.info("Ratio (probe / side-channel):          \(String(format: "%8.2f", ratio))x")
         }
     }
 
