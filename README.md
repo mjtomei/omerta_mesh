@@ -147,6 +147,7 @@ OmertaMesh uses the following notable third-party libraries:
 - **[gVisor netstack](https://gvisor.dev/)** (Apache-2.0) - Userspace TCP/IP stack for the OmertaTunnel module
 - **[Swift NIO](https://github.com/apple/swift-nio)** (Apache-2.0) - Non-blocking I/O
 - **[Swift Crypto](https://github.com/apple/swift-crypto)** (Apache-2.0) - Cryptographic operations
+- **[BoringSSL](https://boringssl.googlesource.com/boringssl/)** (Apache-2.0) - Vendored via swift-crypto for direct C API access in crypto benchmarks
 
 See [licenses/](licenses/) for complete license information.
 
