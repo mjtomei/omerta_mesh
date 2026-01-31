@@ -112,6 +112,6 @@ Requires the `CBoringSSL` vendored target for Part A tests. Part B tests are pur
 
 ## Environment
 
-- Swift 5.9+ (tested with 5.10 on Linux, 5.9.2 on macOS)
+- Swift 6.2.3
 - Linux: Ubuntu on x86_64
 - macOS: Apple Silicon (arm64)
