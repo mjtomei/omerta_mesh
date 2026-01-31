@@ -520,9 +520,10 @@ public actor MeshNode {
         let boundPort = UInt16(port)
 
         // Route incoming data on auxiliary socket through the same envelope processing
+        // but skip endpoint recording (aux port addresses would pollute the endpoint table)
         await auxSocket.onReceive { [weak self] data, address in
             guard let self else { return }
-            await self.handleIncomingData(data, from: address)
+            await self.handleIncomingData(data, from: address, isAuxiliary: true)
         }
 
         auxiliarySockets[boundPort] = auxSocket
@@ -599,7 +600,7 @@ public actor MeshNode {
     }
 
     /// Handle incoming UDP data
-    private func handleIncomingData(_ data: Data, from address: NIOCore.SocketAddress) async {
+    private func handleIncomingData(_ data: Data, from address: NIOCore.SocketAddress, isAuxiliary: Bool = false) async {
         logger.info("Received \(data.count) bytes from \(address)")
 
         // Try v2 wire format first (fast path rejection for non-Omerta packets)
@@ -607,7 +608,7 @@ public actor MeshNode {
             do {
                 // Use decodeV2WithHash to get the raw channel hash for routing
                 let (envelope, channelHash) = try MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey)
-                await processEnvelope(envelope, from: address, channelHash: channelHash)
+                await processEnvelope(envelope, from: address, channelHash: channelHash, skipEndpointRecording: isAuxiliary)
                 return
             } catch EnvelopeError.networkMismatch {
                 logger.debug("Packet for different network from \(address)")
@@ -637,7 +638,7 @@ public actor MeshNode {
     ///   - envelope: The decoded envelope
     ///   - address: Source address
     ///   - channelHash: Raw channel hash from v2 format (nil for v1 format, uses string-based lookup)
-    private func processEnvelope(_ envelope: MeshEnvelope, from address: NIOCore.SocketAddress, channelHash: UInt16? = nil) async {
+    private func processEnvelope(_ envelope: MeshEnvelope, from address: NIOCore.SocketAddress, channelHash: UInt16? = nil, skipEndpointRecording: Bool = false) async {
 
         // Check for duplicates
         if seenMessageIds.contains(envelope.messageId) {
@@ -683,17 +684,21 @@ public actor MeshNode {
             return
         }
 
-        // Update peer info and track endpoint
         let endpointString = formatEndpoint(address)
-        await updatePeerConnectionFromMessage(peerId: envelope.fromPeerId, endpoint: endpointString)
 
-        // Record in endpoint manager for multi-endpoint tracking
-        logger.info("Recording endpoint for peer \(envelope.fromPeerId.prefix(16))... machine \(envelope.machineId.prefix(16))... at \(endpointString)")
-        await endpointManager.recordMessageReceived(
-            from: envelope.fromPeerId,
-            machineId: envelope.machineId,
-            endpoint: endpointString
-        )
+        // Update peer info and track endpoint (skip for auxiliary socket traffic
+        // whose source addresses would pollute the endpoint table)
+        if !skipEndpointRecording {
+            await updatePeerConnectionFromMessage(peerId: envelope.fromPeerId, endpoint: endpointString)
+
+            // Record in endpoint manager for multi-endpoint tracking
+            logger.info("Recording endpoint for peer \(envelope.fromPeerId.prefix(16))... machine \(envelope.machineId.prefix(16))... at \(endpointString)")
+            await endpointManager.recordMessageReceived(
+                from: envelope.fromPeerId,
+                machineId: envelope.machineId,
+                endpoint: endpointString
+            )
+        }
 
         // Record machine-peer association in registry
         await machinePeerRegistry.setMachine(envelope.machineId, peer: envelope.fromPeerId)
