@@ -823,9 +823,19 @@ func rampBandwidth(
             peakIdx = idx
         }
 
+        // Stop if delivered has dropped well below peak
         if steps.count >= 3 && step.deliveredMbps < 0.7 * peakDelivered {
             logger.info("  ramp: stopping early — delivered \(String(format: "%.1f", step.deliveredMbps)) < 70% of peak \(String(format: "%.1f", peakDelivered))")
             break
+        }
+
+        // Stop if sender is saturated (can't reach target) for two consecutive steps
+        if steps.count >= 2 && step.sentMbps < targetMbps * 0.7 {
+            let prevStep = steps[steps.count - 2]
+            if prevStep.sentMbps < prevStep.targetMbps * 0.7 {
+                logger.info("  ramp: stopping — sender saturated at \(String(format: "%.1f", step.sentMbps)) Mbps (target \(String(format: "%.1f", targetMbps)))")
+                break
+            }
         }
     }
 
