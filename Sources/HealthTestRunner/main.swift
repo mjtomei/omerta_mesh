@@ -2943,7 +2943,7 @@ do {
         logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
 
         let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
-        try await Task.sleep(for: .seconds(2))  // Allow endpoint negotiation
+        try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
 
         let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
         let actualEpCount: Int
@@ -2987,9 +2987,9 @@ do {
         record("Phase 15: \(totalEps)-EP BW", passed: peak > 0,
                detail: "endpoints=\(actualEpCount), peak-sent=\(String(format: "%.1f", peak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", peak / singleEpPeak) : "N/A")")
 
-        // Close session before next run to free aux ports
+        // Close session before next run to free aux ports, and allow actor queues to drain
         await manager.closeSession(key: epKey)
-        try await Task.sleep(for: .seconds(1))
+        try await Task.sleep(for: .seconds(3))
     }
 
     await sendControl("phase15-multiep-done")
