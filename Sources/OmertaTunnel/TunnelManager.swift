@@ -515,8 +515,12 @@ public actor TunnelManager {
                 // Send ack (with extra endpoints if we bound any)
                 let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId,
                                            extraEndpoints: extraEndpointAddrs)
-                if let ackData = try? JSONEncoder().encode(ack) {
-                    try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                do {
+                    let ackData = try JSONEncoder().encode(ack)
+                    try await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                    logger.info("Sent ack with \(extraEndpointAddrs?.count ?? 0) extra endpoint(s)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                } catch {
+                    logger.error("Failed to send ack: \(error)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
                 }
 
                 // Start health monitor for this machine if first session
