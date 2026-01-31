@@ -304,6 +304,24 @@ public actor TunnelManager {
         deliveredStats.removeValue(forKey: key)
         endpointSets.removeValue(forKey: key)
 
+        // Unbind auxiliary ports associated with this session
+        if let auxProvider = provider as? AuxiliaryPortProvider {
+            var portsToUnbind: [UInt16] = []
+            for (port, var keys) in auxiliaryPorts {
+                keys.remove(key)
+                if keys.isEmpty {
+                    portsToUnbind.append(port)
+                    auxiliaryPorts.removeValue(forKey: port)
+                } else {
+                    auxiliaryPorts[port] = keys
+                }
+            }
+            for port in portsToUnbind {
+                await auxProvider.unbindAuxiliaryPort(port)
+                logger.info("Unbound auxiliary port \(port) for closed session")
+            }
+        }
+
         logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
         // Notify remote machine
