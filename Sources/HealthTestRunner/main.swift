@@ -2241,7 +2241,7 @@ do {
     logger.info("Vanilla A\u{2192}B bandwidth ramp (1400B packets)")
     let vanillaRampResult = try await rampBandwidth(
         packetSize: 1400,
-        stepDuration: .seconds(2),
+        stepDuration: .seconds(1),
         targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
         send: { data in
             let buf = vanillaChannel.allocator.buffer(bytes: data)
@@ -2282,7 +2282,7 @@ do {
     let reversePacketSize = 1400
     // Compute packet count from peak rate over 2 seconds
     let reversePeakMbps = max(vanillaRampResult.peakTargetMbps, 1.0)
-    let reversePacketCount = Int(reversePeakMbps * 1e6 / 8.0 * 2.0 / Double(reversePacketSize))
+    let reversePacketCount = Int(reversePeakMbps * 1e6 / 8.0 * 1.0 / Double(reversePacketSize))
     let vanillaPort = vanillaChannel.localAddress?.port ?? 0
     await sendControl("phase11-udp-reverse-go", detail: "\(reversePacketSize),\(reversePacketCount),\(vanillaPort)")
 
@@ -2477,7 +2477,7 @@ do {
     logger.info("Mesh A\u{2192}B bandwidth ramp (1400B packets)")
     let meshRampResult = try await rampBandwidth(
         packetSize: 1400,
-        stepDuration: .seconds(2),
+        stepDuration: .seconds(1),
         targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
         send: { data in
             try await bwSession.send(data)
@@ -2515,7 +2515,7 @@ do {
     }
     let meshRevPktSize = 1400
     let meshRevPeakMbps = max(meshRampResult.peakTargetMbps, 1.0)
-    let meshRevPktCount = Int(meshRevPeakMbps * 1e6 / 8.0 * 2.0 / Double(meshRevPktSize))
+    let meshRevPktCount = Int(meshRevPeakMbps * 1e6 / 8.0 * 1.0 / Double(meshRevPktSize))
     await sendControl("phase12-bw-reverse-start", detail: "\(meshRevPktSize),\(meshRevPktCount)")
 
     var meshBToASentMbps: Double = 0
