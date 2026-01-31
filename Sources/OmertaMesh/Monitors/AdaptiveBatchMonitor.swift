@@ -80,7 +80,7 @@ public actor AdaptiveBatchMonitor: BatchMonitor {
             return nil
         }
 
-        let currentBandwidth = Double(currentTraffic.bytesPerSecond)
+        let currentBandwidth = Double(currentTraffic.deliveredBytesPerSecond ?? currentTraffic.bytesPerSecond)
         let currentLatency = currentTraffic.averageLatencyMicroseconds
 
         defer {

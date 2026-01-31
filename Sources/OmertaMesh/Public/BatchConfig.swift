@@ -62,17 +62,22 @@ public struct TrafficStats: Sendable {
     public var packetsPerSecond: UInt64
     public var activeEndpoints: Int
     public var averageLatencyMicroseconds: Double
+    /// Delivered (acknowledged by remote) bytes per second, if available.
+    /// When non-nil, this reflects actual throughput as reported by the receiver.
+    public var deliveredBytesPerSecond: UInt64?
 
     public init(
         bytesPerSecond: UInt64 = 0,
         packetsPerSecond: UInt64 = 0,
         activeEndpoints: Int = 0,
-        averageLatencyMicroseconds: Double = 0
+        averageLatencyMicroseconds: Double = 0,
+        deliveredBytesPerSecond: UInt64? = nil
     ) {
         self.bytesPerSecond = bytesPerSecond
         self.packetsPerSecond = packetsPerSecond
         self.activeEndpoints = activeEndpoints
         self.averageLatencyMicroseconds = averageLatencyMicroseconds
+        self.deliveredBytesPerSecond = deliveredBytesPerSecond
     }
 }
 
