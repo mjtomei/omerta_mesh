@@ -2152,16 +2152,22 @@ record("Phase 10: Latency & Jitter", passed: true,
 
 logPhase("Phase 11a: Vanilla UDP Baseline")
 
-do {
-    // Suspend health monitoring on both nodes during bandwidth tests to prevent
-    // false failures from network saturation starving probe packets
-    if let mon = monitor {
-        await mon.stopMonitoring()
-        logger.info("Health monitoring suspended for bandwidth phases")
-    }
-    await sendControl("suspend-health")
-    _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+// Suspend health monitoring on both nodes before bandwidth phases.
+// Must be outside the do/catch so it runs even if early phases left monitors in a bad state.
+if let mon = monitor {
+    await mon.stopMonitoring()
+    logger.info("Health monitoring suspended for bandwidth phases (Node A)")
+}
+// Also refresh the monitor reference in case it was recreated
+if let freshMon = await manager.getHealthMonitor(for: remoteMachineId) {
+    await freshMon.stopMonitoring()
+}
+await sendControl("suspend-health")
+_ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+// Wait for any in-flight failure callbacks to settle
+try await Task.sleep(for: .seconds(1))
 
+do {
     // Tell Node B to start vanilla echo server
     await sendControl("phase11-vanilla-start")
     guard let readyMsg = await waitForPhase("phase11-vanilla-ready", timeout: .seconds(30)),
