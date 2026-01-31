@@ -22,6 +22,37 @@ public struct NetworkKey: Sendable, Codable, Equatable {
     /// When this key was created
     public let createdAt: Date
 
+    /// Pre-initialized AEAD context for the network (payload) key.
+    /// Avoids ~455 ns key schedule computation on every seal/open call.
+    /// Thread-safe for concurrent use.
+    public let aeadContext: AEADContext
+
+    /// Pre-initialized AEAD context for the HKDF-derived header key.
+    /// Used to encrypt routing and auth headers in the v3 wire format.
+    public let headerAeadContext: AEADContext
+
+    /// The network key as [UInt8] for use with DirectCrypto APIs.
+    public var keyBytes: [UInt8] { [UInt8](networkKey) }
+
+    // Custom CodingKeys to exclude aeadContext/headerAeadContext
+    private enum CodingKeys: String, CodingKey {
+        case networkKey, networkName, bootstrapPeers, createdAt
+    }
+
+    /// HKDF info for deriving the header encryption key
+    private static let headerKeyInfo = [UInt8]("omerta-header-v3".utf8)
+
+    /// Derive 32-byte header key from the network key using HKDF-SHA256
+    static func deriveHeaderKeyBytes(from keyData: Data) -> [UInt8] {
+        let inputKey = SymmetricKey(data: keyData)
+        let derived = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKey,
+            info: Data(headerKeyInfo),
+            outputByteCount: 32
+        )
+        return derived.withUnsafeBytes { [UInt8]($0) }
+    }
+
     public init(
         networkKey: Data,
         networkName: String,
@@ -32,6 +63,27 @@ public struct NetworkKey: Sendable, Codable, Equatable {
         self.networkName = networkName
         self.bootstrapPeers = bootstrapPeers
         self.createdAt = createdAt
+        let keyBytes = [UInt8](networkKey)
+        // AEADContext init only fails for wrong key size; 32-byte keys always succeed
+        self.aeadContext = try! AEADContext(key: keyBytes)
+        self.headerAeadContext = try! AEADContext(key: Self.deriveHeaderKeyBytes(from: networkKey))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.networkKey = try container.decode(Data.self, forKey: .networkKey)
+        self.networkName = try container.decode(String.self, forKey: .networkName)
+        self.bootstrapPeers = try container.decode([String].self, forKey: .bootstrapPeers)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.aeadContext = try! AEADContext(key: [UInt8](networkKey))
+        self.headerAeadContext = try! AEADContext(key: Self.deriveHeaderKeyBytes(from: networkKey))
+    }
+
+    public static func == (lhs: NetworkKey, rhs: NetworkKey) -> Bool {
+        lhs.networkKey == rhs.networkKey &&
+        lhs.networkName == rhs.networkName &&
+        lhs.bootstrapPeers == rhs.bootstrapPeers &&
+        lhs.createdAt == rhs.createdAt
     }
 
     // MARK: - Encoding/Decoding
