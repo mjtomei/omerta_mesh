@@ -149,9 +149,14 @@ public actor TunnelSession {
         // If we have a multi-endpoint set with >1 endpoint, pick one for this flush
         if let endpointSet = endpointSet, await endpointSet.count > 1 {
             if let endpoint = await endpointSet.next(byteCount: batchData.count) {
-                try await provider.sendOnChannel(batchData, toEndpoint: endpoint.address,
-                                                  viaPort: endpoint.localPort,
-                                                  toMachine: remoteMachineId, channel: wireChannel)
+                if endpoint.address == "primary" {
+                    // Use standard send path for the primary endpoint
+                    try await provider.sendOnChannel(batchData, toMachine: remoteMachineId, channel: wireChannel)
+                } else {
+                    try await provider.sendOnChannel(batchData, toEndpoint: endpoint.address,
+                                                      viaPort: endpoint.localPort,
+                                                      toMachine: remoteMachineId, channel: wireChannel)
+                }
                 await endpointSet.recordSend(to: endpoint.address, bytes: batchData.count)
             } else {
                 // Fallback to primary

@@ -2920,9 +2920,17 @@ do {
     await sendControl("phase15-multiep-start")
     _ = await waitForAck("phase15-multiep-ack", timeout: .seconds(10))
 
-    // Use the existing manager — create a new session on a dedicated channel
-    let multiEpSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-multiep")
-    try await Task.sleep(for: .seconds(1))
+    // Use the existing manager — create a new session on a dedicated channel with 3 extra endpoints
+    let multiEpSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-multiep", extraEndpoints: 3)
+    try await Task.sleep(for: .seconds(2))  // Allow time for endpoint negotiation (request → ack → endpointOffer)
+
+    // Report endpoint count
+    let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: "health-test-multiep")
+    if let epSet = await manager.getEndpointSet(for: epKey) {
+        let epCount = await epSet.count
+        let epAddrs = await epSet.activeAddresses
+        logger.info("Multi-endpoint session has \(epCount) endpoint(s): \(epAddrs)")
+    }
 
     // Ramp bandwidth on multi-endpoint tunnel
     logger.info("Multi-endpoint A\u{2192}B bandwidth ramp (1400B packets, 3 extra endpoints)")
@@ -2962,10 +2970,26 @@ do {
         logger.info("  Ratio: \(String(format: "%.2fx", multiEpPeak / singleEpPeak))")
     }
 
+    // Report per-endpoint stats
+    if let epSet = await manager.getEndpointSet(for: epKey) {
+        let allEps = await epSet.allEndpoints
+        logger.info("Per-endpoint bandwidth breakdown:")
+        for ep in allEps {
+            let sentMbps = Double(ep.bytesSent) * 8.0 / 1_000_000.0
+            logger.info("  \(ep.address) (local:\(ep.localPort.map { String($0) } ?? "primary")): sent=\(String(format: "%.1f", sentMbps))Mb, weight=\(String(format: "%.2f", ep.weight))")
+        }
+    }
+
     await sendControl("phase15-multiep-done")
 
+    // Build detail string with endpoint count
+    var epCountStr = "?"
+    if let epSet = await manager.getEndpointSet(for: epKey) {
+        epCountStr = "\(await epSet.count)"
+    }
+
     record("Phase 15: Multi-Endpoint BW", passed: multiEpPeak > 0,
-           detail: "multi-ep=\(String(format: "%.1f", multiEpPeak))Mbps, single-ep=\(String(format: "%.1f", singleEpPeak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", multiEpPeak / singleEpPeak) : "N/A")")
+           detail: "endpoints=\(epCountStr), multi-ep=\(String(format: "%.1f", multiEpPeak))Mbps, single-ep=\(String(format: "%.1f", singleEpPeak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", multiEpPeak / singleEpPeak) : "N/A")")
 } catch {
     record("Phase 15: Multi-Endpoint BW", passed: false, detail: "Error: \(error)")
 }
