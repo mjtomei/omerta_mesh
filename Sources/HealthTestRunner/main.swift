@@ -942,8 +942,8 @@ struct PerfSummary {
     var recoveryTimeSeconds: Double = 0
 
     // Best bandwidth for the overhead comparison
-    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.sentMbps).max() ?? 0 }
-    var meshBandwidthMbps: Double { meshBandwidth.map(\.sentMbps).max() ?? 0 }
+    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.deliveredMbps).max() ?? 0 }
+    var meshBandwidthMbps: Double { meshBandwidth.map(\.deliveredMbps).max() ?? 0 }
     var tcpBandwidthMbps: Double { tcpBandwidth.map(\.sentMbps).max() ?? 0 }
 }
 
@@ -2271,10 +2271,9 @@ do {
     // Clean up Node B
     await sendControl("phase11-vanilla-done")
 
-    let bestVanillaMbps = perfSummary.vanillaBandwidthMbps
     let phase11aPass = vanillaLatCount >= 100
     record("Phase 11a: Vanilla UDP Baseline", passed: phase11aPass,
-           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, best A\u{2192}B sent=\(String(format: "%.1f", bestVanillaMbps))Mbps delivered=\(String(format: "%.1f", deliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", bToASentMbps))Mbps delivered=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
+           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, A\u{2192}B peak=\(String(format: "%.1f", deliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", bToASentMbps))Mbps delivered=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
 } catch {
     record("Phase 11a: Vanilla UDP Baseline", passed: false, detail: "Error: \(error)")
 }
@@ -2512,7 +2511,7 @@ do {
 
     let bestMeshMbps = perfSummary.meshBandwidthMbps
     record("Phase 12: Mesh Bandwidth", passed: bestMeshMbps > 0,
-           detail: "best A\u{2192}B sent=\(String(format: "%.1f", bestMeshMbps))Mbps delivered=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps probe=\(String(format: "%.1f", probeMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
+           detail: "A\u{2192}B peak=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps probe=\(String(format: "%.1f", probeMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
 }
