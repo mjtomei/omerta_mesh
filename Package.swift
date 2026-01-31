@@ -43,6 +43,7 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Crypto", package: "swift-crypto"),
+                .target(name: "CBoringSSL", condition: .when(platforms: [.macOS, .iOS])),
             ]
         ),
         .plugin(
@@ -81,6 +82,7 @@ let package = Package(
         ),
         .testTarget(name: "OmertaMeshTests", dependencies: [
             "OmertaMesh",
+            .product(name: "Crypto", package: "swift-crypto"),
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
         ]),
