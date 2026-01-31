@@ -1,4 +1,0 @@
-module CBoringSSL {
-    header "CCryptoBoringSSL.h"
-    export *
-}
