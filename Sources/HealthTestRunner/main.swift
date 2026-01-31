@@ -2909,21 +2909,19 @@ logPhase("Phase 15: Multi-Endpoint Bandwidth")
 if targetPhase == nil || targetPhase == 15 {
 
 do {
-    // Create a new TunnelManager with extra endpoints configured
-    let multiEpConfig = TunnelManagerConfig(
-        healthProbeMinInterval: .milliseconds(500),
-        healthProbeMaxInterval: .seconds(15),
-        healthFailureThreshold: 3,
-        healthGraceIntervals: 3,
-        extraEndpoints: 3
-    )
-    let multiEpManager = TunnelManager(provider: mesh, config: multiEpConfig)
-    try await multiEpManager.start()
+    // Suspend health monitoring if not already suspended (in case phases 11-14 were skipped)
+    if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+        await mon.stopMonitoring()
+    }
+    await sendControl("suspend-health")
+    _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+    try await Task.sleep(for: .milliseconds(500))
 
     await sendControl("phase15-multiep-start")
     _ = await waitForAck("phase15-multiep-ack", timeout: .seconds(10))
 
-    let multiEpSession = try await multiEpManager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
+    // Use the existing manager — create a new session on a dedicated channel
+    let multiEpSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-multiep")
     try await Task.sleep(for: .seconds(1))
 
     // Ramp bandwidth on multi-endpoint tunnel
@@ -2965,7 +2963,6 @@ do {
     }
 
     await sendControl("phase15-multiep-done")
-    await multiEpManager.stop()
 
     record("Phase 15: Multi-Endpoint BW", passed: multiEpPeak > 0,
            detail: "multi-ep=\(String(format: "%.1f", multiEpPeak))Mbps, single-ep=\(String(format: "%.1f", singleEpPeak))Mbps, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", multiEpPeak / singleEpPeak) : "N/A")")
