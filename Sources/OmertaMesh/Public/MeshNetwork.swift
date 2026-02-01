@@ -7,7 +7,7 @@ import NIOPosix
 
 /// The main entry point for the mesh network
 /// This actor wraps all internal components and provides a clean public API
-public actor MeshNetwork: ChannelProvider {
+public actor MeshNetwork: ChannelProvider, AuxiliaryPortProvider {
     // MARK: - Properties
 
     /// Our cryptographic identity
@@ -447,6 +447,14 @@ public actor MeshNetwork: ChannelProvider {
         try await node.flushChannel(channel)
     }
 
+    /// Send data on a channel to a specific endpoint via an optional auxiliary port.
+    public func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        try await node.sendOnChannel(data, toEndpoint: endpoint, viaPort: localPort, toMachine: machineId, channel: channel)
+    }
+
     /// Register a handler with a batch config override.
     public func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
         guard ChannelUtils.isValid(channel) else {
@@ -461,6 +469,26 @@ public actor MeshNetwork: ChannelProvider {
     }
 
     // MARK: - Batch Monitors
+
+    // MARK: - Auxiliary Port Provider
+
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    public func bindAuxiliaryPort() async throws -> UInt16 {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        return try await node.bindAuxiliaryPort()
+    }
+
+    /// Close and remove an auxiliary socket.
+    public func unbindAuxiliaryPort(_ port: UInt16) async {
+        await meshNode?.unbindAuxiliaryPort(port)
+    }
+
+    /// Get the local address that a remote machine can reach us on.
+    public func localAddressForMachine(_ machineId: MachineId) async -> String? {
+        await meshNode?.localAddressForMachine(machineId)
+    }
 
     /// Registered batch monitors
     private var batchMonitors: [any BatchMonitor] = []

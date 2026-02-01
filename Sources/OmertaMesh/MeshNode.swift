@@ -150,6 +150,9 @@ public actor MeshNode {
     /// The UDP socket for network communication
     private let socket: UDPSocket
 
+    /// Auxiliary UDP sockets for multi-endpoint tunnels (port → socket)
+    private var auxiliarySockets: [UInt16: UDPSocket] = [:]
+
     /// Event loop group for NIO
     private let eventLoopGroup: EventLoopGroup
 
@@ -492,8 +495,101 @@ public actor MeshNode {
         }
         pendingResponses.removeAll()
 
+        // Close auxiliary sockets
+        for (_, auxSocket) in auxiliarySockets {
+            await auxSocket.close()
+        }
+        auxiliarySockets.removeAll()
+
         await socket.close()
         logger.info("Mesh node stopped")
+    }
+
+    // MARK: - Auxiliary Sockets (Multi-Endpoint Tunnels)
+
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    /// The auxiliary socket's receive handler feeds into the same `processEnvelope` path.
+    /// Returns the bound port number.
+    public func bindAuxiliaryPort() async throws -> UInt16 {
+        let auxSocket = UDPSocket(eventLoopGroup: eventLoopGroup)
+        try await auxSocket.bind(host: "::", port: 0)
+        guard let port = await auxSocket.port else {
+            await auxSocket.close()
+            throw UDPSocketError.notRunning
+        }
+        let boundPort = UInt16(port)
+
+        // Route incoming data on auxiliary socket through the same envelope processing
+        // but skip endpoint recording (aux port addresses would pollute the endpoint table)
+        await auxSocket.onReceive { [weak self] data, address in
+            guard let self else { return }
+            await self.handleIncomingData(data, from: address, isAuxiliary: true)
+        }
+
+        auxiliarySockets[boundPort] = auxSocket
+        logger.info("Auxiliary socket bound on port \(boundPort)")
+        return boundPort
+    }
+
+    /// Close and remove an auxiliary socket.
+    public func unbindAuxiliaryPort(_ port: UInt16) async {
+        guard let auxSocket = auxiliarySockets.removeValue(forKey: port) else { return }
+        await auxSocket.close()
+        logger.info("Auxiliary socket unbound from port \(port)")
+    }
+
+    /// Send data to a specific endpoint, optionally via an auxiliary port.
+    /// If `viaPort` is nil or not found, uses the primary socket.
+    public func sendToEndpoint(_ data: Data, endpoint: String, viaPort: UInt16?) async throws {
+        let sendSocket: UDPSocket
+        if let port = viaPort, let auxSocket = auxiliarySockets[port] {
+            sendSocket = auxSocket
+        } else {
+            sendSocket = socket
+        }
+        try await sendSocket.sendRaw(data, to: endpoint)
+    }
+
+    /// Send an envelope-wrapped message to a specific endpoint via an auxiliary socket.
+    /// This wraps data in a signed/encrypted envelope (same as normal send) but routes
+    /// through the specified auxiliary socket instead of the primary.
+    public func sendEnvelope(_ message: MeshMessage, to endpoint: String, channel: String = "", viaPort: UInt16?) async throws {
+        let envelope = try MeshEnvelope.signed(
+            from: identity,
+            machineId: machineId,
+            to: nil,
+            channel: channel,
+            payload: message
+        )
+        let encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+
+        let sendSocket: UDPSocket
+        if let port = viaPort, let auxSocket = auxiliarySockets[port] {
+            sendSocket = auxSocket
+        } else {
+            sendSocket = socket
+        }
+        try await sendSocket.send(encryptedData, to: endpoint)
+    }
+
+    /// Get the local address that a remote machine can use to reach us.
+    /// Returns the host portion (e.g. "192.0.2.1") or nil if unknown.
+    public func localAddressForMachine(_ machineId: MachineId) async -> String? {
+        // Look up the peer for this machine
+        guard let peerId = await machinePeerRegistry.getMostRecentPeer(for: machineId) else { return nil }
+
+        // Get the peer's endpoint (this is THEIR address)
+        let endpoints = await endpointManager.getEndpoints(peerId: peerId, machineId: machineId)
+        guard let endpoint = EndpointUtils.preferredEndpoint(from: endpoints),
+              let remoteHost = EndpointUtils.hostFromEndpoint(endpoint) else { return nil }
+
+        // For IPv4 LAN: find our local address on the same subnet
+        if EndpointUtils.isIPv4(endpoint) {
+            return EndpointUtils.localIPv4OnSameSubnet(as: remoteHost)
+        }
+
+        // For IPv6: use our best local IPv6 address
+        return EndpointUtils.getBestLocalIPv6Address()
     }
 
     // MARK: - Message Handling
@@ -504,7 +600,7 @@ public actor MeshNode {
     }
 
     /// Handle incoming UDP data
-    private func handleIncomingData(_ data: Data, from address: NIOCore.SocketAddress) async {
+    private func handleIncomingData(_ data: Data, from address: NIOCore.SocketAddress, isAuxiliary: Bool = false) async {
         logger.info("Received \(data.count) bytes from \(address)")
 
         // Try v2 wire format first (fast path rejection for non-Omerta packets)
@@ -512,7 +608,7 @@ public actor MeshNode {
             do {
                 // Use decodeV2WithHash to get the raw channel hash for routing
                 let (envelope, channelHash) = try MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey)
-                await processEnvelope(envelope, from: address, channelHash: channelHash)
+                await processEnvelope(envelope, from: address, channelHash: channelHash, skipEndpointRecording: isAuxiliary)
                 return
             } catch EnvelopeError.networkMismatch {
                 logger.debug("Packet for different network from \(address)")
@@ -542,7 +638,7 @@ public actor MeshNode {
     ///   - envelope: The decoded envelope
     ///   - address: Source address
     ///   - channelHash: Raw channel hash from v2 format (nil for v1 format, uses string-based lookup)
-    private func processEnvelope(_ envelope: MeshEnvelope, from address: NIOCore.SocketAddress, channelHash: UInt16? = nil) async {
+    private func processEnvelope(_ envelope: MeshEnvelope, from address: NIOCore.SocketAddress, channelHash: UInt16? = nil, skipEndpointRecording: Bool = false) async {
 
         // Check for duplicates
         if seenMessageIds.contains(envelope.messageId) {
@@ -588,17 +684,21 @@ public actor MeshNode {
             return
         }
 
-        // Update peer info and track endpoint
         let endpointString = formatEndpoint(address)
-        await updatePeerConnectionFromMessage(peerId: envelope.fromPeerId, endpoint: endpointString)
 
-        // Record in endpoint manager for multi-endpoint tracking
-        logger.info("Recording endpoint for peer \(envelope.fromPeerId.prefix(16))... machine \(envelope.machineId.prefix(16))... at \(endpointString)")
-        await endpointManager.recordMessageReceived(
-            from: envelope.fromPeerId,
-            machineId: envelope.machineId,
-            endpoint: endpointString
-        )
+        // Update peer info and track endpoint (skip for auxiliary socket traffic
+        // whose source addresses would pollute the endpoint table)
+        if !skipEndpointRecording {
+            await updatePeerConnectionFromMessage(peerId: envelope.fromPeerId, endpoint: endpointString)
+
+            // Record in endpoint manager for multi-endpoint tracking
+            logger.info("Recording endpoint for peer \(envelope.fromPeerId.prefix(16))... machine \(envelope.machineId.prefix(16))... at \(endpointString)")
+            await endpointManager.recordMessageReceived(
+                from: envelope.fromPeerId,
+                machineId: envelope.machineId,
+                endpoint: endpointString
+            )
+        }
 
         // Record machine-peer association in registry
         await machinePeerRegistry.setMachine(envelope.machineId, peer: envelope.fromPeerId)
@@ -2320,6 +2420,16 @@ extension MeshNode: MeshNodeServices {
 
         let message = MeshMessage.data(data)
         try await send(message, to: endpoint, channel: channel)
+    }
+
+    /// Send data on a channel to a specific endpoint via an optional auxiliary port.
+    /// Wraps in a signed/encrypted envelope and sends via the auxiliary socket if specified.
+    public func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        guard ChannelUtils.isValid(channel) else {
+            throw MeshNodeError.invalidChannel(channel)
+        }
+        let message = MeshMessage.data(data)
+        try await sendEnvelope(message, to: endpoint, channel: channel, viaPort: localPort)
     }
 
     /// Handle incoming message on a channel (string-based, for v1 compatibility)

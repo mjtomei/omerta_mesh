@@ -131,4 +131,78 @@ public enum EndpointUtils {
         // Fall back to any non-link-local address
         return addresses.first
     }
+
+    // MARK: - Local IPv4 Address Discovery
+
+    /// Get all local private IPv4 addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+    public static func getLocalIPv4Addresses() -> [String] {
+        var addresses: [String] = []
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return addresses
+        }
+
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let addr = ptr {
+            defer { ptr = addr.pointee.ifa_next }
+
+            guard addr.pointee.ifa_addr?.pointee.sa_family == sa_family_t(AF_INET) else {
+                continue
+            }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                addr.pointee.ifa_addr,
+                socklen_t(MemoryLayout<sockaddr_in>.size),
+                &hostname,
+                socklen_t(hostname.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+
+            guard result == 0 else { continue }
+
+            let address = String(cString: hostname)
+
+            // Skip loopback
+            if address.hasPrefix("127.") { continue }
+
+            addresses.append(address)
+        }
+
+        return addresses
+    }
+
+    /// Parse the host portion from an endpoint string ("host:port" → "host", "[::1]:5000" → "::1")
+    public static func hostFromEndpoint(_ endpoint: String) -> String? {
+        if endpoint.hasPrefix("[") {
+            // IPv6 bracket notation [host]:port
+            guard let closeBracket = endpoint.firstIndex(of: "]") else { return nil }
+            return String(endpoint[endpoint.index(after: endpoint.startIndex)..<closeBracket])
+        }
+        // IPv4: host:port
+        guard let lastColon = endpoint.lastIndex(of: ":") else { return nil }
+        return String(endpoint[..<lastColon])
+    }
+
+    /// Find a local IPv4 address on the same /24 subnet as the given remote address.
+    public static func localIPv4OnSameSubnet(as remoteHost: String) -> String? {
+        let remoteParts = remoteHost.split(separator: ".")
+        guard remoteParts.count == 4 else { return nil }
+        let remoteSubnet = remoteParts[0...2].joined(separator: ".")
+
+        for localIP in getLocalIPv4Addresses() {
+            let localParts = localIP.split(separator: ".")
+            guard localParts.count == 4 else { continue }
+            let localSubnet = localParts[0...2].joined(separator: ".")
+            if localSubnet == remoteSubnet {
+                return localIP
+            }
+        }
+        return nil
+    }
 }

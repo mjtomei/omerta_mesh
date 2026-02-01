@@ -217,6 +217,7 @@ var port: Int = 18020
 var bootstrap: String? = nil
 var lan = false
 var remoteHost: String = ""
+var targetPhase: Int? = nil
 
 var args = CommandLine.arguments.dropFirst()
 while let arg = args.first {
@@ -235,6 +236,9 @@ while let arg = args.first {
         lan = true
     case "--remote-host":
         remoteHost = String(args.first ?? "")
+        args = args.dropFirst()
+    case "--phase":
+        targetPhase = Int(args.first ?? "")
         args = args.dropFirst()
     default:
         break
@@ -737,6 +741,17 @@ struct RampResult {
     let steps: [RampStep]
     let peakDeliveredMbps: Double
     let peakTargetMbps: Double
+
+    /// Peak sent Mbps across all steps (useful when delivered feedback is unavailable)
+    var peakSentMbps: Double {
+        steps.map(\.sentMbps).max() ?? 0
+    }
+
+    /// Total duration of all steps in seconds (estimated as stepCount * stepDuration)
+    var totalDurationSeconds: Double {
+        // Each step is ~1 second in the ramp; approximate from step count
+        Double(steps.count)
+    }
 }
 
 /// Send at a target rate for `stepDuration` and measure delivered bandwidth.
@@ -1563,6 +1578,33 @@ if !isNodeA {
             }
             logger.info("Node B: recovery ping echo stopped")
 
+        case "phase15-multiep-start":
+            logger.info("Node B: Phase 15 multi-endpoint bandwidth — setting up receiver")
+            let multiEpMeasurer15 = BandwidthMeasurer()
+            await multiEpMeasurer15.start()
+            await dataRouter.setHandler { data in
+                await multiEpMeasurer15.addBytes(UInt64(data.count))
+            }
+            await sendControl("phase15-multiep-ack")
+
+            while true {
+                guard let stepCmd = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if stepCmd.phase == "ramp-step-report" {
+                    let stepResult = await multiEpMeasurer15.result()
+                    let stepBytes = stepResult.bytes
+                    let stepDur = stepResult.duration
+                    let stepNanos = UInt64(stepDur.components.seconds) * 1_000_000_000 + UInt64(stepDur.components.attoseconds / 1_000_000_000)
+                    await sendControl("ramp-step-report-ack", detail: "\(stepBytes),\(stepNanos)")
+                } else if stepCmd.phase == "ramp-step-reset" {
+                    await multiEpMeasurer15.start()
+                    await sendControl("ramp-step-reset-ack")
+                } else if stepCmd.phase == "phase15-multiep-done" {
+                    break
+                }
+            }
+            await dataRouter.setHandler(nil)
+            logger.info("Node B: Phase 15 multi-endpoint bandwidth done")
+
         case "done":
             logger.info("Node B: test complete")
             await sendControl("done-ack")
@@ -1657,6 +1699,9 @@ do {
 } catch {
     record("Phase 1: Baseline Traffic", passed: false, detail: "Error: \(error)")
 }
+
+// Skip health/network phases (2-10) when targeting a bandwidth phase
+if targetPhase == nil || (targetPhase! >= 2 && targetPhase! <= 10) {
 
 // MARK: - Phase 2: Idle & Probe Backoff
 
@@ -2148,6 +2193,8 @@ record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
+} // end skip health/network phases 2-10
+
 // MARK: - Phase 11a: Vanilla Baseline (Direct UDP)
 
 logPhase("Phase 11a: Vanilla UDP Baseline")
@@ -2166,6 +2213,9 @@ await sendControl("suspend-health")
 _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
 // Wait for any in-flight failure callbacks to settle
 try await Task.sleep(for: .seconds(1))
+
+// Skip phases 11-14 when targeting a later bandwidth phase (e.g., 15)
+if targetPhase == nil || (targetPhase! >= 11 && targetPhase! <= 14) {
 
 do {
     // Tell Node B to start vanilla echo server
@@ -2861,9 +2911,116 @@ record("Phase 14: Recovery Timing", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-// MARK: - Phase 15: Summary
+} // end skip phases 11-14
 
-logPhase("Phase 15: Summary")
+// MARK: - Phase 15: Multi-Endpoint Bandwidth
+
+logPhase("Phase 15: Multi-Endpoint Bandwidth")
+
+if targetPhase == nil || targetPhase == 15 {
+
+do {
+    // Suspend health monitoring if not already suspended (in case phases 11-14 were skipped)
+    if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+        await mon.stopMonitoring()
+    }
+    await sendControl("suspend-health")
+    _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+    try await Task.sleep(for: .milliseconds(500))
+
+    await sendControl("phase15-multiep-start")
+    _ = await waitForAck("phase15-multiep-ack", timeout: .seconds(10))
+
+    let singleEpPeak = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }.map(\.deliveredMbps).max() ?? 0
+
+    // Test multiple endpoint counts: 4, 8, 16, 32 total (3, 7, 15, 31 extra)
+    let endpointCounts = [3, 7, 15, 31]
+
+    for (runIdx, extraCount) in endpointCounts.enumerated() {
+        let totalEps = extraCount + 1
+        let channelName = "health-test-multiep-\(totalEps)"
+
+        logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
+
+        let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
+        try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
+
+        let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
+        let actualEpCount: Int
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            actualEpCount = await epSet.count
+            logger.info("  Negotiated \(actualEpCount) endpoint(s)")
+        } else {
+            actualEpCount = 1
+        }
+
+        logger.info("  Ramp: 1400B packets, \(actualEpCount) endpoints")
+        let rampResult = try await rampBandwidth(
+            packetSize: 1400,
+            stepDuration: .seconds(1),
+            targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
+            send: { data in try await session.send(data) },
+            flush: { try await session.flush() },
+            getDelivered: {
+                await sendControl("ramp-step-report")
+                if let report = await waitForPhase("ramp-step-report-ack", timeout: .seconds(10)),
+                   let detail = report.detail {
+                    let parts = detail.split(separator: ",")
+                    if parts.count >= 2,
+                       let bytes = UInt64(parts[0]),
+                       let nanos = UInt64(parts[1]) {
+                        return (bytes, nanos)
+                    }
+                }
+                return (0, 0)
+            },
+            resetReceiver: {
+                await sendControl("ramp-step-reset")
+                _ = await waitForPhase("ramp-step-reset-ack", timeout: .seconds(5))
+            },
+            logger: logger
+        )
+
+        let peak = rampResult.peakSentMbps
+        let receivedMbps = rampResult.peakDeliveredMbps
+        let duration = rampResult.totalDurationSeconds
+
+        // Per-endpoint breakdown
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            let allEps = await epSet.allEndpoints
+            let totalBytes = allEps.reduce(UInt64(0)) { $0 + $1.bytesSent }
+            logger.info("  Per-endpoint (\(String(format: "%.0fs", duration))):")
+            for ep in allEps {
+                let mbps = duration > 0 ? Double(ep.bytesSent) * 8.0 / (duration * 1_000_000.0) : 0
+                let pct = totalBytes > 0 ? Double(ep.bytesSent) * 100.0 / Double(totalBytes) : 0
+                let label = ep.address == "primary" ? "primary" : "aux:\(ep.localPort ?? 0)"
+                logger.info("    \(label): \(String(format: "%.1f", mbps)) Mbps (\(String(format: "%.0f%%", pct)))")
+            }
+        }
+
+        logger.info("  Peak sent: \(String(format: "%.1f", peak)) Mbps")
+
+        logger.info("  Received: \(String(format: "%.1f", receivedMbps)) Mbps")
+        let lossPct = peak > 0 && receivedMbps > 0 ? max(0, (1.0 - receivedMbps / peak) * 100.0) : 0.0
+
+        // Close session before next run to free aux ports, and allow actor queues to drain
+        await manager.closeSession(key: epKey)
+        try await Task.sleep(for: .seconds(3))
+
+        record("Phase 15: \(totalEps)-EP BW", passed: peak > 0,
+               detail: "endpoints=\(actualEpCount), peak-sent=\(String(format: "%.1f", peak))Mbps, received=\(String(format: "%.1f", receivedMbps))Mbps, loss=\(String(format: "%.1f", lossPct))%, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", peak / singleEpPeak) : "N/A")")
+    }
+
+    await sendControl("phase15-multiep-done")
+} catch {
+    record("Phase 15: Multi-Endpoint BW", passed: false, detail: "Error: \(error)")
+}
+
+} // end phase 15 guard
+
+// MARK: - Phase 16: Summary
+
+logPhase("Phase 16: Summary")
 
 await sendControl("done")
 _ = await waitForAck("done-ack", timeout: .seconds(10))
