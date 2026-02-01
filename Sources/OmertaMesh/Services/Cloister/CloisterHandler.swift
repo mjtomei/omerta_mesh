@@ -160,10 +160,8 @@ public actor CloisterHandler {
             let networkId = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
             // Create confirmation (prove we derived the same key)
-            let confirmationData = try ChaChaPoly.seal(
-                Data("confirmed".utf8),
-                using: networkKey
-            ).combined
+            let networkKeyBytes = networkKey.withUnsafeBytes { [UInt8]($0) }
+            let confirmationData = Data(try DirectCrypto.sealCombined([UInt8]("confirmed".utf8), key: networkKeyBytes))
 
             // Send response with our public key
             await sendNegotiationResponse(
@@ -368,15 +366,14 @@ public actor CloisterHandler {
             let inviteKey = try await sessionData.session.deriveInviteKey()
 
             // Decrypt the network key
-            let sealedBox = try ChaChaPoly.SealedBox(combined: payload.encryptedNetworkKey)
-            let networkKey = try ChaChaPoly.open(sealedBox, using: inviteKey)
+            let inviteKeyBytes = inviteKey.withUnsafeBytes { [UInt8]($0) }
+            let networkKey = Data(try DirectCrypto.openCombined([UInt8](payload.encryptedNetworkKey), key: inviteKeyBytes))
 
             // Optionally decrypt network name
             var networkName = sessionData.networkNameHint ?? "shared-network"
             if let encryptedName = payload.encryptedNetworkName {
-                let nameSealedBox = try ChaChaPoly.SealedBox(combined: encryptedName)
-                let nameData = try ChaChaPoly.open(nameSealedBox, using: inviteKey)
-                networkName = String(data: nameData, encoding: .utf8) ?? networkName
+                let nameBytes = try DirectCrypto.openCombined([UInt8](encryptedName), key: inviteKeyBytes)
+                networkName = String(bytes: nameBytes, encoding: .utf8) ?? networkName
             }
 
             // Compute network ID

@@ -133,6 +133,13 @@ See [plans/notes.txt](../plans/notes.txt) for the latest human-managed TODO list
 - [ ] Kernel/DPU/FPGA accelerated mesh nodes
 - [ ] WireGuard connection migration
 
+## Benchmarks
+
+The `benchmarks/` directory contains standalone SPM packages for performance analysis:
+
+- **`benchmarks/crypto/`** — ChaCha20-Poly1305 throughput benchmarks comparing BoringSSL direct API, swift-crypto ChaChaPoly, and parallel decryption strategies. See [REPORT.md](benchmarks/crypto/REPORT.md).
+- **`benchmarks/swift/`** — `Data` vs `[UInt8]` allocation elision analysis demonstrating why the codebase uses `[UInt8]` internally. See [DATA_ELISION_REPORT.md](benchmarks/swift/DATA_ELISION_REPORT.md).
+
 ## Third-Party Dependencies
 
 OmertaMesh uses the following notable third-party libraries:
@@ -140,6 +147,7 @@ OmertaMesh uses the following notable third-party libraries:
 - **[gVisor netstack](https://gvisor.dev/)** (Apache-2.0) - Userspace TCP/IP stack for the OmertaTunnel module
 - **[Swift NIO](https://github.com/apple/swift-nio)** (Apache-2.0) - Non-blocking I/O
 - **[Swift Crypto](https://github.com/apple/swift-crypto)** (Apache-2.0) - Cryptographic operations
+- **[BoringSSL](https://boringssl.googlesource.com/boringssl/)** (Apache-2.0) - Vendored via swift-crypto for direct C API access in crypto benchmarks
 
 See [licenses/](licenses/) for complete license information.
 

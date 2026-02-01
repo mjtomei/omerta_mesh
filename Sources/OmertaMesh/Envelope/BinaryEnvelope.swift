@@ -27,7 +27,7 @@
 // Per-chunk overhead: 16 (tag) = 16 bytes
 
 import Foundation
-import Crypto
+import Crypto  // Still needed for SHA256, HKDF, SymmetricKey
 
 /// Encrypted data ready for network transmission.
 /// Can only be constructed by BinaryEnvelope encryption methods.
@@ -118,9 +118,6 @@ public enum BinaryEnvelope {
         return (available / 4) * 3
     }()
 
-    /// HKDF info string for header key derivation
-    private static let headerKeyInfo = Data("omerta-header-v3".utf8)
-
     /// Nonce XOR values for domain separation
     private static let routingNonceXor: UInt8 = 0x00
     private static let authNonceXor: UInt8 = 0x01
@@ -133,32 +130,22 @@ public enum BinaryEnvelope {
         return Data(hash.prefix(8))
     }
 
-    // MARK: - Key Derivation
-
-    /// Derive the header encryption key from the network key
-    private static func deriveHeaderKey(from networkKey: Data) -> SymmetricKey {
-        let inputKey = SymmetricKey(data: networkKey)
-        return HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: inputKey,
-            info: headerKeyInfo,
-            outputByteCount: 32
-        )
-    }
+    // MARK: - Nonce Derivation
 
     /// Derive a nonce by XORing the last byte of the base nonce
-    private static func deriveNonce(_ baseNonce: [UInt8], xor: UInt8) throws -> ChaChaPoly.Nonce {
+    private static func deriveNonce(_ baseNonce: [UInt8], xor: UInt8) -> [UInt8] {
         var derived = baseNonce
         derived[11] ^= xor
-        return try ChaChaPoly.Nonce(data: derived)
+        return derived
     }
 
     /// Derive a chunk nonce: XOR low byte with 0x02, bytes 9-10 with chunk index
-    private static func deriveChunkNonce(_ baseNonce: [UInt8], chunkIndex: Int) throws -> ChaChaPoly.Nonce {
+    private static func deriveChunkNonce(_ baseNonce: [UInt8], chunkIndex: Int) -> [UInt8] {
         var derived = baseNonce
         derived[11] ^= 0x02
         derived[9] ^= UInt8(truncatingIfNeeded: chunkIndex >> 8)
         derived[10] ^= UInt8(truncatingIfNeeded: chunkIndex)
-        return try ChaChaPoly.Nonce(data: derived)
+        return derived
     }
 
     // MARK: - Encoding
@@ -169,43 +156,66 @@ public enum BinaryEnvelope {
         payload: Data,
         networkKey: Data
     ) throws -> SealedEnvelope {
-        // Generate random base nonce
-        let baseNonceValue = ChaChaPoly.Nonce()
-        let baseNonce = Array(baseNonceValue)
+        // Create ephemeral AEAD contexts (callers using NetworkKey get precomputed ones)
+        let keyBytes = [UInt8](networkKey)
+        let headerKeyBytes = NetworkKey.deriveHeaderKeyBytes(from: networkKey)
+        let headerCtx = try AEADContext(key: headerKeyBytes)
+        let payloadCtx = try AEADContext(key: keyBytes)
+        return try encodeWithContexts(header: header, payload: payload,
+                                       headerCtx: headerCtx, payloadCtx: payloadCtx)
+    }
 
-        // Derive keys
-        let headerKey = deriveHeaderKey(from: networkKey)
-        let payloadKey = SymmetricKey(data: networkKey)
+    /// Encode using precomputed AEAD contexts from NetworkKey
+    public static func encode(
+        header: EnvelopeHeader,
+        payload: Data,
+        networkKey: NetworkKey
+    ) throws -> SealedEnvelope {
+        try encodeWithContexts(header: header, payload: payload,
+                                headerCtx: networkKey.headerAeadContext,
+                                payloadCtx: networkKey.aeadContext)
+    }
+
+    /// Internal encode implementation using AEAD contexts
+    private static func encodeWithContexts(
+        header: EnvelopeHeader,
+        payload: Data,
+        headerCtx: AEADContext,
+        payloadCtx: AEADContext
+    ) throws -> SealedEnvelope {
+        // Generate random base nonce
+        let baseNonce = DirectCrypto.randomNonce()
 
         // Encode headers
-        let routingData = try header.encodeRouting()
-        let authData = try header.encodeAuth()
+        let routingData = [UInt8](try header.encodeRouting())
+        let authData = [UInt8](try header.encodeAuth())
 
         // Encrypt routing header (nonce XOR 0x00 = base nonce)
-        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
-        let routingSealedBox = try ChaChaPoly.seal(routingData, using: headerKey, nonce: routingNonce)
+        let routingNonce = deriveNonce(baseNonce, xor: routingNonceXor)
+        let (routingCiphertext, routingTag) = try headerCtx.seal(plaintext: routingData, nonce: routingNonce)
 
         // Encrypt auth header (nonce XOR 0x01)
-        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
-        let authSealedBox = try ChaChaPoly.seal(authData, using: payloadKey, nonce: authNonce)
+        let authNonce = deriveNonce(baseNonce, xor: authNonceXor)
+        let (authCiphertext, authTag) = try payloadCtx.seal(plaintext: authData, nonce: authNonce)
 
         // Split payload into chunks and encrypt each
-        let chunkPlaintexts: [Data]
-        if payload.isEmpty {
-            chunkPlaintexts = [Data()]
+        let payloadBytes = [UInt8](payload)
+        let chunkPlaintexts: [[UInt8]]
+        if payloadBytes.isEmpty {
+            chunkPlaintexts = [[]]
         } else {
-            chunkPlaintexts = stride(from: 0, to: payload.count, by: chunkSize).map { start in
-                let end = min(start + chunkSize, payload.count)
-                return Data(payload[start..<end])
+            chunkPlaintexts = stride(from: 0, to: payloadBytes.count, by: chunkSize).map { start in
+                let end = min(start + chunkSize, payloadBytes.count)
+                return Array(payloadBytes[start..<end])
             }
         }
 
-        var encryptedChunks: [(ciphertext: Data, tag: Data)] = []
+        var encryptedChunks: [(ciphertext: [UInt8], tag: [UInt8])] = []
         encryptedChunks.reserveCapacity(chunkPlaintexts.count)
         for (i, chunkData) in chunkPlaintexts.enumerated() {
-            let chunkNonce = try deriveChunkNonce(baseNonce, chunkIndex: i)
-            let sealed = try ChaChaPoly.seal(chunkData, using: payloadKey, nonce: chunkNonce)
-            encryptedChunks.append((Data(sealed.ciphertext), Data(sealed.tag)))
+            let chunkNonce = deriveChunkNonce(baseNonce, chunkIndex: i)
+            let (ct, tag) = try payloadCtx.seal(plaintext: chunkData, nonce: chunkNonce)
+            encryptedChunks.append((ct, tag))
         }
 
         // Build the packet
@@ -217,20 +227,20 @@ public enum BinaryEnvelope {
         writer.writeByte(version)
 
         // Routing header section
-        writer.writeBytes(Data(baseNonce))                      // 12 bytes nonce
-        writer.writeBytes(routingSealedBox.tag)                 // 16 bytes tag
-        writer.writeBytes(routingSealedBox.ciphertext)          // 44 bytes encrypted routing
+        writer.writeBytes(baseNonce)                            // 12 bytes nonce
+        writer.writeBytes(routingTag)                           // 16 bytes tag
+        writer.writeBytes(routingCiphertext)                    // 44 bytes encrypted routing
 
         // Auth header section
-        writer.writeBytes(authSealedBox.tag)                    // 16 bytes tag
-        writer.writeBytes(authSealedBox.ciphertext)             // 136 bytes encrypted auth
+        writer.writeBytes(authTag)                              // 16 bytes tag
+        writer.writeBytes(authCiphertext)                       // 136 bytes encrypted auth
 
         // Payload section (chunked) — chunk count and sizes derived from total length
         writer.writeUInt32(UInt32(payload.count))               // 4 bytes total plaintext length
 
         for chunk in encryptedChunks {
-            writer.writeBytes(chunk.ciphertext)                    // N bytes encrypted data
-            writer.writeBytes(chunk.tag)                           // 16 bytes tag
+            writer.writeBytes(chunk.ciphertext)                 // N bytes encrypted data
+            writer.writeBytes(chunk.tag)                        // 16 bytes tag
         }
 
         return SealedEnvelope(data: writer.data)
@@ -261,6 +271,23 @@ public enum BinaryEnvelope {
         _ data: Data,
         networkKey: Data
     ) throws -> RoutingHeader {
+        let headerKeyBytes = NetworkKey.deriveHeaderKeyBytes(from: networkKey)
+        let headerCtx = try AEADContext(key: headerKeyBytes)
+        return try decodeRoutingOnlyWithContext(data, headerCtx: headerCtx)
+    }
+
+    /// Decode routing header using precomputed context from NetworkKey
+    public static func decodeRoutingOnly(
+        _ data: Data,
+        networkKey: NetworkKey
+    ) throws -> RoutingHeader {
+        try decodeRoutingOnlyWithContext(data, headerCtx: networkKey.headerAeadContext)
+    }
+
+    private static func decodeRoutingOnlyWithContext(
+        _ data: Data,
+        headerCtx: AEADContext
+    ) throws -> RoutingHeader {
         let minSize = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize
         guard data.count >= minSize else {
             throw EnvelopeError.truncatedPacket
@@ -276,26 +303,20 @@ public enum BinaryEnvelope {
 
         // Extract nonce
         let nonceStart = prefixSize
-        let baseNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
+        let baseNonce = [UInt8](data[nonceStart..<(nonceStart + nonceSize)])
 
         // Extract routing tag + ciphertext
         let routingTagStart = nonceStart + nonceSize
-        let routingTag = Data(data[routingTagStart..<(routingTagStart + tagSize)])
+        let routingTag = [UInt8](data[routingTagStart..<(routingTagStart + tagSize)])
         let routingDataStart = routingTagStart + tagSize
         let routingDataEnd = routingDataStart + RoutingHeader.encodedSize
-        let encryptedRouting = Data(data[routingDataStart..<routingDataEnd])
+        let encryptedRouting = [UInt8](data[routingDataStart..<routingDataEnd])
 
         // Decrypt routing header
-        let headerKey = deriveHeaderKey(from: networkKey)
-        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
-        let routingSealedBox = try ChaChaPoly.SealedBox(
-            nonce: routingNonce,
-            ciphertext: encryptedRouting,
-            tag: routingTag
-        )
-        let routingData = try ChaChaPoly.open(routingSealedBox, using: headerKey)
+        let routingNonce = deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingBytes = try headerCtx.open(ciphertext: encryptedRouting, tag: routingTag, nonce: routingNonce)
 
-        return try RoutingHeader.decode(from: routingData)
+        return try RoutingHeader.decode(from: Data(routingBytes))
     }
 
     // MARK: - Full Decode
@@ -304,6 +325,30 @@ public enum BinaryEnvelope {
     public static func decode(
         _ data: Data,
         networkKey: Data
+    ) throws -> (header: EnvelopeHeader, payload: Data) {
+        let keyBytes = [UInt8](networkKey)
+        let headerKeyBytes = NetworkKey.deriveHeaderKeyBytes(from: networkKey)
+        let headerCtx = try AEADContext(key: headerKeyBytes)
+        let payloadCtx = try AEADContext(key: keyBytes)
+        return try decodeWithContexts(data, networkKey: networkKey,
+                                       headerCtx: headerCtx, payloadCtx: payloadCtx)
+    }
+
+    /// Decode using precomputed AEAD contexts from NetworkKey
+    public static func decode(
+        _ data: Data,
+        networkKey: NetworkKey
+    ) throws -> (header: EnvelopeHeader, payload: Data) {
+        try decodeWithContexts(data, networkKey: networkKey.networkKey,
+                                headerCtx: networkKey.headerAeadContext,
+                                payloadCtx: networkKey.aeadContext)
+    }
+
+    private static func decodeWithContexts(
+        _ data: Data,
+        networkKey: Data,
+        headerCtx: AEADContext,
+        payloadCtx: AEADContext
     ) throws -> (header: EnvelopeHeader, payload: Data) {
         let routingEnd = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize
         let authEnd = routingEnd + tagSize + AuthHeader.encodedSize
@@ -322,27 +367,18 @@ public enum BinaryEnvelope {
 
         // Extract base nonce
         let nonceStart = prefixSize
-        let baseNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
-
-        // Derive keys
-        let headerKey = deriveHeaderKey(from: networkKey)
-        let payloadKey = SymmetricKey(data: networkKey)
+        let baseNonce = [UInt8](data[nonceStart..<(nonceStart + nonceSize)])
 
         // --- Decrypt routing header ---
         let routingTagStart = nonceStart + nonceSize
-        let routingTag = Data(data[routingTagStart..<(routingTagStart + tagSize)])
+        let routingTag = [UInt8](data[routingTagStart..<(routingTagStart + tagSize)])
         let routingDataStart = routingTagStart + tagSize
         let routingDataEnd = routingDataStart + RoutingHeader.encodedSize
-        let encryptedRouting = Data(data[routingDataStart..<routingDataEnd])
+        let encryptedRouting = [UInt8](data[routingDataStart..<routingDataEnd])
 
-        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
-        let routingSealedBox = try ChaChaPoly.SealedBox(
-            nonce: routingNonce,
-            ciphertext: encryptedRouting,
-            tag: routingTag
-        )
-        let routingBytes = try ChaChaPoly.open(routingSealedBox, using: headerKey)
-        let routingHeader = try RoutingHeader.decode(from: routingBytes)
+        let routingNonce = deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingBytes = try headerCtx.open(ciphertext: encryptedRouting, tag: routingTag, nonce: routingNonce)
+        let routingHeader = try RoutingHeader.decode(from: Data(routingBytes))
 
         // Verify network hash
         let expectedHash = computeNetworkHash(networkKey)
@@ -352,19 +388,14 @@ public enum BinaryEnvelope {
 
         // --- Decrypt auth header ---
         let authTagStart = routingDataEnd
-        let authTag = Data(data[authTagStart..<(authTagStart + tagSize)])
+        let authTag = [UInt8](data[authTagStart..<(authTagStart + tagSize)])
         let authDataStart = authTagStart + tagSize
         let authDataEnd = authDataStart + AuthHeader.encodedSize
-        let encryptedAuth = Data(data[authDataStart..<authDataEnd])
+        let encryptedAuth = [UInt8](data[authDataStart..<authDataEnd])
 
-        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
-        let authSealedBox = try ChaChaPoly.SealedBox(
-            nonce: authNonce,
-            ciphertext: encryptedAuth,
-            tag: authTag
-        )
-        let authBytes = try ChaChaPoly.open(authSealedBox, using: payloadKey)
-        let authHeader = try AuthHeader.decode(from: authBytes)
+        let authNonce = deriveNonce(baseNonce, xor: authNonceXor)
+        let authBytes = try payloadCtx.open(ciphertext: encryptedAuth, tag: authTag, nonce: authNonce)
+        let authHeader = try AuthHeader.decode(from: Data(authBytes))
 
         // --- Decrypt payload chunks ---
         var reader = BinaryReader(data)
@@ -399,18 +430,13 @@ public enum BinaryEnvelope {
                 throw EnvelopeError.truncatedPacket
             }
 
-            let encryptedChunk = Data(data[(data.startIndex + chunkDataStart)..<(data.startIndex + chunkDataEnd)])
-            let chunkTag = Data(data[(data.startIndex + chunkDataEnd)..<(data.startIndex + chunkDataEnd + tagSize)])
+            let encryptedChunk = [UInt8](data[(data.startIndex + chunkDataStart)..<(data.startIndex + chunkDataEnd)])
+            let chunkTag = [UInt8](data[(data.startIndex + chunkDataEnd)..<(data.startIndex + chunkDataEnd + tagSize)])
             reader.offset = chunkDataEnd + tagSize
 
-            let chunkNonce = try deriveChunkNonce(baseNonce, chunkIndex: i)
-            let chunkSealedBox = try ChaChaPoly.SealedBox(
-                nonce: chunkNonce,
-                ciphertext: encryptedChunk,
-                tag: chunkTag
-            )
-            let chunkData = try ChaChaPoly.open(chunkSealedBox, using: payloadKey)
-            payload.append(chunkData)
+            let chunkNonce = deriveChunkNonce(baseNonce, chunkIndex: i)
+            let chunkBytes = try payloadCtx.open(ciphertext: encryptedChunk, tag: chunkTag, nonce: chunkNonce)
+            payload.append(contentsOf: chunkBytes)
         }
 
         // Reconstruct combined header

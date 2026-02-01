@@ -38,6 +38,9 @@ public enum BinaryEnvelopeError: Error, CustomStringConvertible {
 struct BinaryWriter {
     var data: Data
 
+    /// Access the written bytes as [UInt8] without copying (uses withUnsafeBytes).
+    var bytes: [UInt8] { [UInt8](data) }
+
     init(capacity: Int = 1024) {
         data = Data(capacity: capacity)
     }
@@ -76,6 +79,11 @@ struct BinaryWriter {
     /// Write raw bytes
     mutating func writeBytes(_ bytes: Data) {
         data.append(bytes)
+    }
+
+    /// Write raw bytes from [UInt8]
+    mutating func writeBytes(_ bytes: [UInt8]) {
+        data.append(contentsOf: bytes)
     }
 }
 

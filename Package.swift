@@ -23,12 +23,27 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CBoringSSL",
+            exclude: [
+                "crypto/bio/connect.cc",
+                "crypto/bio/socket_helper.cc",
+                "crypto/bio/socket.cc",
+            ],
+            cSettings: [
+                .define("_HAS_EXCEPTIONS", to: "0", .when(platforms: [.windows])),
+                .define("WIN32_LEAN_AND_MEAN", .when(platforms: [.windows])),
+                .define("NOMINMAX", .when(platforms: [.windows])),
+                .define("_CRT_SECURE_NO_WARNINGS", .when(platforms: [.windows])),
+            ]
+        ),
+        .target(
             name: "OmertaMesh",
             dependencies: [
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Crypto", package: "swift-crypto"),
+                .target(name: "CBoringSSL", condition: .when(platforms: [.macOS, .iOS])),
             ]
         ),
         .plugin(
@@ -67,6 +82,7 @@ let package = Package(
         ),
         .testTarget(name: "OmertaMeshTests", dependencies: [
             "OmertaMesh",
+            .product(name: "Crypto", package: "swift-crypto"),
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
         ]),
@@ -119,5 +135,6 @@ let package = Package(
                 permissions: []
             )
         ),
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )
