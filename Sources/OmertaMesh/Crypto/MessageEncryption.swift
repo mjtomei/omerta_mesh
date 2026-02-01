@@ -1,9 +1,8 @@
-// MessageEncryption.swift - ChaCha20-Poly1305 message encryption
+// MessageEncryption.swift - ChaCha20-Poly1305 message encryption via DirectCrypto
 
 import Foundation
-import Crypto
 
-/// Symmetric message encryption using ChaCha20-Poly1305
+/// Symmetric message encryption using ChaCha20-Poly1305 (via DirectCrypto/BoringSSL)
 public enum MessageEncryption {
 
     /// Encrypt data using ChaCha20-Poly1305
@@ -15,12 +14,8 @@ public enum MessageEncryption {
         guard key.count == 32 else {
             throw MessageEncryptionError.invalidKeySize
         }
-
-        let symmetricKey = SymmetricKey(data: key)
-        let nonce = ChaChaPoly.Nonce()
-        let sealedBox = try ChaChaPoly.seal(data, using: symmetricKey, nonce: nonce)
-
-        return sealedBox.combined
+        let result = try DirectCrypto.sealCombined([UInt8](data), key: [UInt8](key))
+        return Data(result)
     }
 
     /// Decrypt data using ChaCha20-Poly1305
@@ -32,15 +27,11 @@ public enum MessageEncryption {
         guard key.count == 32 else {
             throw MessageEncryptionError.invalidKeySize
         }
-
         guard data.count >= 28 else {  // 12 (nonce) + 16 (tag) minimum
             throw MessageEncryptionError.dataTooShort
         }
-
-        let symmetricKey = SymmetricKey(data: key)
-        let sealedBox = try ChaChaPoly.SealedBox(combined: data)
-
-        return try ChaChaPoly.open(sealedBox, using: symmetricKey)
+        let result = try DirectCrypto.openCombined([UInt8](data), key: [UInt8](key))
+        return Data(result)
     }
 }
 

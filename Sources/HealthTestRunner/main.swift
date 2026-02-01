@@ -202,10 +202,19 @@ let logger = Logger(label: "health-test")
 
 // MARK: - Root Check
 
+// Root is required for phases 1-10 (iptables/pfctl/ip commands) but not for bandwidth-only phases
 #if canImport(Glibc) || canImport(Darwin)
-if getuid() != 0 {
+let earlyPhaseArg: Int? = {
+    let allArgs = CommandLine.arguments
+    if let idx = allArgs.firstIndex(of: "--phase"), idx + 1 < allArgs.count {
+        return Int(allArgs[idx + 1])
+    }
+    return nil
+}()
+if getuid() != 0 && (earlyPhaseArg == nil || earlyPhaseArg! <= 10) {
     logger.error("HealthTestRunner must be run as root (for iptables/pfctl/ip commands)")
     logger.error("Usage: sudo .build/debug/HealthTestRunner --role nodeA ...")
+    logger.error("  Or use --phase 11 to skip phases requiring root")
     exit(1)
 }
 #endif
@@ -1432,14 +1441,31 @@ if !isNodeA {
                 continue
             }
             let revPayload12 = Data(repeating: 0xBB, count: pktSize12r)
+            let revState12 = await revSession12.state
+            logger.info("Node B: reverse session state=\(revState12), channel=\(key12r.channel)")
             let revClock12 = ContinuousClock()
             let revStart12 = revClock12.now
             var revSentBytes12: UInt64 = 0
-            for _ in 1...pktCount12r {
-                try? await revSession12.send(revPayload12)
-                revSentBytes12 += UInt64(pktSize12r)
+            var revErrors12: Int = 0
+            for i in 1...pktCount12r {
+                do {
+                    try await revSession12.send(revPayload12)
+                    revSentBytes12 += UInt64(pktSize12r)
+                } catch {
+                    revErrors12 += 1
+                    if revErrors12 <= 3 {
+                        logger.error("Node B: reverse send error #\(revErrors12) at pkt \(i): \(error)")
+                    }
+                }
             }
-            try? await revSession12.flush()
+            do {
+                try await revSession12.flush()
+            } catch {
+                logger.error("Node B: reverse flush error: \(error)")
+            }
+            if revErrors12 > 0 {
+                logger.warning("Node B: reverse send had \(revErrors12) errors out of \(pktCount12r) packets")
+            }
             let revElapsed12 = revClock12.now - revStart12
             let revNanos12 = UInt64(revElapsed12.components.seconds) * 1_000_000_000 + UInt64(revElapsed12.components.attoseconds / 1_000_000_000)
             await sendControl("phase12-bw-reverse-done", detail: "\(revSentBytes12),\(revNanos12)")
@@ -1513,14 +1539,31 @@ if !isNodeA {
                 continue
             }
             let revPayload12bs = Data(repeating: 0xCC, count: pktSize12bs)
+            let revState12bs = await revSession12bs.state
+            logger.info("Node B: sweep reverse session state=\(revState12bs), channel=\(key12bs.channel)")
             let revClock12bs = ContinuousClock()
             let revStart12bs = revClock12bs.now
             var revSent12bs: UInt64 = 0
-            for _ in 1...pktCount12bs {
-                try? await revSession12bs.send(revPayload12bs)
-                revSent12bs += UInt64(pktSize12bs)
+            var revErrors12bs: Int = 0
+            for i in 1...pktCount12bs {
+                do {
+                    try await revSession12bs.send(revPayload12bs)
+                    revSent12bs += UInt64(pktSize12bs)
+                } catch {
+                    revErrors12bs += 1
+                    if revErrors12bs <= 3 {
+                        logger.error("Node B: sweep reverse send error #\(revErrors12bs) at pkt \(i): \(error)")
+                    }
+                }
             }
-            try? await revSession12bs.flush()
+            do {
+                try await revSession12bs.flush()
+            } catch {
+                logger.error("Node B: sweep reverse flush error: \(error)")
+            }
+            if revErrors12bs > 0 {
+                logger.warning("Node B: sweep reverse had \(revErrors12bs) errors out of \(pktCount12bs)")
+            }
             let revElapsed12bs = revClock12bs.now - revStart12bs
             let revNanos12bs = UInt64(revElapsed12bs.components.seconds) * 1_000_000_000 + UInt64(revElapsed12bs.components.attoseconds / 1_000_000_000)
             await sendControl("phase12b-step-reverse-done", detail: "\(revSent12bs),\(revNanos12bs)")
@@ -1650,10 +1693,13 @@ func record(_ name: String, passed: Bool, detail: String) {
 
 // MARK: - Phase 1: Baseline Bidirectional Traffic
 
+var monitor: TunnelHealthMonitor? = nil
+
+if targetPhase == nil || targetPhase! <= 10 {
+
 logPhase("Phase 1: Baseline Bidirectional Traffic")
 
 var session1: TunnelSession? = nil
-var monitor: TunnelHealthMonitor? = nil
 
 do {
     // Wait for Node B to signal it's ready (handler set up)
@@ -2193,7 +2239,9 @@ record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-} // end skip health/network phases 2-10
+} // end phases 2-10 guard
+
+} // end phases 1-10 guard
 
 // MARK: - Phase 11a: Vanilla Baseline (Direct UDP)
 
@@ -3068,15 +3116,15 @@ do {
     // Bandwidth by packet size (A→B)
     logger.info("")
     logger.info("=== BANDWIDTH BY PACKET SIZE (A\u{2192}B) ===")
-    logger.info("Packet Size    Vanilla Sent    Mesh Sent    Overhead")
+    logger.info("Packet Size    Vanilla Delivered    Mesh Delivered    Overhead")
     let vanillaAtoB = perfSummary.vanillaBandwidth.filter { $0.direction == "A\u{2192}B" }
     let meshAtoB = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }
     let allSizes = Set(vanillaAtoB.map(\.packetSize) + meshAtoB.map(\.packetSize)).sorted()
     for size in allSizes {
-        let vBw = vanillaAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
-        let mBw = meshAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
+        let vBw = vanillaAtoB.first(where: { $0.packetSize == size })?.deliveredMbps ?? 0
+        let mBw = meshAtoB.first(where: { $0.packetSize == size })?.deliveredMbps ?? 0
         let overhead = vBw > 0 && mBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
-        logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))  \(String(format: "%10.1f", mBw))    \(overhead)")
+        logger.info("\(String(format: "%7d B", size))    \(String(format: "%14.1f", vBw))  \(String(format: "%14.1f", mBw))    \(overhead)")
     }
 
     // Ramp curves

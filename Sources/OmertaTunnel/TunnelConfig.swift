@@ -18,6 +18,7 @@ public struct TunnelSessionKey: Hashable, Sendable {
 public enum TunnelState: Sendable, Equatable {
     case connecting
     case active
+    case degraded
     case disconnected
     case failed(String)
 }
@@ -60,7 +61,8 @@ public struct TunnelManagerConfig: Sendable {
     // Health monitoring
     public var healthProbeMinInterval: Duration = .milliseconds(500)
     public var healthProbeMaxInterval: Duration = .seconds(15)
-    public var healthFailureThreshold: Int = 3
+    public var healthDegradedThreshold: Int = 3
+    public var healthFailureThreshold: Int = 6
     /// Number of initial probe intervals to skip failure counting (grace period for remote to start probing)
     public var healthGraceIntervals: Int = 3
 
@@ -77,7 +79,8 @@ public struct TunnelManagerConfig: Sendable {
         maxTotalSessions: Int = 1000,
         healthProbeMinInterval: Duration = .milliseconds(500),
         healthProbeMaxInterval: Duration = .seconds(15),
-        healthFailureThreshold: Int = 3,
+        healthDegradedThreshold: Int = 3,
+        healthFailureThreshold: Int = 6,
         healthGraceIntervals: Int = 3,
         batchConfig: BatchConfig? = nil,
         extraEndpoints: Int = 0
@@ -86,6 +89,7 @@ public struct TunnelManagerConfig: Sendable {
         self.maxTotalSessions = maxTotalSessions
         self.healthProbeMinInterval = healthProbeMinInterval
         self.healthProbeMaxInterval = healthProbeMaxInterval
+        self.healthDegradedThreshold = healthDegradedThreshold
         self.healthFailureThreshold = healthFailureThreshold
         self.healthGraceIntervals = healthGraceIntervals
         self.batchConfig = batchConfig

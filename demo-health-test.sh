@@ -26,7 +26,7 @@ if [ $# -lt 2 ]; then
     echo ""
     echo "  ssh-host     SSH destination (e.g. 'mac', 'user@192.0.2.10')"
     echo "  remote-path  Absolute path on remote to clone into (must not exist)"
-    echo "  --phase N    Run only phase N (and setup phase 1)"
+    echo "  --phase N    Only run phases starting from N (skip earlier phases)"
     exit 1
 fi
 

@@ -91,7 +91,7 @@ public actor TunnelSession {
     /// - Parameter data: The packet data to buffer
     /// - Throws: TunnelError.notConnected if session is not active
     public func send(_ data: Data) async throws {
-        guard state == .active else {
+        guard state == .active || state == .degraded else {
             throw TunnelError.notConnected
         }
 
@@ -123,7 +123,7 @@ public actor TunnelSession {
     /// Flush all buffered packets, sending them as a single batch.
     /// - Throws: TunnelError.notConnected if session is not active
     public func flush() async throws {
-        guard state == .active else {
+        guard state == .active || state == .degraded else {
             throw TunnelError.notConnected
         }
 
@@ -185,7 +185,7 @@ public actor TunnelSession {
     /// - Parameter data: The packet data to send
     /// - Throws: TunnelError.notConnected if session is not active
     public func sendAndFlush(_ data: Data) async throws {
-        guard state == .active else {
+        guard state == .active || state == .degraded else {
             throw TunnelError.notConnected
         }
 
@@ -214,10 +214,24 @@ public actor TunnelSession {
         ])
     }
 
+    /// Mark the session as degraded (health monitor detected issues but not yet failed)
+    func setDegraded() {
+        if state == .active {
+            state = .degraded
+        }
+    }
+
+    /// Recover from degraded state back to active
+    func recover() {
+        if state == .degraded {
+            state = .active
+        }
+    }
+
     /// Close the session and clean up resources
     public func close() async {
         // Flush any remaining buffered data before closing
-        if state == .active && !sendBuffer.isEmpty {
+        if (state == .active || state == .degraded) && !sendBuffer.isEmpty {
             try? await flush()
         }
 

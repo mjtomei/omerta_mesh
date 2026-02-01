@@ -6,10 +6,10 @@ index 3474e9e..6ff90bf 100644
          try? group.syncShutdownGracefully()
          try await super.tearDown()
      }
-+    // Scenario 3: Code fakes the OMRT prefix on plaintext data
++    // Scenario 3: Code fakes the OMR prefix on plaintext data
 +    func testSpoofedMagicPrefix() async throws {
-+        var fake = Data("OMRT".utf8)
-+        fake.append(0x02)
++        var fake = Data("OMR".utf8)
++        fake.append(0x03)
 +        fake.append(Data("keepalive-ping-no-encryption".utf8))
 +        try await socket.sendRaw(fake, to: dest)
 +        try await Task.sleep(nanoseconds: 10_000_000)
