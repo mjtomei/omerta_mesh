@@ -73,7 +73,7 @@ public actor TunnelManager {
     private var auxiliaryPorts: [UInt16: Set<TunnelSessionKey>] = [:]
 
     /// Whether the manager is running
-    private var isRunning: Bool = false
+    public private(set) var isRunning: Bool = false
 
     /// Task consuming endpoint change events
     private var endpointChangeTask: Task<Void, Never>?
