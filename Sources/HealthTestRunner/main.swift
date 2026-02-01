@@ -1430,14 +1430,31 @@ if !isNodeA {
                 continue
             }
             let revPayload12 = Data(repeating: 0xBB, count: pktSize12r)
+            let revState12 = await revSession12.state
+            logger.info("Node B: reverse session state=\(revState12), channel=\(key12r.channel)")
             let revClock12 = ContinuousClock()
             let revStart12 = revClock12.now
             var revSentBytes12: UInt64 = 0
-            for _ in 1...pktCount12r {
-                try? await revSession12.send(revPayload12)
-                revSentBytes12 += UInt64(pktSize12r)
+            var revErrors12: Int = 0
+            for i in 1...pktCount12r {
+                do {
+                    try await revSession12.send(revPayload12)
+                    revSentBytes12 += UInt64(pktSize12r)
+                } catch {
+                    revErrors12 += 1
+                    if revErrors12 <= 3 {
+                        logger.error("Node B: reverse send error #\(revErrors12) at pkt \(i): \(error)")
+                    }
+                }
             }
-            try? await revSession12.flush()
+            do {
+                try await revSession12.flush()
+            } catch {
+                logger.error("Node B: reverse flush error: \(error)")
+            }
+            if revErrors12 > 0 {
+                logger.warning("Node B: reverse send had \(revErrors12) errors out of \(pktCount12r) packets")
+            }
             let revElapsed12 = revClock12.now - revStart12
             let revNanos12 = UInt64(revElapsed12.components.seconds) * 1_000_000_000 + UInt64(revElapsed12.components.attoseconds / 1_000_000_000)
             await sendControl("phase12-bw-reverse-done", detail: "\(revSentBytes12),\(revNanos12)")
@@ -1511,14 +1528,31 @@ if !isNodeA {
                 continue
             }
             let revPayload12bs = Data(repeating: 0xCC, count: pktSize12bs)
+            let revState12bs = await revSession12bs.state
+            logger.info("Node B: sweep reverse session state=\(revState12bs), channel=\(key12bs.channel)")
             let revClock12bs = ContinuousClock()
             let revStart12bs = revClock12bs.now
             var revSent12bs: UInt64 = 0
-            for _ in 1...pktCount12bs {
-                try? await revSession12bs.send(revPayload12bs)
-                revSent12bs += UInt64(pktSize12bs)
+            var revErrors12bs: Int = 0
+            for i in 1...pktCount12bs {
+                do {
+                    try await revSession12bs.send(revPayload12bs)
+                    revSent12bs += UInt64(pktSize12bs)
+                } catch {
+                    revErrors12bs += 1
+                    if revErrors12bs <= 3 {
+                        logger.error("Node B: sweep reverse send error #\(revErrors12bs) at pkt \(i): \(error)")
+                    }
+                }
             }
-            try? await revSession12bs.flush()
+            do {
+                try await revSession12bs.flush()
+            } catch {
+                logger.error("Node B: sweep reverse flush error: \(error)")
+            }
+            if revErrors12bs > 0 {
+                logger.warning("Node B: sweep reverse had \(revErrors12bs) errors out of \(pktCount12bs)")
+            }
             let revElapsed12bs = revClock12bs.now - revStart12bs
             let revNanos12bs = UInt64(revElapsed12bs.components.seconds) * 1_000_000_000 + UInt64(revElapsed12bs.components.attoseconds / 1_000_000_000)
             await sendControl("phase12b-step-reverse-done", detail: "\(revSent12bs),\(revNanos12bs)")
