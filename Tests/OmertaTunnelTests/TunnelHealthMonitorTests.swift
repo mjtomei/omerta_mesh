@@ -305,4 +305,152 @@ final class TunnelHealthMonitorTests: XCTestCase {
         let failures = await monitor._consecutiveFailures
         XCTAssertEqual(failures, 0, "No failures should accumulate when packets arrive with probes")
     }
+
+    // MARK: - Degraded state tests
+
+    func testDegradedFiringAtThreshold() async throws {
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            degradedThreshold: 3,
+            failureThreshold: 6
+        )
+
+        var degradedFired = false
+        var failureFired = false
+        let failureExpectation = expectation(description: "Failure callback fired")
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in },
+            onDegraded: { _ in degradedFired = true },
+            onFailure: { _ in
+                failureFired = true
+                failureExpectation.fulfill()
+            },
+            onRecovered: { _ in }
+        )
+
+        await fulfillment(of: [failureExpectation], timeout: 10)
+        await monitor.stopMonitoring()
+
+        XCTAssertTrue(degradedFired, "Degraded should fire at threshold 3")
+        XCTAssertTrue(failureFired, "Failure should fire at threshold 6")
+    }
+
+    func testDegradedRecovery() async throws {
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            degradedThreshold: 3,
+            failureThreshold: 10
+        )
+
+        var degradedFired = false
+        var recoveredFired = false
+        var failureFired = false
+        var probeCount = 0
+
+        let recoveredExpectation = expectation(description: "Recovery callback fired")
+        recoveredExpectation.assertForOverFulfill = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in
+                probeCount += 1
+                // After 4 probes with no response (degraded fires at 3),
+                // simulate a packet arriving
+                if probeCount == 5 {
+                    await monitor.onPacketReceived()
+                }
+            },
+            onDegraded: { _ in degradedFired = true },
+            onFailure: { _ in failureFired = true },
+            onRecovered: { _ in
+                recoveredFired = true
+                recoveredExpectation.fulfill()
+            }
+        )
+
+        await fulfillment(of: [recoveredExpectation], timeout: 10)
+        await monitor.stopMonitoring()
+
+        XCTAssertTrue(degradedFired, "Degraded should have fired")
+        XCTAssertTrue(recoveredFired, "Recovery should have fired after packet received")
+        XCTAssertFalse(failureFired, "Failure should not have fired")
+        let failures = await monitor._consecutiveFailures
+        XCTAssertEqual(failures, 0, "Failures should be reset after recovery")
+    }
+
+    func testDegradedDoesNotBreakLoop() async throws {
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            degradedThreshold: 2,
+            failureThreshold: 10
+        )
+
+        var degradedFired = false
+        var probeCountAfterDegraded = 0
+
+        let enoughProbes = expectation(description: "Probes continue after degraded")
+        enoughProbes.assertForOverFulfill = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in
+                if degradedFired {
+                    probeCountAfterDegraded += 1
+                    if probeCountAfterDegraded >= 3 {
+                        enoughProbes.fulfill()
+                    }
+                }
+            },
+            onDegraded: { _ in degradedFired = true },
+            onFailure: { _ in },
+            onRecovered: { _ in }
+        )
+
+        await fulfillment(of: [enoughProbes], timeout: 10)
+        await monitor.stopMonitoring()
+
+        XCTAssertTrue(degradedFired, "Degraded should have fired")
+        XCTAssertGreaterThanOrEqual(probeCountAfterDegraded, 3, "Monitor should keep probing after degraded")
+    }
+
+    func testNoDegradedWhenBelowThreshold() async throws {
+        let monitor = TunnelHealthMonitor(
+            minProbeInterval: .milliseconds(50),
+            maxProbeInterval: .seconds(1),
+            degradedThreshold: 3,
+            failureThreshold: 6
+        )
+
+        var degradedFired = false
+        var probeCount = 0
+        let respondedExpectation = expectation(description: "Responded before degraded threshold")
+        respondedExpectation.assertForOverFulfill = false
+
+        await monitor.startMonitoring(
+            machineId: "test-machine",
+            sendProbe: { _ in
+                probeCount += 1
+                // Miss 2 probes, then respond on 3rd (before degraded threshold fires)
+                if probeCount == 3 {
+                    await monitor.onPacketReceived()
+                    respondedExpectation.fulfill()
+                }
+            },
+            onDegraded: { _ in degradedFired = true },
+            onFailure: { _ in },
+            onRecovered: { _ in }
+        )
+
+        await fulfillment(of: [respondedExpectation], timeout: 10)
+        // Let another cycle pass
+        try await Task.sleep(for: .milliseconds(150))
+        await monitor.stopMonitoring()
+
+        XCTAssertFalse(degradedFired, "Degraded should not fire when failures stay below threshold")
+    }
 }

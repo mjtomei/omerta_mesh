@@ -203,7 +203,7 @@ public actor TunnelManager {
         // Return existing session if active
         if let existing = sessions[key] {
             let state = await existing.state
-            if state == .active {
+            if state == .active || state == .degraded {
                 return existing
             }
             // Remove stale session
@@ -242,6 +242,7 @@ public actor TunnelManager {
             let monitor = TunnelHealthMonitor(
                 minProbeInterval: config.healthProbeMinInterval,
                 maxProbeInterval: config.healthProbeMaxInterval,
+                degradedThreshold: config.healthDegradedThreshold,
                 failureThreshold: config.healthFailureThreshold,
                 graceIntervals: config.healthGraceIntervals
             )
@@ -253,9 +254,15 @@ public actor TunnelManager {
                     let payload = await self.buildProbePayload(for: id)
                     try await self.provider.sendOnChannel(payload, toMachine: id, channel: self.healthProbeChannel)
                 },
+                onDegraded: { [weak self] id in
+                    await self?.handleHealthDegraded(machineId: id)
+                },
                 onFailure: { [weak self] id in
                     guard let self else { return }
                     await self.handleHealthFailure(machineId: id)
+                },
+                onRecovered: { [weak self] id in
+                    await self?.handleHealthRecovered(machineId: id)
                 }
             )
         } else {
@@ -335,6 +342,26 @@ public actor TunnelManager {
         healthMonitors.removeValue(forKey: machineId)
     }
 
+    private func handleHealthDegraded(machineId: MachineId) async {
+        logger.warning("Health DEGRADED for machine — marking sessions degraded", metadata: ["machine": "\(machineId)"])
+        let keys = sessions.keys.filter { $0.remoteMachineId == machineId }
+        for key in keys {
+            if let session = sessions[key] {
+                await session.setDegraded()
+            }
+        }
+    }
+
+    private func handleHealthRecovered(machineId: MachineId) async {
+        logger.info("Health RECOVERED for machine — restoring sessions", metadata: ["machine": "\(machineId)"])
+        let keys = sessions.keys.filter { $0.remoteMachineId == machineId }
+        for key in keys {
+            if let session = sessions[key] {
+                await session.recover()
+            }
+        }
+    }
+
     private func reprobeAllMachines() async {
         for (_, monitor) in healthMonitors {
             await monitor.onPacketReceived()
@@ -360,6 +387,7 @@ public actor TunnelManager {
 
     private func dispatchToSession(_ data: Data, from machineId: MachineId, channel: String) async {
         let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+        await notifyPacketReceived(from: machineId)
         if let session = sessions[key] {
             receiveAccum[key, default: (bytes: 0, packets: 0)].bytes += UInt64(data.count)
             receiveAccum[key, default: (bytes: 0, packets: 0)].packets += 1
@@ -455,6 +483,7 @@ public actor TunnelManager {
                     let monitor = TunnelHealthMonitor(
                         minProbeInterval: config.healthProbeMinInterval,
                         maxProbeInterval: config.healthProbeMaxInterval,
+                        degradedThreshold: config.healthDegradedThreshold,
                         failureThreshold: config.healthFailureThreshold,
                         graceIntervals: config.healthGraceIntervals
                     )
@@ -465,8 +494,14 @@ public actor TunnelManager {
                             guard let self else { return }
                             try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
                         },
+                        onDegraded: { [weak self] id in
+                            await self?.handleHealthDegraded(machineId: id)
+                        },
                         onFailure: { [weak self] id in
                             await self?.handleHealthFailure(machineId: id)
+                        },
+                        onRecovered: { [weak self] id in
+                            await self?.handleHealthRecovered(machineId: id)
                         }
                     )
                 }
