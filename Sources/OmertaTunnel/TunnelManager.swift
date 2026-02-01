@@ -75,6 +75,9 @@ public actor TunnelManager {
     /// Whether the manager is running
     public private(set) var isRunning: Bool = false
 
+    /// When true, health monitors are not created for new sessions
+    private var healthMonitoringSuspended: Bool = false
+
     /// Task consuming endpoint change events
     private var endpointChangeTask: Task<Void, Never>?
 
@@ -258,7 +261,7 @@ public actor TunnelManager {
         await newSession.setEndpointSet(endpointSet)
 
         // Start health monitor for this machine if first session
-        if healthMonitors[machineId] == nil {
+        if !healthMonitoringSuspended, healthMonitors[machineId] == nil {
             logger.info("Creating health monitor for machine \(machineId.prefix(8))...")
             let monitor = TunnelHealthMonitor(
                 minProbeInterval: config.healthProbeMinInterval,
@@ -284,6 +287,8 @@ public actor TunnelManager {
                     await self?.handleHealthRecovered(machineId: id)
                 }
             )
+        } else if healthMonitoringSuspended {
+            logger.debug("Health monitoring suspended, skipping monitor for \(machineId.prefix(8))")
         } else {
             logger.debug("Health monitor already exists for \(machineId.prefix(8))...")
         }
@@ -398,6 +403,22 @@ public actor TunnelManager {
                 await session.recover()
             }
         }
+    }
+
+    /// Suspend health monitoring: stop all monitors and prevent new ones from being created.
+    /// Call `resumeHealthMonitoring()` to re-enable.
+    public func suspendHealthMonitoring() async {
+        healthMonitoringSuspended = true
+        for (id, monitor) in healthMonitors {
+            await monitor.stopMonitoring()
+            logger.info("Suspended health monitor for \(id.prefix(8))")
+        }
+        healthMonitors.removeAll()
+    }
+
+    /// Resume health monitoring for future sessions.
+    public func resumeHealthMonitoring() {
+        healthMonitoringSuspended = false
     }
 
     private func reprobeAllMachines() async {
@@ -552,7 +573,7 @@ public actor TunnelManager {
                 }
 
                 // Start health monitor for this machine if first session
-                if healthMonitors[machineId] == nil {
+                if !healthMonitoringSuspended, healthMonitors[machineId] == nil {
                     let monitor = TunnelHealthMonitor(
                         minProbeInterval: config.healthProbeMinInterval,
                         maxProbeInterval: config.healthProbeMaxInterval,

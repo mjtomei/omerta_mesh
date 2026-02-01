@@ -1473,10 +1473,8 @@ if !isNodeA {
 
         case "suspend-health":
             // Suspend health monitoring on Node B during bandwidth phases
-            if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
-                await mon.stopMonitoring()
-                logger.info("Node B: health monitoring suspended")
-            }
+            await manager.suspendHealthMonitoring()
+            logger.info("Node B: health monitoring suspended")
             await sendControl("suspend-health-ack")
 
         case "ramp-step-reset":
@@ -3013,10 +3011,8 @@ logPhase("Phase 15: Multi-Endpoint Bandwidth")
 if targetPhase == nil || targetPhase == 15 {
 
 do {
-    // Suspend health monitoring if not already suspended (in case phases 11-14 were skipped)
-    if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
-        await mon.stopMonitoring()
-    }
+    // Suspend health monitoring on both sides — prevents new monitors during bandwidth tests
+    await manager.suspendHealthMonitoring()
     await sendControl("suspend-health")
     _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
     try await Task.sleep(for: .milliseconds(500))
@@ -3036,12 +3032,6 @@ do {
         logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
 
         let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
-        // Stop health monitor on both sides — bandwidth saturation prevents probes
-        if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
-            await mon.stopMonitoring()
-        }
-        await sendControl("suspend-health")
-        _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
         try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
 
         let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
@@ -3132,12 +3122,6 @@ do {
 
             // Node A creates the session (triggers endpoint negotiation)
             let revSession = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
-            // Stop health monitor on both sides — bandwidth saturation prevents probes
-            if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
-                await mon.stopMonitoring()
-            }
-            await sendControl("suspend-health")
-            _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
             try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation
 
             let revKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
