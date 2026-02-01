@@ -572,22 +572,36 @@ final class BinaryEnvelopeTests: XCTestCase {
         XCTAssertEqual(emptyOverhead, 232 + 16)
     }
 
+    func testPlatformMaxUDPDatagramIsSane() {
+        let maxDgram = BinaryEnvelope.platformMaxUDPDatagram
+        XCTAssertGreaterThan(maxDgram, 0, "platformMaxUDPDatagram must be positive")
+        XCTAssertLessThanOrEqual(maxDgram, 65535, "platformMaxUDPDatagram must not exceed 65535")
+        #if canImport(Darwin)
+        // macOS default is 9216; verify we got a reasonable value
+        XCTAssertGreaterThanOrEqual(maxDgram, 9216,
+            "macOS platformMaxUDPDatagram should be at least 9216, got \(maxDgram)")
+        #else
+        XCTAssertEqual(maxDgram, 65535, "Linux platformMaxUDPDatagram should be 65535")
+        #endif
+    }
+
     func testMaxPayloadForUDPIsExact() {
         let maxPayload = BinaryEnvelope.maxPayloadForUDP
+        let maxDgram = BinaryEnvelope.platformMaxUDPDatagram
 
-        // At maxPayload, the wire size should be <= 65535
+        // At maxPayload, the wire size should be <= platformMaxUDPDatagram
         let wireSize = maxPayload + BinaryEnvelope.totalOverhead(payloadSize: maxPayload)
-        XCTAssertLessThanOrEqual(wireSize, 65535,
-            "maxPayloadForUDP (\(maxPayload)) produces wire size \(wireSize) which exceeds 65535")
+        XCTAssertLessThanOrEqual(wireSize, maxDgram,
+            "maxPayloadForUDP (\(maxPayload)) produces wire size \(wireSize) which exceeds \(maxDgram)")
 
-        // At maxPayload + 1, the wire size should exceed 65535
+        // At maxPayload + 1, the wire size should exceed platformMaxUDPDatagram
         let wireSizePlus1 = (maxPayload + 1) + BinaryEnvelope.totalOverhead(payloadSize: maxPayload + 1)
-        XCTAssertGreaterThan(wireSizePlus1, 65535,
-            "maxPayloadForUDP + 1 should exceed 65535 but wire size is \(wireSizePlus1)")
+        XCTAssertGreaterThan(wireSizePlus1, maxDgram,
+            "maxPayloadForUDP + 1 should exceed \(maxDgram) but wire size is \(wireSizePlus1)")
     }
 
     func testMaxApplicationDataForUDPEncodesSuccessfully() throws {
-        // Verify that MeshMessage.data() at maxApplicationDataForUDP encodes to <= 65535 bytes
+        let maxDgram = BinaryEnvelope.platformMaxUDPDatagram
         let keypair = IdentityKeypair()
         let machineId = UUID().uuidString
         let maxAppData = BinaryEnvelope.maxApplicationDataForUDP
@@ -602,12 +616,12 @@ final class BinaryEnvelopeTests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: Data(repeating: 0x42, count: 32))
-        XCTAssertLessThanOrEqual(encoded.data.count, 65535,
-            "Envelope with maxApplicationDataForUDP bytes should fit in a UDP datagram, got \(encoded.data.count)")
+        XCTAssertLessThanOrEqual(encoded.data.count, maxDgram,
+            "Envelope with maxApplicationDataForUDP bytes should fit in \(maxDgram), got \(encoded.data.count)")
     }
 
     func testMaxApplicationDataPlusOneExceedsUDP() throws {
-        // Verify that maxApplicationDataForUDP + 1 exceeds the limit
+        let maxDgram = BinaryEnvelope.platformMaxUDPDatagram
         let keypair = IdentityKeypair()
         let machineId = UUID().uuidString
         // Use a significantly larger payload to account for base64 granularity
@@ -623,7 +637,7 @@ final class BinaryEnvelopeTests: XCTestCase {
         )
 
         let encoded = try envelope.encodeV2(networkKey: Data(repeating: 0x42, count: 32))
-        XCTAssertGreaterThan(encoded.data.count, 65535,
-            "Envelope with maxApplicationDataForUDP + 512 bytes should exceed UDP limit, got \(encoded.data.count)")
+        XCTAssertGreaterThan(encoded.data.count, maxDgram,
+            "Envelope with maxApplicationDataForUDP + 512 bytes should exceed \(maxDgram), got \(encoded.data.count)")
     }
 }
