@@ -3036,10 +3036,12 @@ do {
         logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
 
         let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
-        // Stop health monitor — bandwidth saturation prevents probes from getting through
+        // Stop health monitor on both sides — bandwidth saturation prevents probes
         if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
             await mon.stopMonitoring()
         }
+        await sendControl("suspend-health")
+        _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
         try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
 
         let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
@@ -3130,10 +3132,12 @@ do {
 
             // Node A creates the session (triggers endpoint negotiation)
             let revSession = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
-            // Stop health monitor — bandwidth saturation prevents probes from getting through
+            // Stop health monitor on both sides — bandwidth saturation prevents probes
             if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
                 await mon.stopMonitoring()
             }
+            await sendControl("suspend-health")
+            _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
             try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation
 
             let revKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
