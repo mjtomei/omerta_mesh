@@ -202,10 +202,19 @@ let logger = Logger(label: "health-test")
 
 // MARK: - Root Check
 
+// Root is required for phases 1-10 (iptables/pfctl/ip commands) but not for bandwidth-only phases
 #if canImport(Glibc) || canImport(Darwin)
-if getuid() != 0 {
+let earlyPhaseArg: Int? = {
+    let allArgs = CommandLine.arguments
+    if let idx = allArgs.firstIndex(of: "--phase"), idx + 1 < allArgs.count {
+        return Int(allArgs[idx + 1])
+    }
+    return nil
+}()
+if getuid() != 0 && (earlyPhaseArg == nil || earlyPhaseArg! <= 10) {
     logger.error("HealthTestRunner must be run as root (for iptables/pfctl/ip commands)")
     logger.error("Usage: sudo .build/debug/HealthTestRunner --role nodeA ...")
+    logger.error("  Or use --phase 11 to skip phases requiring root")
     exit(1)
 }
 #endif
