@@ -80,11 +80,27 @@ public enum BinaryEnvelope {
         return headerOverhead + chunkCount * perChunkOverhead
     }
 
+    /// Maximum UDP datagram size for the current platform.
+    /// macOS defaults to 9216 (net.inet.udp.maxdgram), Linux allows up to 65535.
+    public static let platformMaxUDPDatagram: Int = {
+        #if canImport(Darwin)
+        // Query sysctl net.inet.udp.maxdgram at runtime
+        var size = 0
+        var len = MemoryLayout<Int>.size
+        if sysctlbyname("net.inet.udp.maxdgram", &size, &len, nil, 0) == 0, size > 0 {
+            return size
+        }
+        return 9216  // macOS default
+        #else
+        return 65535
+        #endif
+    }()
+
     /// Maximum envelope payload (post-JSON-encoding) that fits in a single
-    /// UDP datagram (65535 bytes).
+    /// UDP datagram, respecting platform limits.
     /// Derived from: wireSize = headerOverhead + payload + ceil(payload/chunkSize) * perChunkOverhead
     public static let maxPayloadForUDP: Int = {
-        let maxWire = 65535
+        let maxWire = platformMaxUDPDatagram
         // Binary search for the largest payload where totalOverhead(payload) + payload <= maxWire
         var lo = 0
         var hi = maxWire
