@@ -2911,15 +2911,15 @@ do {
     // Bandwidth by packet size (A→B)
     logger.info("")
     logger.info("=== BANDWIDTH BY PACKET SIZE (A\u{2192}B) ===")
-    logger.info("Packet Size    Vanilla Sent    Mesh Sent    Overhead")
+    logger.info("Packet Size    Vanilla Delivered    Mesh Delivered    Overhead")
     let vanillaAtoB = perfSummary.vanillaBandwidth.filter { $0.direction == "A\u{2192}B" }
     let meshAtoB = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }
     let allSizes = Set(vanillaAtoB.map(\.packetSize) + meshAtoB.map(\.packetSize)).sorted()
     for size in allSizes {
-        let vBw = vanillaAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
-        let mBw = meshAtoB.first(where: { $0.packetSize == size })?.sentMbps ?? 0
+        let vBw = vanillaAtoB.first(where: { $0.packetSize == size })?.deliveredMbps ?? 0
+        let mBw = meshAtoB.first(where: { $0.packetSize == size })?.deliveredMbps ?? 0
         let overhead = vBw > 0 && mBw > 0 ? String(format: "%.2fx", vBw / mBw) : "N/A"
-        logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))  \(String(format: "%10.1f", mBw))    \(overhead)")
+        logger.info("\(String(format: "%7d B", size))    \(String(format: "%14.1f", vBw))  \(String(format: "%14.1f", mBw))    \(overhead)")
     }
 
     // Ramp curves
