@@ -1598,15 +1598,6 @@ if !isNodeA {
                 } else if stepCmd.phase == "ramp-step-reset" {
                     await multiEpMeasurer15.start()
                     await sendControl("ramp-step-reset-ack")
-                } else if stepCmd.phase == "phase15-ep-reset" {
-                    await multiEpMeasurer15.start()
-                    await sendControl("phase15-ep-reset-ack")
-                } else if stepCmd.phase == "phase15-ep-report" {
-                    let epResult = await multiEpMeasurer15.result()
-                    let epBytes = epResult.bytes
-                    let epDur = epResult.duration
-                    let epNanos = UInt64(epDur.components.seconds) * 1_000_000_000 + UInt64(epDur.components.attoseconds / 1_000_000_000)
-                    await sendControl("phase15-ep-report-ack", detail: "\(epBytes),\(epNanos)")
                 } else if stepCmd.phase == "phase15-multiep-done" {
                     break
                 }
@@ -2951,10 +2942,6 @@ do {
 
         logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
 
-        // Reset Node B's measurer for this endpoint count
-        await sendControl("phase15-ep-reset")
-        _ = await waitForPhase("phase15-ep-reset-ack", timeout: .seconds(10))
-
         let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
         try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
 
@@ -2974,12 +2961,28 @@ do {
             targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
             send: { data in try await session.send(data) },
             flush: { try await session.flush() },
-            getDelivered: { (0, 0) },
-            resetReceiver: { },
+            getDelivered: {
+                await sendControl("ramp-step-report")
+                if let report = await waitForPhase("ramp-step-report-ack", timeout: .seconds(10)),
+                   let detail = report.detail {
+                    let parts = detail.split(separator: ",")
+                    if parts.count >= 2,
+                       let bytes = UInt64(parts[0]),
+                       let nanos = UInt64(parts[1]) {
+                        return (bytes, nanos)
+                    }
+                }
+                return (0, 0)
+            },
+            resetReceiver: {
+                await sendControl("ramp-step-reset")
+                _ = await waitForPhase("ramp-step-reset-ack", timeout: .seconds(5))
+            },
             logger: logger
         )
 
         let peak = rampResult.peakSentMbps
+        let receivedMbps = rampResult.peakDeliveredMbps
         let duration = rampResult.totalDurationSeconds
 
         // Per-endpoint breakdown
@@ -2997,22 +3000,12 @@ do {
 
         logger.info("  Peak sent: \(String(format: "%.1f", peak)) Mbps")
 
+        logger.info("  Received: \(String(format: "%.1f", receivedMbps)) Mbps")
+        let lossPct = peak > 0 && receivedMbps > 0 ? max(0, (1.0 - receivedMbps / peak) * 100.0) : 0.0
+
         // Close session before next run to free aux ports, and allow actor queues to drain
         await manager.closeSession(key: epKey)
         try await Task.sleep(for: .seconds(3))
-
-        // Query Node B's received bytes now that queues have drained
-        await sendControl("phase15-ep-report")
-        var receivedMbps = 0.0
-        if let reportMsg = await waitForPhase("phase15-ep-report-ack", timeout: .seconds(10)) {
-            let parts = (reportMsg.detail ?? "").split(separator: ",")
-            if parts.count == 2, let rxBytes = UInt64(parts[0]), let rxNanos = UInt64(parts[1]), rxNanos > 0 {
-                receivedMbps = Double(rxBytes) * 8.0 / (Double(rxNanos) / 1_000_000_000.0) / 1_000_000.0
-                logger.info("  Received: \(String(format: "%.1f", receivedMbps)) Mbps")
-            }
-        }
-
-        let lossPct = peak > 0 && receivedMbps > 0 ? max(0, (1.0 - receivedMbps / peak) * 100.0) : 0.0
 
         record("Phase 15: \(totalEps)-EP BW", passed: peak > 0,
                detail: "endpoints=\(actualEpCount), peak-sent=\(String(format: "%.1f", peak))Mbps, received=\(String(format: "%.1f", receivedMbps))Mbps, loss=\(String(format: "%.1f", lossPct))%, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", peak / singleEpPeak) : "N/A")")
