@@ -217,6 +217,7 @@ var port: Int = 18020
 var bootstrap: String? = nil
 var lan = false
 var remoteHost: String = ""
+var targetPhase: Int? = nil
 
 var args = CommandLine.arguments.dropFirst()
 while let arg = args.first {
@@ -235,6 +236,9 @@ while let arg = args.first {
         lan = true
     case "--remote-host":
         remoteHost = String(args.first ?? "")
+        args = args.dropFirst()
+    case "--phase":
+        targetPhase = Int(args.first ?? "")
         args = args.dropFirst()
     default:
         break
@@ -1608,10 +1612,13 @@ func record(_ name: String, passed: Bool, detail: String) {
 
 // MARK: - Phase 1: Baseline Bidirectional Traffic
 
+var monitor: TunnelHealthMonitor? = nil
+
+if targetPhase == nil || targetPhase! <= 10 {
+
 logPhase("Phase 1: Baseline Bidirectional Traffic")
 
 var session1: TunnelSession? = nil
-var monitor: TunnelHealthMonitor? = nil
 
 do {
     // Wait for Node B to signal it's ready (handler set up)
@@ -2147,6 +2154,8 @@ do {
 record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
+
+} // end phases 1-10 guard
 
 // MARK: - Phase 11a: Vanilla Baseline (Direct UDP)
 
