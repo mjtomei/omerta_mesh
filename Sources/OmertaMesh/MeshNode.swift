@@ -268,6 +268,12 @@ public actor MeshNode {
     /// Set of known bootstrap peer IDs (for weighted NAT predictions)
     private var bootstrapPeers: Set<PeerId> = []
 
+    /// Optional crypto process pool for offloading ChaCha20-Poly1305 chunk operations
+    public var cryptoPool: CryptoProcessPool?
+
+    /// Optional signature process pool for offloading Ed25519 verification
+    public var signaturePool: SignatureProcessPool?
+
     /// The port we're listening on
     public var port: Int? {
         get async {
@@ -282,7 +288,9 @@ public actor MeshNode {
     ///   - identity: The cryptographic identity (peer ID is derived from this)
     ///   - config: Node configuration (must include encryption key)
     ///   - eventLogger: Optional event logger for persistent storage
-    public init(identity: IdentityKeypair, config: Config, eventLogger: MeshEventLogger? = nil) throws {
+    ///   - cryptoPool: Optional crypto process pool for parallel chunk crypto
+    ///   - signaturePool: Optional signature process pool for parallel verification
+    public init(identity: IdentityKeypair, config: Config, eventLogger: MeshEventLogger? = nil, cryptoPool: CryptoProcessPool? = nil, signaturePool: SignatureProcessPool? = nil) throws {
         self.identity = identity
         self.machineId = try getOrCreateMachineId()
         self.config = config
@@ -312,6 +320,8 @@ public actor MeshNode {
         )
         self.natPredictor = NATPredictor()
         self.machinePeerRegistry = MachinePeerRegistry()
+        self.cryptoPool = cryptoPool
+        self.signaturePool = signaturePool
     }
 
     /// Set up the hole punch manager callbacks
@@ -561,7 +571,12 @@ public actor MeshNode {
             channel: channel,
             payload: message
         )
-        let encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+        let encryptedData: SealedEnvelope
+        if let pool = cryptoPool {
+            encryptedData = try await envelope.encodeV2(networkKey: config.encryptionKey, pool: pool)
+        } else {
+            encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+        }
 
         let sendSocket: UDPSocket
         if let port = viaPort, let auxSocket = auxiliarySockets[port] {
@@ -606,8 +621,13 @@ public actor MeshNode {
         // Try v2 wire format first (fast path rejection for non-Omerta packets)
         if BinaryEnvelope.isValidPrefix(data) {
             do {
-                // Use decodeV2WithHash to get the raw channel hash for routing
-                let (envelope, channelHash) = try MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey)
+                // Use pool-accelerated decode if crypto pool is available
+                let (envelope, channelHash): (MeshEnvelope, UInt16)
+                if let pool = cryptoPool {
+                    (envelope, channelHash) = try await MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey, pool: pool)
+                } else {
+                    (envelope, channelHash) = try MeshEnvelope.decodeV2WithHash(data, networkKey: config.encryptionKey)
+                }
                 await processEnvelope(envelope, from: address, channelHash: channelHash, skipEndpointRecording: isAuxiliary)
                 return
             } catch EnvelopeError.networkMismatch {
@@ -668,7 +688,14 @@ public actor MeshNode {
         }
 
         // Verify signature using embedded public key (also verifies peer ID derivation)
-        guard envelope.verifySignature() else {
+        // Use signature pool if available for off-process verification
+        let signatureValid: Bool
+        if let sigPool = signaturePool {
+            signatureValid = await envelope.verifySignature(pool: sigPool)
+        } else {
+            signatureValid = envelope.verifySignature()
+        }
+        guard signatureValid else {
             logger.warning("Rejecting message with invalid signature",
                           metadata: ["from": "\(envelope.fromPeerId.prefix(8))..."])
 
@@ -1058,7 +1085,13 @@ public actor MeshNode {
         )
 
         // Encode using v2 wire format with layered encryption
-        let encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+        // Use crypto pool if available
+        let encryptedData: SealedEnvelope
+        if let pool = cryptoPool {
+            encryptedData = try await envelope.encodeV2(networkKey: config.encryptionKey, pool: pool)
+        } else {
+            encryptedData = try envelope.encodeV2(networkKey: config.encryptionKey)
+        }
         logger.info("Sending \(encryptedData.data.count) bytes to \(endpoint)")
         try await socket.send(encryptedData, to: endpoint)
 
