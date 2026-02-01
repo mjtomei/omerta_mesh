@@ -1562,6 +1562,62 @@ if !isNodeA {
             logger.info("Node B: batch sweep complete")
             await sendControl("phase12b-sweep-done-ack")
 
+        case "phase12c-parallel-start":
+            // Phase 12c: Parallel sessions B→A bandwidth test
+            let parts12c = (cmd.detail ?? "").split(separator: ",")
+            let sessionCount12c = parts12c.count >= 1 ? (Int(parts12c[0]) ?? 4) : 4
+            let pktSize12c = parts12c.count >= 2 ? (Int(parts12c[1]) ?? 1400) : 1400
+            let pktCount12c = parts12c.count >= 3 ? (Int(parts12c[2]) ?? 5000) : 5000
+
+            // Get or create sessions on numbered channels
+            var sessions12c: [TunnelSession] = []
+            guard let baseKey12c = await dataRouter.key else {
+                await sendControl("phase12c-parallel-done", detail: "0,0")
+                continue
+            }
+            for i in 0..<sessionCount12c {
+                let ch = "health-test-par-\(i)"
+                if let s = try? await manager.getSession(machineId: baseKey12c.remoteMachineId, channel: ch) {
+                    sessions12c.append(s)
+                }
+            }
+            logger.info("Node B: phase12c sending on \(sessions12c.count) sessions, \(pktCount12c) pkts of \(pktSize12c)B each")
+            await sendControl("phase12c-parallel-ack")
+
+            let payload12c = Data(repeating: 0xDD, count: pktSize12c)
+            let clock12c = ContinuousClock()
+            let start12c = clock12c.now
+
+            // Send in parallel across all sessions using a task group
+            await withTaskGroup(of: UInt64.self) { group in
+                for session in sessions12c {
+                    group.addTask {
+                        var sent: UInt64 = 0
+                        for _ in 1...pktCount12c {
+                            do {
+                                try await session.send(payload12c)
+                                sent += UInt64(pktSize12c)
+                            } catch {
+                                break
+                            }
+                        }
+                        try? await session.flush()
+                        return sent
+                    }
+                }
+                // Await all tasks (results unused, just drain)
+                for await _ in group {}
+            }
+
+            let elapsed12c = clock12c.now - start12c
+            let nanos12c = UInt64(elapsed12c.components.seconds) * 1_000_000_000 + UInt64(elapsed12c.components.attoseconds / 1_000_000_000)
+            let totalSent12c = UInt64(sessions12c.count) * UInt64(pktCount12c) * UInt64(pktSize12c)
+            await sendControl("phase12c-parallel-done", detail: "\(totalSent12c),\(nanos12c)")
+            logger.info("Node B: phase12c sent \(totalSent12c) bytes across \(sessions12c.count) sessions in \(nanos12c)ns")
+
+        case "phase12c-cleanup":
+            await sendControl("phase12c-cleanup-ack")
+
         case "phase13-ping-start":
             // Echo tunnel pings back (PING→PONG)
             await sendControl("phase13-ping-ack")
@@ -2706,6 +2762,87 @@ do {
            detail: perfSummary.batchSweep.filter { $0.direction == "A\u{2192}B" }.map { "delay=\($0.delayMs)ms:\(String(format: "%.1f", $0.sentMbps))Mbps" }.joined(separator: ", "))
 } catch {
     record("Phase 12b: Batch Config Sweep", passed: false, detail: "Error: \(error)")
+}
+
+// MARK: - Phase 12c: Parallel Sessions B→A Bandwidth
+
+logPhase("Phase 12c: Parallel Sessions B\u{2192}A")
+
+do {
+    let parallelCounts = [1, 2, 4, 8]
+    let parPktSize = 1400
+    let parTargetBytes: UInt64 = 10_000_000  // per session
+    let parPktCount = Int(parTargetBytes / UInt64(parPktSize))
+
+    logger.info("Parallel B\u{2192}A: \(parPktCount) pkts of \(parPktSize)B per session")
+
+    var parallelResults: [(sessions: Int, sentMbps: Double, deliveredMbps: Double)] = []
+
+    for count in parallelCounts {
+        // Create receiver sessions on Node A
+        var receiveMeasurers: [BandwidthMeasurer] = []
+        var parSessions: [TunnelSession] = []
+        for i in 0..<count {
+            let ch = "health-test-par-\(i)"
+            let measurer = BandwidthMeasurer()
+            await measurer.start()
+            receiveMeasurers.append(measurer)
+            let s = try await manager.getSession(machineId: remoteMachineId, channel: ch)
+            let m = measurer  // capture for closure
+            await s.onReceive { data in
+                await m.addBytes(UInt64(data.count))
+            }
+            parSessions.append(s)
+        }
+
+        // Tell Node B to start sending
+        await sendControl("phase12c-parallel-start", detail: "\(count),\(parPktSize),\(parPktCount)")
+        _ = await waitForPhase("phase12c-parallel-ack", timeout: .seconds(15))
+
+        // Wait for Node B to finish
+        var sentMbps: Double = 0
+        if let done = await waitForPhase("phase12c-parallel-done", timeout: .seconds(60)),
+           let detail = done.detail {
+            let parts = detail.split(separator: ",")
+            if parts.count >= 2,
+               let sentBytes = UInt64(parts[0]),
+               let sentNanos = UInt64(parts[1]),
+               sentNanos > 0 {
+                sentMbps = Double(sentBytes) * 8.0 / 1_000_000.0 / (Double(sentNanos) / 1e9)
+            }
+        }
+
+        // Wait for stragglers
+        try await Task.sleep(for: .seconds(2))
+
+        // Sum delivered across all sessions
+        var totalDeliveredBytes: UInt64 = 0
+        var maxDuration: Duration = .zero
+        for measurer in receiveMeasurers {
+            let r = await measurer.result()
+            totalDeliveredBytes += r.bytes
+            if r.duration > maxDuration { maxDuration = r.duration }
+        }
+        let durationSec = Double(maxDuration.components.seconds) + Double(maxDuration.components.attoseconds) / 1e18
+        let deliveredMbps = durationSec > 0 ? (Double(totalDeliveredBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
+
+        parallelResults.append((sessions: count, sentMbps: sentMbps, deliveredMbps: deliveredMbps))
+        logger.info("  \(count) session(s): sent=\(String(format: "%.1f", sentMbps)) Mbps, delivered=\(String(format: "%.1f", deliveredMbps)) Mbps (\(String(format: "%.1f", Double(totalDeliveredBytes) / 1_000_000.0)) MB)")
+
+        // Clean up sessions
+        for i in 0..<count {
+            let key = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: "health-test-par-\(i)")
+            await manager.closeSession(key: key)
+        }
+        await sendControl("phase12c-cleanup")
+        _ = await waitForPhase("phase12c-cleanup-ack", timeout: .seconds(10))
+        try await Task.sleep(for: .seconds(1))
+    }
+
+    let summary = parallelResults.map { "\($0.sessions)s:\(String(format: "%.1f", $0.deliveredMbps))Mbps" }.joined(separator: ", ")
+    record("Phase 12c: Parallel B\u{2192}A", passed: !parallelResults.isEmpty, detail: summary)
+} catch {
+    record("Phase 12c: Parallel B\u{2192}A", passed: false, detail: "Error: \(error)")
 }
 
 // MARK: - Phase 13: Mesh Latency (Ping-Pong)
