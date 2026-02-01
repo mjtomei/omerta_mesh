@@ -349,6 +349,26 @@ public struct MeshEnvelope: Codable, Sendable {
         return envelope
     }
 
+    /// Verify the signature off-process using a signature pool.
+    /// Also verifies that fromPeerId is correctly derived from the public key.
+    public func verifySignature(pool: SignatureProcessPool) async -> Bool {
+        guard IdentityKeypair.verifyPeerIdDerivation(peerId: fromPeerId, publicKeyBase64: publicKey) else {
+            return false
+        }
+
+        guard let sigData = Data(base64Encoded: signature),
+              let keyData = Data(base64Encoded: publicKey),
+              let dataToSign = try? dataToSign() else {
+            return false
+        }
+
+        do {
+            return try await pool.verify(data: dataToSign, signature: sigData, publicKey: keyData)
+        } catch {
+            return false
+        }
+    }
+
     /// Verify the signature using the embedded public key
     /// Also verifies that fromPeerId is correctly derived from the public key
     public func verifySignature() -> Bool {

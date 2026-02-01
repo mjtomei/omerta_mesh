@@ -62,6 +62,12 @@ public actor MeshNetwork: ChannelProvider {
     /// Retry configuration for network operations
     public var retryConfig: RetryConfig = .network
 
+    /// Optional crypto process pool for offloading ChaCha20-Poly1305 operations
+    private var cryptoPool: CryptoProcessPool?
+
+    /// Optional signature process pool for offloading Ed25519 verification
+    private var signaturePool: SignatureProcessPool?
+
     // MARK: - Initialization
 
     /// Create a new mesh network with a cryptographic identity
@@ -86,6 +92,24 @@ public actor MeshNetwork: ChannelProvider {
         self.connectionTracker = DirectConnectionTracker(staleThreshold: config.recentContactMaxAge)
         self.networkStore = networkStore ?? NetworkStore.defaultStore()
         self.logger = Logger(label: "io.omerta.mesh.network")
+    }
+
+    // MARK: - Process Pools
+
+    /// Enable crypto process pool for offloading ChaCha20-Poly1305 chunk operations.
+    /// Must be called before start(). Only functional on Linux.
+    /// - Parameter workerCount: Number of worker processes (default: processor count)
+    public func enableCryptoPool(workerCount: Int = ProcessInfo.processInfo.processorCount) throws {
+        guard state == .stopped else { return }
+        self.cryptoPool = try CryptoProcessPool(workerCount: workerCount)
+    }
+
+    /// Enable signature process pool for offloading Ed25519 verification.
+    /// Must be called before start(). Only functional on Linux.
+    /// - Parameter workerCount: Number of worker processes (default: 2)
+    public func enableSignaturePool(workerCount: Int = 2) throws {
+        guard state == .stopped else { return }
+        self.signaturePool = try SignatureProcessPool(workerCount: workerCount)
     }
 
     // MARK: - Lifecycle
@@ -139,7 +163,7 @@ public actor MeshNetwork: ChannelProvider {
                 self.eventLogger = try? MeshEventLogger(logDir: config.eventLogDir)
             }
 
-            let node = try MeshNode(identity: identity, config: nodeConfig, eventLogger: eventLogger)
+            let node = try MeshNode(identity: identity, config: nodeConfig, eventLogger: eventLogger, cryptoPool: cryptoPool, signaturePool: signaturePool)
             self.meshNode = node
 
             // Start the node
@@ -196,6 +220,11 @@ public actor MeshNetwork: ChannelProvider {
             await node.stop()
             meshNode = nil
         }
+
+        cryptoPool?.shutdown()
+        cryptoPool = nil
+        signaturePool?.shutdown()
+        signaturePool = nil
 
         if ownsEventLoopGroup, let elg = eventLoopGroup {
             try? await elg.shutdownGracefully()
