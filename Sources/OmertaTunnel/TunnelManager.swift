@@ -54,6 +54,18 @@ public actor TunnelManager {
     private let pendingDataMaxPerKey = 32
     private let pendingDataTTL: Duration = .seconds(5)
 
+    /// Per-session receive accumulators (bytes and packets since last probe)
+    private var receiveAccum: [TunnelSessionKey: (bytes: UInt64, packets: UInt64)] = [:]
+
+    /// Timestamp of last probe sent to each machine (for computing per-second rates)
+    private var lastProbeTime: [MachineId: ContinuousClock.Instant] = [:]
+
+    /// Per-machine round-robin offset for probe channel selection
+    private var probeRoundRobinOffset: [MachineId: Int] = [:]
+
+    /// Remote-reported delivered stats per session
+    private var deliveredStats: [TunnelSessionKey: (bytesPerSecond: UInt64, packetsPerSecond: UInt64)] = [:]
+
     /// Whether the manager is running
     private var isRunning: Bool = false
 
@@ -110,11 +122,10 @@ public actor TunnelManager {
 
         // Register health probe handler — receiving a probe means remote is alive.
         // Both sides run monitors and send probes independently. No echo response needed.
-        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
+        // Probes carry per-channel receive stats reported by the remote side.
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
             guard let self else { return }
-            let hasMonitor = await self.healthMonitors[machineId] != nil
-            await self.logger.debug("Health probe received from \(machineId.prefix(8)), monitor exists: \(hasMonitor)")
-            await self.notifyPacketReceived(from: machineId)
+            await self.handleHealthProbe(from: machineId, data: data)
         }
 
         isRunning = true
@@ -159,6 +170,10 @@ public actor TunnelManager {
         sessions.removeAll()
         sessionIds.removeAll()
         pendingData.removeAll()
+        receiveAccum.removeAll()
+        deliveredStats.removeAll()
+        lastProbeTime.removeAll()
+        probeRoundRobinOffset.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
@@ -235,7 +250,8 @@ public actor TunnelManager {
                 machineId: machineId,
                 sendProbe: { [weak self] id in
                     guard let self else { return }
-                    try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                    let payload = await self.buildProbePayload(for: id)
+                    try await self.provider.sendOnChannel(payload, toMachine: id, channel: self.healthProbeChannel)
                 },
                 onFailure: { [weak self] id in
                     guard let self else { return }
@@ -265,6 +281,8 @@ public actor TunnelManager {
     public func closeSession(key: TunnelSessionKey) async {
         guard let session = sessions.removeValue(forKey: key) else { return }
         let sid = sessionIds.removeValue(forKey: key)
+        receiveAccum.removeValue(forKey: key)
+        deliveredStats.removeValue(forKey: key)
 
         logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
@@ -288,6 +306,8 @@ public actor TunnelManager {
         if let monitor = healthMonitors.removeValue(forKey: machineId) {
             await monitor.stopMonitoring()
         }
+        lastProbeTime.removeValue(forKey: machineId)
+        probeRoundRobinOffset.removeValue(forKey: machineId)
     }
 
     /// Close the default "data" channel session (backward compatibility)
@@ -341,6 +361,8 @@ public actor TunnelManager {
     private func dispatchToSession(_ data: Data, from machineId: MachineId, channel: String) async {
         let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
         if let session = sessions[key] {
+            receiveAccum[key, default: (bytes: 0, packets: 0)].bytes += UInt64(data.count)
+            receiveAccum[key, default: (bytes: 0, packets: 0)].packets += 1
             await session.deliverIncoming(data)
         } else {
             // Buffer data that arrives before the session handshake completes
@@ -478,6 +500,125 @@ public actor TunnelManager {
                 await session.close()
                 logger.info("Session closed by machine", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
             }
+        }
+    }
+    // MARK: - Delivered Stats
+
+    /// Get delivered traffic stats for a session, as reported by the remote side.
+    public func deliveredTrafficStats(for key: TunnelSessionKey) -> (bytesPerSecond: UInt64, packetsPerSecond: UInt64)? {
+        deliveredStats[key]
+    }
+
+    // MARK: - Probe Encoding/Decoding
+
+    /// Build a probe payload with per-channel receive stats for the given machine.
+    /// Format: [1B channelCount] then per channel: [1B nameLen][name bytes][8B bytesPerSec LE][8B packetsPerSec LE]
+    private func buildProbePayload(for machineId: MachineId) -> Data {
+        let now = ContinuousClock.now
+        let elapsed: Duration
+        if let last = lastProbeTime[machineId] {
+            elapsed = now - last
+        } else {
+            elapsed = .zero
+        }
+        lastProbeTime[machineId] = now
+
+        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+
+        // Gather channels for this machine, sorted for stability
+        let relevantKeys = receiveAccum.keys
+            .filter { $0.remoteMachineId == machineId }
+            .sorted { $0.channel < $1.channel }
+
+        // Round-robin: pick up to 10
+        let maxChannels = 10
+        let total = relevantKeys.count
+        let selected: [TunnelSessionKey]
+        if total <= maxChannels {
+            selected = relevantKeys
+        } else {
+            let offset = probeRoundRobinOffset[machineId, default: 0] % total
+            var picks: [TunnelSessionKey] = []
+            for i in 0..<maxChannels {
+                picks.append(relevantKeys[(offset + i) % total])
+            }
+            selected = picks
+            probeRoundRobinOffset[machineId] = offset + maxChannels
+        }
+
+        // Encode
+        var payload = Data()
+        payload.append(UInt8(selected.count))
+
+        for key in selected {
+            let accum = receiveAccum[key] ?? (bytes: 0, packets: 0)
+            let bps: UInt64
+            let pps: UInt64
+            if elapsedSeconds > 0 {
+                bps = UInt64(Double(accum.bytes) / elapsedSeconds)
+                pps = UInt64(Double(accum.packets) / elapsedSeconds)
+            } else {
+                bps = 0
+                pps = 0
+            }
+
+            // Reset accumulator for this channel
+            receiveAccum.removeValue(forKey: key)
+
+            let nameBytes = Array(key.channel.utf8)
+            payload.append(UInt8(min(nameBytes.count, 255)))
+            payload.append(contentsOf: nameBytes.prefix(255))
+            var bpsLE = bps.littleEndian
+            var ppsLE = pps.littleEndian
+            payload.append(Data(bytes: &bpsLE, count: 8))
+            payload.append(Data(bytes: &ppsLE, count: 8))
+        }
+
+        return payload
+    }
+
+    /// Handle an incoming health probe, parsing per-channel stats.
+    private func handleHealthProbe(from machineId: MachineId, data: Data) async {
+        logger.debug("Health probe received from \(machineId.prefix(8))")
+
+        // Parse stats if payload is present
+        if data.count >= 1 {
+            parseProbeStats(from: machineId, data: data)
+        }
+
+        await notifyPacketReceived(from: machineId)
+    }
+
+    /// Parse probe payload and store delivered stats.
+    private func parseProbeStats(from machineId: MachineId, data: Data) {
+        var offset = 0
+        guard offset < data.count else { return }
+
+        let channelCount = Int(data[offset])
+        offset += 1
+
+        for _ in 0..<channelCount {
+            guard offset < data.count else { return }
+            let nameLen = Int(data[offset])
+            offset += 1
+
+            guard offset + nameLen + 16 <= data.count else { return }
+
+            let nameBytes = data[offset..<(offset + nameLen)]
+            offset += nameLen
+
+            guard let channelName = String(bytes: nameBytes, encoding: .utf8) else {
+                offset += 16
+                continue
+            }
+
+            let bps = data[offset..<(offset + 8)].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+            offset += 8
+            let pps = data[offset..<(offset + 8)].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+            offset += 8
+
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channelName)
+            deliveredStats[key] = (bytesPerSecond: UInt64(littleEndian: bps), packetsPerSecond: UInt64(littleEndian: pps))
         }
     }
 }
