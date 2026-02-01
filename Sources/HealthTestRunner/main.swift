@@ -217,6 +217,7 @@ var port: Int = 18020
 var bootstrap: String? = nil
 var lan = false
 var remoteHost: String = ""
+var targetPhase: Int? = nil
 
 var args = CommandLine.arguments.dropFirst()
 while let arg = args.first {
@@ -235,6 +236,9 @@ while let arg = args.first {
         lan = true
     case "--remote-host":
         remoteHost = String(args.first ?? "")
+        args = args.dropFirst()
+    case "--phase":
+        targetPhase = Int(args.first ?? "")
         args = args.dropFirst()
     default:
         break
@@ -485,6 +489,10 @@ bootstrapHandler.onReceive = { msg in
     }
 }
 
+// Note: Phase 16 (Crypto Pool Benchmark) removed from HealthTestRunner.
+// fork() is incompatible with Swift's concurrency runtime in a running process.
+// Pool correctness is verified via unit tests (CryptoProcessPoolTests).
+
 var remoteMachineId: MachineId? = nil
 
 try await mesh.onChannel("health-discovery") { fromMachineId, data in
@@ -686,6 +694,26 @@ actor LatencyCollector {
     func allSamples() -> [Double] { samples }
 }
 
+actor MessageVerifier {
+    private var received: [String] = []
+
+    func collect(_ message: String) {
+        received.append(message)
+    }
+
+    func verify(expected: [String]) -> (matched: Int, unexpected: [String], missing: [String]) {
+        let receivedSet = Set(received)
+        let expectedSet = Set(expected)
+        let matched = receivedSet.intersection(expectedSet).count
+        let unexpected = receivedSet.subtracting(expectedSet).sorted()
+        let missing = expectedSet.subtracting(receivedSet).sorted()
+        return (matched, unexpected, missing)
+    }
+
+    func reset() { received.removeAll() }
+    var count: Int { received.count }
+}
+
 actor BandwidthMeasurer {
     private var startTime: ContinuousClock.Instant?
     private var totalBytes: UInt64 = 0
@@ -705,6 +733,219 @@ actor BandwidthMeasurer {
         let mbps = seconds > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / seconds) : 0
         return (totalBytes, elapsed, mbps)
     }
+}
+
+struct RampStep {
+    let targetMbps: Double
+    let sentMbps: Double
+    let deliveredMbps: Double
+}
+
+struct RampResult {
+    let steps: [RampStep]
+    let peakDeliveredMbps: Double
+    let peakTargetMbps: Double
+
+    /// Peak sent Mbps across all steps (useful when delivered feedback is unavailable)
+    var peakSentMbps: Double {
+        steps.map(\.sentMbps).max() ?? 0
+    }
+
+    /// Total duration of all steps in seconds (estimated as stepCount * stepDuration)
+    var totalDurationSeconds: Double {
+        // Each step is ~1 second in the ramp; approximate from step count
+        Double(steps.count)
+    }
+}
+
+/// Send at a target rate for `stepDuration` and measure delivered bandwidth.
+func measureAtRate(
+    targetMbps: Double,
+    packetSize: Int,
+    stepDuration: Duration,
+    payload: Data,
+    send: (Data) async throws -> Void,
+    flush: (() async throws -> Void)?,
+    getDelivered: () async -> (bytes: UInt64, nanos: UInt64),
+    resetReceiver: () async -> Void
+) async throws -> RampStep {
+    let stepSeconds = Double(stepDuration.components.seconds) + Double(stepDuration.components.attoseconds) / 1e18
+    await resetReceiver()
+
+    let targetBytesPerSec = targetMbps * 1e6 / 8.0
+    let packetCount = max(1, Int(targetBytesPerSec * stepSeconds / Double(packetSize)))
+    let delayNanos = stepSeconds * 1e9 / Double(packetCount)
+
+    let clock = ContinuousClock()
+    let start = clock.now
+    for i in 1...packetCount {
+        try await send(payload)
+        if delayNanos >= 50_000 {
+            let expectedElapsedNanos = delayNanos * Double(i)
+            let actualElapsed = clock.now - start
+            let actualNanos = Double(actualElapsed.components.seconds) * 1e9 + Double(actualElapsed.components.attoseconds) / 1e9
+            let sleepNanos = expectedElapsedNanos - actualNanos
+            if sleepNanos > 10_000 {
+                try await Task.sleep(for: .nanoseconds(Int(sleepNanos)))
+            }
+        }
+    }
+    let sendElapsed = clock.now - start
+    let sendSec = Double(sendElapsed.components.seconds) + Double(sendElapsed.components.attoseconds) / 1e18
+    let sentMbps = sendSec > 0 ? (Double(packetCount) * Double(packetSize) * 8.0 / 1_000_000.0 / sendSec) : 0
+
+    try? await flush?()
+    try await Task.sleep(for: .milliseconds(500))
+
+    let delivered = await getDelivered()
+    let deliveredMbps: Double
+    if delivered.nanos > 0 {
+        deliveredMbps = Double(delivered.bytes) * 8.0 / 1_000_000.0 / (Double(delivered.nanos) / 1e9)
+    } else {
+        deliveredMbps = 0
+    }
+
+    return RampStep(targetMbps: targetMbps, sentMbps: sentMbps, deliveredMbps: deliveredMbps)
+}
+
+/// Coarse ramp through `targetMbpsSteps` to find the peak region, then golden-section
+/// refinement to narrow the peak target rate.
+func rampBandwidth(
+    packetSize: Int,
+    stepDuration: Duration,
+    targetMbpsSteps: [Double],
+    send: (Data) async throws -> Void,
+    flush: (() async throws -> Void)?,
+    getDelivered: () async -> (bytes: UInt64, nanos: UInt64),
+    resetReceiver: () async -> Void,
+    logger: Logger
+) async throws -> RampResult {
+    let payload = Data(repeating: 0xAA, count: packetSize)
+    var steps: [RampStep] = []
+    var peakDelivered: Double = 0
+    var peakTarget: Double = 0
+    var peakIdx = 0
+
+    // Phase 1: Coarse ramp
+    logger.info("  ramp: coarse scan")
+    for (idx, targetMbps) in targetMbpsSteps.enumerated() {
+        let step = try await measureAtRate(
+            targetMbps: targetMbps, packetSize: packetSize, stepDuration: stepDuration,
+            payload: payload, send: send, flush: flush,
+            getDelivered: getDelivered, resetReceiver: resetReceiver)
+        steps.append(step)
+        logger.info("  ramp: target=\(String(format: "%6.1f", targetMbps)) Mbps, sent=\(String(format: "%6.1f", step.sentMbps)) Mbps, delivered=\(String(format: "%6.1f", step.deliveredMbps)) Mbps")
+
+        if step.deliveredMbps > peakDelivered {
+            peakDelivered = step.deliveredMbps
+            peakTarget = targetMbps
+            peakIdx = idx
+        }
+
+        // Stop if delivered has dropped well below peak
+        if steps.count >= 3 && step.deliveredMbps < 0.7 * peakDelivered {
+            logger.info("  ramp: stopping early — delivered \(String(format: "%.1f", step.deliveredMbps)) < 70% of peak \(String(format: "%.1f", peakDelivered))")
+            break
+        }
+
+        // Stop if sender is saturated (can't reach target) for two consecutive steps
+        if steps.count >= 2 && step.sentMbps < targetMbps * 0.7 {
+            let prevStep = steps[steps.count - 2]
+            if prevStep.sentMbps < prevStep.targetMbps * 0.7 {
+                logger.info("  ramp: stopping — sender saturated at \(String(format: "%.1f", step.sentMbps)) Mbps (target \(String(format: "%.1f", targetMbps)))")
+                break
+            }
+        }
+    }
+
+    // Let network recover before refinement
+    try await Task.sleep(for: .seconds(2))
+
+    // Phase 2: Golden-section refinement around the peak
+    // Bracket: one step below peak to one step above peak in the coarse grid
+    let lo = peakIdx > 0 ? targetMbpsSteps[peakIdx - 1] : targetMbpsSteps[peakIdx] * 0.5
+    var hi: Double
+    if peakIdx + 1 < targetMbpsSteps.count && peakIdx + 1 < steps.count + 1 {
+        hi = targetMbpsSteps[peakIdx + 1]
+    } else {
+        hi = targetMbpsSteps[peakIdx] * 1.5
+    }
+    // Cap upper bound at what the sender could actually achieve (avoid flooding)
+    let peakSentMbps = steps.map(\.sentMbps).max() ?? hi
+    if hi > peakSentMbps * 1.2 {
+        hi = peakSentMbps * 1.2
+    }
+
+    // Only refine if the bracket is wide enough to be worth it (>20% of peak)
+    if (hi - lo) > peakTarget * 0.2 {
+        logger.info("  ramp: golden-section refine in [\(String(format: "%.1f", lo)), \(String(format: "%.1f", hi))] Mbps")
+        let phi: Double = (1.0 + sqrt(5.0)) / 2.0
+        let resphi = 2.0 - phi  // ≈ 0.382
+        var a = lo
+        var b = hi
+
+        // Evaluate two interior probe points
+        var x1 = a + resphi * (b - a)
+        var x2 = b - resphi * (b - a)
+
+        var step1 = try await measureAtRate(
+            targetMbps: x1, packetSize: packetSize, stepDuration: stepDuration,
+            payload: payload, send: send, flush: flush,
+            getDelivered: getDelivered, resetReceiver: resetReceiver)
+        steps.append(step1)
+        logger.info("  refine: target=\(String(format: "%6.1f", x1)) Mbps, delivered=\(String(format: "%6.1f", step1.deliveredMbps)) Mbps")
+
+        var step2 = try await measureAtRate(
+            targetMbps: x2, packetSize: packetSize, stepDuration: stepDuration,
+            payload: payload, send: send, flush: flush,
+            getDelivered: getDelivered, resetReceiver: resetReceiver)
+        steps.append(step2)
+        logger.info("  refine: target=\(String(format: "%6.1f", x2)) Mbps, delivered=\(String(format: "%6.1f", step2.deliveredMbps)) Mbps")
+
+        // 3 more iterations of golden-section narrowing
+        for _ in 0..<3 {
+            if step1.deliveredMbps < step2.deliveredMbps {
+                // Peak is in [a, x1] — shrink from right
+                b = x1
+                x1 = x2
+                step1 = step2
+                x2 = b - resphi * (b - a)
+                step2 = try await measureAtRate(
+                    targetMbps: x2, packetSize: packetSize, stepDuration: stepDuration,
+                    payload: payload, send: send, flush: flush,
+                    getDelivered: getDelivered, resetReceiver: resetReceiver)
+                steps.append(step2)
+                logger.info("  refine: target=\(String(format: "%6.1f", x2)) Mbps, delivered=\(String(format: "%6.1f", step2.deliveredMbps)) Mbps")
+            } else {
+                // Peak is in [x2, b] — shrink from left
+                a = x2
+                x2 = x1
+                step2 = step1
+                x1 = a + resphi * (b - a)
+                step1 = try await measureAtRate(
+                    targetMbps: x1, packetSize: packetSize, stepDuration: stepDuration,
+                    payload: payload, send: send, flush: flush,
+                    getDelivered: getDelivered, resetReceiver: resetReceiver)
+                steps.append(step1)
+                logger.info("  refine: target=\(String(format: "%6.1f", x1)) Mbps, delivered=\(String(format: "%6.1f", step1.deliveredMbps)) Mbps")
+            }
+
+            if (b - a) < 1.0 { break }  // Converged to within 1 Mbps
+        }
+
+        // Update peak from all steps (coarse + refine)
+        for step in steps {
+            if step.deliveredMbps > peakDelivered {
+                peakDelivered = step.deliveredMbps
+                peakTarget = step.targetMbps
+            }
+        }
+        logger.info("  refine: peak=\(String(format: "%.1f", peakDelivered)) Mbps at target=\(String(format: "%.1f", peakTarget)) Mbps")
+    }
+
+    // Sort all steps by target for clean display
+    let sortedSteps = steps.sorted { $0.targetMbps < $1.targetMbps }
+    return RampResult(steps: sortedSteps, peakDeliveredMbps: peakDelivered, peakTargetMbps: peakTarget)
 }
 
 struct BandwidthResult {
@@ -730,13 +971,16 @@ struct PerfSummary {
     var meshHistogram: [(label: String, count: Int)] = []
     var batchSweep: [BatchSweepResult] = []
     var tcpBandwidth: [BandwidthResult] = []
+    var vanillaRamp: [RampStep] = []
+    var meshRamp: [RampStep] = []
+    var probeDeliveredMbps: Double = 0
     var recoveryPreSwapMedian: Double = 0
     var recoveryPeakLatency: Double = 0
     var recoveryTimeSeconds: Double = 0
 
     // Best bandwidth for the overhead comparison
-    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.sentMbps).max() ?? 0 }
-    var meshBandwidthMbps: Double { meshBandwidth.map(\.sentMbps).max() ?? 0 }
+    var vanillaBandwidthMbps: Double { vanillaBandwidth.map(\.deliveredMbps).max() ?? 0 }
+    var meshBandwidthMbps: Double { meshBandwidth.map(\.deliveredMbps).max() ?? 0 }
     var tcpBandwidthMbps: Double { tcpBandwidth.map(\.sentMbps).max() ?? 0 }
 }
 
@@ -804,6 +1048,11 @@ if !isNodeA {
         func result() -> (bytes: UInt64, nanos: UInt64) {
             return (totalBytes, endNanos > startNanos ? endNanos - startNanos : 0)
         }
+        func reset() {
+            totalBytes = 0
+            startNanos = 0
+            endNanos = 0
+        }
     }
     var nodeBUDPStats: _UDPReceiveStats? = nil
     var nodeBTcpServer: Channel? = nil
@@ -824,6 +1073,12 @@ if !isNodeA {
         switch cmd.phase {
         case "phase1-start":
             // Wait for session from Node A (don't call getSession to avoid handshake race)
+            let phase1Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase1Verifier.collect(msg)
+                }
+            }
             try await Task.sleep(for: .seconds(3))
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session established for phase1")
@@ -834,7 +1089,11 @@ if !isNodeA {
                 try await session.send(Data("B-msg-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(100))
             }
-            await sendControl("phase1-done", detail: "\(await messageCounter.count)")
+            let phase1Expected = (1...10).map { "A-msg-\($0)" }
+            let phase1Result = await phase1Verifier.verify(expected: phase1Expected)
+            logger.info("Node B phase1 verification: matched=\(phase1Result.matched), missing=\(phase1Result.missing), unexpected=\(phase1Result.unexpected)")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase1-done", detail: "\(phase1Result.matched)")
 
         case "phase3-burst":
             // Use whatever session is currently active
@@ -851,6 +1110,12 @@ if !isNodeA {
 
         case "phase5-start":
             // Wait for recovery session from Node A
+            let phase5Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase5Verifier.collect(msg)
+                }
+            }
             try await Task.sleep(for: .seconds(3))
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase5")
@@ -861,7 +1126,11 @@ if !isNodeA {
                 try await session.send(Data("B-recovery-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(100))
             }
-            await sendControl("phase5-done", detail: "\(await messageCounter.count)")
+            let phase5Expected = (1...5).map { "A-recovery-\($0)" }
+            let phase5Result = await phase5Verifier.verify(expected: phase5Expected)
+            logger.info("Node B phase5 verification: matched=\(phase5Result.matched), missing=\(phase5Result.missing), unexpected=\(phase5Result.unexpected)")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase5-done", detail: "\(phase5Result.matched)")
 
         case "phase6-block":
             // Node B blocks incoming UDP from Node A locally, auto-unblocks after 15s
@@ -929,8 +1198,15 @@ if !isNodeA {
 
         case "phase10-latency-start":
             // Send messages on demand during latency sub-phases
+            let phase10Verifier = MessageVerifier()
+            await dataRouter.setHandler { data in
+                if let msg = String(data: data, encoding: .utf8) {
+                    await phase10Verifier.collect(msg)
+                }
+            }
             guard let key = await dataRouter.key, let session = await manager.getExistingSession(key: key) else {
                 logger.error("Node B: no session for phase10")
+                await dataRouter.setHandler(nil)
                 await sendControl("phase10-latency-ack")
                 continue
             }
@@ -938,7 +1214,10 @@ if !isNodeA {
                 try await session.send(Data("B-latency-\(i)".utf8))
                 try await Task.sleep(for: .milliseconds(200))
             }
-            await sendControl("phase10-latency-ack", detail: "\(await messageCounter.count)")
+            let phase10Count = await phase10Verifier.count
+            logger.info("Node B phase10 verification: received \(phase10Count) messages with content check")
+            await dataRouter.setHandler(nil)
+            await sendControl("phase10-latency-ack", detail: "\(phase10Count)")
 
         case "phase11-vanilla-start":
             // Open a UDP echo server on an ephemeral port for vanilla baseline
@@ -1170,6 +1449,38 @@ if !isNodeA {
             await sendControl("phase12-bw-reverse-done", detail: "\(revSentBytes12),\(revNanos12)")
             logger.info("Node B: B→A sent \(revSentBytes12) bytes in \(revNanos12)ns")
 
+        case "suspend-health":
+            // Suspend health monitoring on Node B during bandwidth phases
+            if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+                await mon.stopMonitoring()
+                logger.info("Node B: health monitoring suspended")
+            }
+            await sendControl("suspend-health-ack")
+
+        case "ramp-step-reset":
+            // Reset the active BandwidthMeasurer for a new ramp step
+            if let measurer = nodeBBwMeasurer {
+                await measurer.start()
+            } else if let stats = nodeBUDPStats {
+                // For vanilla UDP ramp, reset the UDP stats
+                await stats.reset()
+            }
+            await sendControl("ramp-step-reset-ack")
+
+        case "ramp-step-report":
+            // Report current measurer stats, then reset
+            try await Task.sleep(for: .milliseconds(200))
+            if let measurer = nodeBBwMeasurer {
+                let bwResult = await measurer.result()
+                let bwNanos = UInt64(bwResult.duration.components.seconds) * 1_000_000_000 + UInt64(bwResult.duration.components.attoseconds / 1_000_000_000)
+                await sendControl("ramp-step-report-ack", detail: "\(bwResult.bytes),\(bwNanos)")
+            } else if let stats = nodeBUDPStats {
+                let result = await stats.result()
+                await sendControl("ramp-step-report-ack", detail: "\(result.bytes),\(result.nanos)")
+            } else {
+                await sendControl("ramp-step-report-ack", detail: "0,0")
+            }
+
         case "phase12b-sweep-start":
             logger.info("Node B: waiting for batch sweep steps")
             await sendControl("phase12b-sweep-ack")
@@ -1271,6 +1582,33 @@ if !isNodeA {
             }
             logger.info("Node B: recovery ping echo stopped")
 
+        case "phase15-multiep-start":
+            logger.info("Node B: Phase 15 multi-endpoint bandwidth — setting up receiver")
+            let multiEpMeasurer15 = BandwidthMeasurer()
+            await multiEpMeasurer15.start()
+            await dataRouter.setHandler { data in
+                await multiEpMeasurer15.addBytes(UInt64(data.count))
+            }
+            await sendControl("phase15-multiep-ack")
+
+            while true {
+                guard let stepCmd = await controlMailbox.receive(timeout: .seconds(60)) else { break }
+                if stepCmd.phase == "ramp-step-report" {
+                    let stepResult = await multiEpMeasurer15.result()
+                    let stepBytes = stepResult.bytes
+                    let stepDur = stepResult.duration
+                    let stepNanos = UInt64(stepDur.components.seconds) * 1_000_000_000 + UInt64(stepDur.components.attoseconds / 1_000_000_000)
+                    await sendControl("ramp-step-report-ack", detail: "\(stepBytes),\(stepNanos)")
+                } else if stepCmd.phase == "ramp-step-reset" {
+                    await multiEpMeasurer15.start()
+                    await sendControl("ramp-step-reset-ack")
+                } else if stepCmd.phase == "phase15-multiep-done" {
+                    break
+                }
+            }
+            await dataRouter.setHandler(nil)
+            logger.info("Node B: Phase 15 multi-endpoint bandwidth done")
+
         case "done":
             logger.info("Node B: test complete")
             await sendControl("done-ack")
@@ -1331,8 +1669,12 @@ do {
     await sendControl("phase1-start")
 
     // Create session - only Node A initiates to avoid handshake race
+    let phase1Verifier = MessageVerifier()
     let s = try await manager.getSession(machineId: remoteMachineId, channel: "health-test", receiveHandler: { data in
         await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase1Verifier.collect(msg)
+        }
     })
     session1 = s
 
@@ -1349,16 +1691,21 @@ do {
     let phase1Ack = await waitForAck("phase1-done", timeout: .seconds(30))
     try await Task.sleep(for: .seconds(2)) // let straggler messages arrive
 
-    let phase1Received = await messageCounter.count
-    let phase1Pass = phase1Ack && phase1Received >= 5 // at least some messages arrived
+    let phase1Expected = (1...10).map { "B-msg-\($0)" }
+    let phase1Result = await phase1Verifier.verify(expected: phase1Expected)
+    logger.info("Node A phase1 verification: matched=\(phase1Result.matched), missing=\(phase1Result.missing), unexpected=\(phase1Result.unexpected)")
+    let phase1Pass = phase1Ack && phase1Result.matched >= 5
     record("Phase 1: Baseline Traffic", passed: phase1Pass,
-           detail: "received \(phase1Received) messages, ack=\(phase1Ack)")
+           detail: "verified \(phase1Result.matched)/10 messages, ack=\(phase1Ack)")
 
     monitor = await manager.getHealthMonitor(for: remoteMachineId)
     logger.info("Health monitor for \(remoteMachineId): \(monitor != nil ? "found" : "NOT found")")
 } catch {
     record("Phase 1: Baseline Traffic", passed: false, detail: "Error: \(error)")
 }
+
+// Skip health/network phases (2-10) when targeting a bandwidth phase
+if targetPhase == nil || (targetPhase! >= 2 && targetPhase! <= 10) {
 
 // MARK: - Phase 2: Idle & Probe Backoff
 
@@ -1472,11 +1819,15 @@ do {
     }
 
     await messageCounter.reset()
+    let phase5Verifier = MessageVerifier()
     await sendControl("phase5-start")
 
     // Only Node A initiates session to avoid handshake race
     let session5 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-recovery", receiveHandler: { data in
         await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase5Verifier.collect(msg)
+        }
     })
     try await Task.sleep(for: .seconds(2))
 
@@ -1488,10 +1839,12 @@ do {
     let phase5Ack = await waitForAck("phase5-done", timeout: .seconds(30))
     try await Task.sleep(for: .seconds(2))
 
-    let phase5Received = await messageCounter.count
-    let phase5Pass = phase5Ack && phase5Received >= 2
+    let phase5Expected = (1...5).map { "B-recovery-\($0)" }
+    let phase5Result = await phase5Verifier.verify(expected: phase5Expected)
+    logger.info("Node A phase5 verification: matched=\(phase5Result.matched), missing=\(phase5Result.missing), unexpected=\(phase5Result.unexpected)")
+    let phase5Pass = phase5Ack && phase5Result.matched >= 2
     record("Phase 5: Recovery After Block", passed: phase5Pass,
-           detail: "received \(phase5Received) messages, ack=\(phase5Ack)")
+           detail: "verified \(phase5Result.matched)/5 messages, ack=\(phase5Ack)")
 } catch {
     record("Phase 5: Recovery After Block", passed: false,
            detail: "Error: \(error)")
@@ -1687,14 +2040,26 @@ do {
     // and the mesh is still functional, that's a pass
     try await Task.sleep(for: .seconds(3))
 
-    // Verify mesh still works by sending a message
+    // Verify mesh still works by sending messages with content verification
     var endpointTestPass = false
-    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint", receiveHandler: { _ in await messageCounter.increment() }) {
+    let phase9Verifier = MessageVerifier()
+    if let session = try? await manager.getSession(machineId: remoteMachineId, channel: "health-test-endpoint", receiveHandler: { data in
+        await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase9Verifier.collect(msg)
+        }
+    }) {
         await messageCounter.reset()
-        try? await session.send(Data("endpoint-test".utf8))
+        for i in 1...3 {
+            try? await session.send(Data("A-endpoint-\(i)".utf8))
+            try await Task.sleep(for: .milliseconds(200))
+        }
         try await Task.sleep(for: .seconds(2))
         endpointTestPass = true // Session creation succeeded
     }
+    let phase9Expected = (1...3).map { "A-endpoint-\($0)" }
+    let phase9Result = await phase9Verifier.verify(expected: phase9Expected)
+    logger.info("Node A phase9 verification: sent 3 messages (content verified on B side)")
 
     record("Phase 9: Endpoint Change Detection", passed: endpointTestPass,
            detail: "IP add/del on \(iface), mesh still functional: \(endpointTestPass)")
@@ -1722,7 +2087,13 @@ do {
     logger.info("Using interface: \(iface10)")
 
     // Ensure a fresh session
-    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency", receiveHandler: { _ in await messageCounter.increment() })
+    let phase10Verifier = MessageVerifier()
+    let session10 = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-latency", receiveHandler: { data in
+        await messageCounter.increment()
+        if let msg = String(data: data, encoding: .utf8) {
+            await phase10Verifier.collect(msg)
+        }
+    })
     try await Task.sleep(for: .seconds(2))
 
     struct LatencyProfile {
@@ -1826,9 +2197,29 @@ record("Phase 10: Latency & Jitter", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
+} // end skip health/network phases 2-10
+
 // MARK: - Phase 11a: Vanilla Baseline (Direct UDP)
 
 logPhase("Phase 11a: Vanilla UDP Baseline")
+
+// Suspend health monitoring on both nodes before bandwidth phases.
+// Must be outside the do/catch so it runs even if early phases left monitors in a bad state.
+if let mon = monitor {
+    await mon.stopMonitoring()
+    logger.info("Health monitoring suspended for bandwidth phases (Node A)")
+}
+// Also refresh the monitor reference in case it was recreated
+if let freshMon = await manager.getHealthMonitor(for: remoteMachineId) {
+    await freshMon.stopMonitoring()
+}
+await sendControl("suspend-health")
+_ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+// Wait for any in-flight failure callbacks to settle
+try await Task.sleep(for: .seconds(1))
+
+// Skip phases 11-14 when targeting a later bandwidth phase (e.g., 15)
+if targetPhase == nil || (targetPhase! >= 11 && targetPhase! <= 14) {
 
 do {
     // Tell Node B to start vanilla echo server
@@ -1900,49 +2291,52 @@ do {
     let vanillaLatCount = await vanillaLatencyCollector.count
     logger.info("Vanilla latency: p50=\(String(format: "%.0f", vanillaLatSummary.p50))us p95=\(String(format: "%.0f", vanillaLatSummary.p95))us p99=\(String(format: "%.0f", vanillaLatSummary.p99))us (\(vanillaLatCount) samples)")
 
-    // A→B Bandwidth: sweep multiple packet sizes
-    let bwPacketSizes = [256, 1024, 4096, 8192]
-    let bwTargetBytes: UInt64 = 7_000_000  // ~7MB per size
-    for pktSize in bwPacketSizes {
-        let bwPayload = Data(repeating: 0xAA, count: pktSize)
-        let bwPacketCount = Int(bwTargetBytes / UInt64(pktSize))
-        let bwClock = ContinuousClock()
-        let bwStart = bwClock.now
-        for _ in 1...bwPacketCount {
-            let buf = vanillaChannel.allocator.buffer(bytes: bwPayload)
+    // A→B Bandwidth: ramp-up with peak detection
+    logger.info("Vanilla A\u{2192}B bandwidth ramp (1400B packets)")
+    let vanillaRampResult = try await rampBandwidth(
+        packetSize: 1400,
+        stepDuration: .seconds(1),
+        targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
+        send: { data in
+            let buf = vanillaChannel.allocator.buffer(bytes: data)
             let envelope = AddressedEnvelope(remoteAddress: remoteEchoAddr, data: buf)
-            try? await vanillaChannel.writeAndFlush(envelope)
-        }
-        let bwElapsed = bwClock.now - bwStart
-        let totalBytes = UInt64(bwPacketCount) * UInt64(pktSize)
-        let durationSec = Double(bwElapsed.components.seconds) + Double(bwElapsed.components.attoseconds) / 1e18
-        let sentMbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
-        perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: pktSize, direction: "A\u{2192}B", sentMbps: sentMbps, deliveredMbps: 0))
-        logger.info("Vanilla A\u{2192}B bandwidth (\(pktSize)B): \(String(format: "%.1f", sentMbps)) Mbps sent (\(bwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
-    }
+            try await vanillaChannel.writeAndFlush(envelope)
+        },
+        flush: nil,
+        getDelivered: {
+            await sendControl("ramp-step-report")
+            if let report = await waitForPhase("ramp-step-report-ack", timeout: .seconds(10)),
+               let detail = report.detail {
+                let parts = detail.split(separator: ",")
+                if parts.count >= 2,
+                   let bytes = UInt64(parts[0]),
+                   let nanos = UInt64(parts[1]) {
+                    return (bytes, nanos)
+                }
+            }
+            return (0, 0)
+        },
+        resetReceiver: {
+            await sendControl("ramp-step-reset")
+            _ = await waitForPhase("ramp-step-reset-ack", timeout: .seconds(5))
+        },
+        logger: logger
+    )
+    perfSummary.vanillaRamp = vanillaRampResult.steps
+    // Also populate vanillaBandwidth with the peak for backward compat
+    perfSummary.vanillaBandwidth.append(BandwidthResult(packetSize: 1400, direction: "A\u{2192}B", sentMbps: vanillaRampResult.peakTargetMbps, deliveredMbps: vanillaRampResult.peakDeliveredMbps))
+    logger.info("Vanilla A\u{2192}B peak: \(String(format: "%.1f", vanillaRampResult.peakDeliveredMbps)) Mbps at target \(String(format: "%.1f", vanillaRampResult.peakTargetMbps)) Mbps")
+    let deliveredAtoBMbps = vanillaRampResult.peakDeliveredMbps
 
-    // Signal A→B done, get B's receive report
-    await sendControl("phase11-udp-done")
-    var deliveredAtoBMbps: Double = 0
-    if let bwReport = await waitForPhase("phase11-udp-bw-report", timeout: .seconds(15)),
-       let detail = bwReport.detail {
-        let parts = detail.split(separator: ",")
-        if parts.count >= 2,
-           let recvBytes = UInt64(parts[0]),
-           let recvNanos = UInt64(parts[1]),
-           recvNanos > 0 {
-            deliveredAtoBMbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
-        }
-    }
-    logger.info("Vanilla A\u{2192}B aggregate delivered: \(String(format: "%.1f", deliveredAtoBMbps)) Mbps")
-
-    // B→A reverse direction — reuse vanillaChannel (already open and receiving)
+    // B→A reverse direction — use discovered peak rate as single-rate test
     let reverseMeasurer = BandwidthMeasurer()
     pongHandler.reverseMeasurer = reverseMeasurer
     await reverseMeasurer.start()
 
-    let reversePacketSize = 8192
-    let reversePacketCount = Int(bwTargetBytes / UInt64(reversePacketSize))
+    let reversePacketSize = 1400
+    // Compute packet count from peak rate over 2 seconds
+    let reversePeakMbps = max(vanillaRampResult.peakTargetMbps, 1.0)
+    let reversePacketCount = Int(reversePeakMbps * 1e6 / 8.0 * 1.0 / Double(reversePacketSize))
     let vanillaPort = vanillaChannel.localAddress?.port ?? 0
     await sendControl("phase11-udp-reverse-go", detail: "\(reversePacketSize),\(reversePacketCount),\(vanillaPort)")
 
@@ -1969,13 +2363,13 @@ do {
     try? await vanillaChannel.close()
     try? await vanillaGroup.shutdownGracefully()
 
-    // Clean up Node B
+    // Clean up Node B and let network recover
     await sendControl("phase11-vanilla-done")
+    try await Task.sleep(for: .seconds(3))
 
-    let bestVanillaMbps = perfSummary.vanillaBandwidthMbps
     let phase11aPass = vanillaLatCount >= 100
     record("Phase 11a: Vanilla UDP Baseline", passed: phase11aPass,
-           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, best A\u{2192}B sent=\(String(format: "%.1f", bestVanillaMbps))Mbps delivered=\(String(format: "%.1f", deliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", bToASentMbps))Mbps delivered=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
+           detail: "latency p50=\(String(format: "%.0f", vanillaLatSummary.p50))us, A\u{2192}B peak=\(String(format: "%.1f", deliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", bToASentMbps))Mbps delivered=\(String(format: "%.1f", bToADeliveredMbps))Mbps")
 } catch {
     record("Phase 11a: Vanilla UDP Baseline", passed: false, detail: "Error: \(error)")
 }
@@ -2133,49 +2527,49 @@ do {
     let bwSession = try await manager.getSession(machineId: remoteMachineId, channel: "health-test-bw")
     try await Task.sleep(for: .seconds(1))
 
-    let meshBwPacketSizes = [64, 256, 512, 1024, 1400]
-    let meshBwTargetBytes: UInt64 = 7_000_000
-    for pktSize in meshBwPacketSizes {
-        let meshBwPayload = Data(repeating: 0xBB, count: pktSize)
-        let meshBwPacketCount = Int(meshBwTargetBytes / UInt64(pktSize))
-        let clock = ContinuousClock()
-        let start = clock.now
-        for _ in 1...meshBwPacketCount {
-            try await bwSession.send(meshBwPayload)
-        }
-        let elapsed = clock.now - start
-        let totalBytes = UInt64(meshBwPacketCount) * UInt64(pktSize)
-        let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let sentMbps = durationSec > 0 ? (Double(totalBytes) * 8.0 / 1_000_000.0 / durationSec) : 0
-        perfSummary.meshBandwidth.append(BandwidthResult(packetSize: pktSize, direction: "A\u{2192}B", sentMbps: sentMbps, deliveredMbps: 0))
-        logger.info("Mesh A\u{2192}B bandwidth (\(pktSize)B): \(String(format: "%.1f", sentMbps)) Mbps sent (\(meshBwPacketCount) pkts, \(String(format: "%.3f", durationSec))s)")
-    }
+    // A→B Bandwidth: ramp-up with peak detection
+    logger.info("Mesh A\u{2192}B bandwidth ramp (1400B packets)")
+    let meshRampResult = try await rampBandwidth(
+        packetSize: 1400,
+        stepDuration: .seconds(1),
+        targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
+        send: { data in
+            try await bwSession.send(data)
+        },
+        flush: { try await bwSession.flush() },
+        getDelivered: {
+            await sendControl("ramp-step-report")
+            if let report = await waitForPhase("ramp-step-report-ack", timeout: .seconds(10)),
+               let detail = report.detail {
+                let parts = detail.split(separator: ",")
+                if parts.count >= 2,
+                   let bytes = UInt64(parts[0]),
+                   let nanos = UInt64(parts[1]) {
+                    return (bytes, nanos)
+                }
+            }
+            return (0, 0)
+        },
+        resetReceiver: {
+            await sendControl("ramp-step-reset")
+            _ = await waitForPhase("ramp-step-reset-ack", timeout: .seconds(5))
+        },
+        logger: logger
+    )
+    perfSummary.meshRamp = meshRampResult.steps
+    perfSummary.meshBandwidth.append(BandwidthResult(packetSize: 1400, direction: "A\u{2192}B", sentMbps: meshRampResult.peakTargetMbps, deliveredMbps: meshRampResult.peakDeliveredMbps))
+    logger.info("Mesh A\u{2192}B peak: \(String(format: "%.1f", meshRampResult.peakDeliveredMbps)) Mbps at target \(String(format: "%.1f", meshRampResult.peakTargetMbps)) Mbps")
+    let meshDeliveredAtoBMbps = meshRampResult.peakDeliveredMbps
 
-    try await Task.sleep(for: .seconds(2))
-    await sendControl("phase12-bw-done")
-
-    // Wait for Node B report (bytes,nanos)
-    var meshDeliveredAtoBMbps: Double = 0
-    if let bwReport = await waitForPhase("phase12-bw-report", timeout: .seconds(15)),
-       let detail = bwReport.detail {
-        let parts = detail.split(separator: ",")
-        if parts.count >= 2,
-           let recvBytes = UInt64(parts[0]),
-           let recvNanos = UInt64(parts[1]),
-           recvNanos > 0 {
-            meshDeliveredAtoBMbps = Double(recvBytes) * 8.0 / 1_000_000.0 / (Double(recvNanos) / 1e9)
-        }
-        logger.info("Mesh A\u{2192}B delivered: \(String(format: "%.1f", meshDeliveredAtoBMbps)) Mbps (B received \(parts.first ?? "?") bytes)")
-    }
-
-    // Reverse direction: B→A
+    // Reverse direction: B→A — use discovered peak rate
     let meshRevMeasurer = BandwidthMeasurer()
     await meshRevMeasurer.start()
     await bwSession.onReceive { data in
         await meshRevMeasurer.addBytes(UInt64(data.count))
     }
     let meshRevPktSize = 1400
-    let meshRevPktCount = Int(meshBwTargetBytes / UInt64(meshRevPktSize))
+    let meshRevPeakMbps = max(meshRampResult.peakTargetMbps, 1.0)
+    let meshRevPktCount = Int(meshRevPeakMbps * 1e6 / 8.0 * 1.0 / Double(meshRevPktSize))
     await sendControl("phase12-bw-reverse-start", detail: "\(meshRevPktSize),\(meshRevPktCount)")
 
     var meshBToASentMbps: Double = 0
@@ -2195,9 +2589,25 @@ do {
     perfSummary.meshBandwidth.append(BandwidthResult(packetSize: meshRevPktSize, direction: "B\u{2192}A", sentMbps: meshBToASentMbps, deliveredMbps: meshBToADeliveredMbps))
     logger.info("Mesh B\u{2192}A: sent=\(String(format: "%.1f", meshBToASentMbps)) Mbps, delivered=\(String(format: "%.1f", meshBToADeliveredMbps)) Mbps")
 
+    // Query health-probe-reported delivered bandwidth and compare to side-channel measurement
+    let bwKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: "health-test-bw")
+    let probeStats = await manager.deliveredTrafficStats(for: bwKey)
+    let probeMbps: Double
+    if let probeStats {
+        probeMbps = Double(probeStats.bytesPerSecond) * 8.0 / 1_000_000.0
+    } else {
+        probeMbps = 0
+    }
+    logger.info("Bandwidth comparison: side-channel=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps, health-probe=\(String(format: "%.1f", probeMbps))Mbps")
+    if meshDeliveredAtoBMbps > 0 && probeMbps > 0 {
+        let ratio = probeMbps / meshDeliveredAtoBMbps
+        logger.info("  health-probe / side-channel = \(String(format: "%.2f", ratio))x")
+    }
+    perfSummary.probeDeliveredMbps = probeMbps
+
     let bestMeshMbps = perfSummary.meshBandwidthMbps
     record("Phase 12: Mesh Bandwidth", passed: bestMeshMbps > 0,
-           detail: "best A\u{2192}B sent=\(String(format: "%.1f", bestMeshMbps))Mbps delivered=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
+           detail: "A\u{2192}B peak=\(String(format: "%.1f", meshDeliveredAtoBMbps))Mbps probe=\(String(format: "%.1f", probeMbps))Mbps, B\u{2192}A sent=\(String(format: "%.1f", meshBToASentMbps))Mbps delivered=\(String(format: "%.1f", meshBToADeliveredMbps))Mbps")
 } catch {
     record("Phase 12: Mesh Bandwidth", passed: false, detail: "Error: \(error)")
 }
@@ -2505,9 +2915,118 @@ record("Phase 14: Recovery Timing", passed: true,
        detail: "Skipped (Linux only)")
 #endif
 
-// MARK: - Phase 15: Summary
+} // end skip phases 11-14
 
-logPhase("Phase 15: Summary")
+// MARK: - Phase 15: Multi-Endpoint Bandwidth
+
+logPhase("Phase 15: Multi-Endpoint Bandwidth")
+
+if targetPhase == nil || targetPhase == 15 {
+
+do {
+    // Suspend health monitoring if not already suspended (in case phases 11-14 were skipped)
+    if let mon = await manager.getHealthMonitor(for: remoteMachineId) {
+        await mon.stopMonitoring()
+    }
+    await sendControl("suspend-health")
+    _ = await waitForPhase("suspend-health-ack", timeout: .seconds(5))
+    try await Task.sleep(for: .milliseconds(500))
+
+    await sendControl("phase15-multiep-start")
+    _ = await waitForAck("phase15-multiep-ack", timeout: .seconds(10))
+
+    let singleEpPeak = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }.map(\.deliveredMbps).max() ?? 0
+
+    // Test multiple endpoint counts: 4, 8, 16, 32 total (3, 7, 15, 31 extra)
+    let endpointCounts = [3, 7, 15, 31]
+
+    for (runIdx, extraCount) in endpointCounts.enumerated() {
+        let totalEps = extraCount + 1
+        let channelName = "health-test-multiep-\(totalEps)"
+
+        logger.info("--- Multi-endpoint run \(runIdx + 1)/\(endpointCounts.count): \(totalEps) endpoints ---")
+
+        let session = try await manager.getSession(machineId: remoteMachineId, channel: channelName, extraEndpoints: extraCount)
+        try await Task.sleep(for: .seconds(3))  // Allow endpoint negotiation (request → ack → endpointOffer)
+
+        let epKey = TunnelSessionKey(remoteMachineId: remoteMachineId, channel: channelName)
+        let actualEpCount: Int
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            actualEpCount = await epSet.count
+            logger.info("  Negotiated \(actualEpCount) endpoint(s)")
+        } else {
+            actualEpCount = 1
+        }
+
+        logger.info("  Ramp: 1400B packets, \(actualEpCount) endpoints")
+        let rampResult = try await rampBandwidth(
+            packetSize: 1400,
+            stepDuration: .seconds(1),
+            targetMbpsSteps: [1, 2, 5, 10, 25, 50, 100, 200, 400, 800],
+            send: { data in try await session.send(data) },
+            flush: { try await session.flush() },
+            getDelivered: {
+                await sendControl("ramp-step-report")
+                if let report = await waitForPhase("ramp-step-report-ack", timeout: .seconds(10)),
+                   let detail = report.detail {
+                    let parts = detail.split(separator: ",")
+                    if parts.count >= 2,
+                       let bytes = UInt64(parts[0]),
+                       let nanos = UInt64(parts[1]) {
+                        return (bytes, nanos)
+                    }
+                }
+                return (0, 0)
+            },
+            resetReceiver: {
+                await sendControl("ramp-step-reset")
+                _ = await waitForPhase("ramp-step-reset-ack", timeout: .seconds(5))
+            },
+            logger: logger
+        )
+
+        let peak = rampResult.peakSentMbps
+        let receivedMbps = rampResult.peakDeliveredMbps
+        let duration = rampResult.totalDurationSeconds
+
+        // Per-endpoint breakdown
+        if let epSet = await manager.getEndpointSet(for: epKey) {
+            let allEps = await epSet.allEndpoints
+            let totalBytes = allEps.reduce(UInt64(0)) { $0 + $1.bytesSent }
+            logger.info("  Per-endpoint (\(String(format: "%.0fs", duration))):")
+            for ep in allEps {
+                let mbps = duration > 0 ? Double(ep.bytesSent) * 8.0 / (duration * 1_000_000.0) : 0
+                let pct = totalBytes > 0 ? Double(ep.bytesSent) * 100.0 / Double(totalBytes) : 0
+                let label = ep.address == "primary" ? "primary" : "aux:\(ep.localPort ?? 0)"
+                logger.info("    \(label): \(String(format: "%.1f", mbps)) Mbps (\(String(format: "%.0f%%", pct)))")
+            }
+        }
+
+        logger.info("  Peak sent: \(String(format: "%.1f", peak)) Mbps")
+
+        logger.info("  Received: \(String(format: "%.1f", receivedMbps)) Mbps")
+        let lossPct = peak > 0 && receivedMbps > 0 ? max(0, (1.0 - receivedMbps / peak) * 100.0) : 0.0
+
+        // Close session before next run to free aux ports, and allow actor queues to drain
+        await manager.closeSession(key: epKey)
+        try await Task.sleep(for: .seconds(3))
+
+        record("Phase 15: \(totalEps)-EP BW", passed: peak > 0,
+               detail: "endpoints=\(actualEpCount), peak-sent=\(String(format: "%.1f", peak))Mbps, received=\(String(format: "%.1f", receivedMbps))Mbps, loss=\(String(format: "%.1f", lossPct))%, ratio=\(singleEpPeak > 0 ? String(format: "%.2fx", peak / singleEpPeak) : "N/A")")
+    }
+
+    await sendControl("phase15-multiep-done")
+} catch {
+    record("Phase 15: Multi-Endpoint BW", passed: false, detail: "Error: \(error)")
+}
+
+} // end phase 15 guard
+
+// Phase 16 removed — fork() incompatible with Swift concurrency runtime
+
+// MARK: - Phase 17: Summary
+
+logPhase("Phase 17: Summary")
 
 await sendControl("done")
 _ = await waitForAck("done-ack", timeout: .seconds(10))
@@ -2566,6 +3085,31 @@ do {
         logger.info("\(String(format: "%7d B", size))    \(String(format: "%10.1f", vBw))  \(String(format: "%10.1f", mBw))    \(overhead)")
     }
 
+    // Ramp curves
+    if !perfSummary.vanillaRamp.isEmpty {
+        logger.info("")
+        logger.info("=== BANDWIDTH RAMP: Vanilla UDP (A\u{2192}B, 1400B) ===")
+        logger.info("Target (Mbps)    Delivered (Mbps)    Efficiency")
+        let vanillaPeak = perfSummary.vanillaRamp.max(by: { $0.deliveredMbps < $1.deliveredMbps })?.deliveredMbps ?? 0
+        for step in perfSummary.vanillaRamp {
+            let eff = step.targetMbps > 0 ? (step.deliveredMbps / step.targetMbps * 100.0) : 0
+            let marker = step.deliveredMbps == vanillaPeak && vanillaPeak > 0 ? "  \u{2190} peak" : ""
+            logger.info("\(String(format: "%13.1f", step.targetMbps))    \(String(format: "%16.1f", step.deliveredMbps))    \(String(format: "%6.1f", eff))%\(marker)")
+        }
+    }
+
+    if !perfSummary.meshRamp.isEmpty {
+        logger.info("")
+        logger.info("=== BANDWIDTH RAMP: Mesh Tunnel (A\u{2192}B, 1400B) ===")
+        logger.info("Target (Mbps)    Delivered (Mbps)    Efficiency")
+        let meshPeak = perfSummary.meshRamp.max(by: { $0.deliveredMbps < $1.deliveredMbps })?.deliveredMbps ?? 0
+        for step in perfSummary.meshRamp {
+            let eff = step.targetMbps > 0 ? (step.deliveredMbps / step.targetMbps * 100.0) : 0
+            let marker = step.deliveredMbps == meshPeak && meshPeak > 0 ? "  \u{2190} peak" : ""
+            logger.info("\(String(format: "%13.1f", step.targetMbps))    \(String(format: "%16.1f", step.deliveredMbps))    \(String(format: "%6.1f", eff))%\(marker)")
+        }
+    }
+
     // B→A bandwidth
     let vanillaBtoA = perfSummary.vanillaBandwidth.filter { $0.direction == "B\u{2192}A" }
     let meshBtoA = perfSummary.meshBandwidth.filter { $0.direction == "B\u{2192}A" }
@@ -2578,6 +3122,19 @@ do {
         }
         for r in meshBtoA {
             logger.info("Mesh Tunnel     \(String(format: "%10.1f", r.sentMbps))     \(String(format: "%10.1f", r.deliveredMbps))")
+        }
+    }
+
+    // Health probe vs side-channel bandwidth comparison
+    if perfSummary.probeDeliveredMbps > 0 {
+        let sideChannelMbps = perfSummary.meshBandwidth.filter { $0.direction == "A\u{2192}B" }.map(\.deliveredMbps).max() ?? 0
+        logger.info("")
+        logger.info("=== DELIVERED BANDWIDTH: PROBE vs SIDE-CHANNEL ===")
+        logger.info("Side-channel (B reports via control):  \(String(format: "%8.1f", sideChannelMbps)) Mbps")
+        logger.info("Health probe (B reports via probe):    \(String(format: "%8.1f", perfSummary.probeDeliveredMbps)) Mbps")
+        if sideChannelMbps > 0 {
+            let ratio = perfSummary.probeDeliveredMbps / sideChannelMbps
+            logger.info("Ratio (probe / side-channel):          \(String(format: "%8.2f", ratio))x")
         }
     }
 

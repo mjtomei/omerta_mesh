@@ -7,7 +7,7 @@ import NIOPosix
 
 /// The main entry point for the mesh network
 /// This actor wraps all internal components and provides a clean public API
-public actor MeshNetwork: ChannelProvider {
+public actor MeshNetwork: ChannelProvider, AuxiliaryPortProvider {
     // MARK: - Properties
 
     /// Our cryptographic identity
@@ -62,6 +62,12 @@ public actor MeshNetwork: ChannelProvider {
     /// Retry configuration for network operations
     public var retryConfig: RetryConfig = .network
 
+    /// Optional crypto process pool for offloading ChaCha20-Poly1305 operations
+    private var cryptoPool: CryptoProcessPool?
+
+    /// Optional signature process pool for offloading Ed25519 verification
+    private var signaturePool: SignatureProcessPool?
+
     // MARK: - Initialization
 
     /// Create a new mesh network with a cryptographic identity
@@ -86,6 +92,24 @@ public actor MeshNetwork: ChannelProvider {
         self.connectionTracker = DirectConnectionTracker(staleThreshold: config.recentContactMaxAge)
         self.networkStore = networkStore ?? NetworkStore.defaultStore()
         self.logger = Logger(label: "io.omerta.mesh.network")
+    }
+
+    // MARK: - Process Pools
+
+    /// Enable crypto process pool for offloading ChaCha20-Poly1305 chunk operations.
+    /// Must be called before start(). Only functional on Linux.
+    /// - Parameter workerCount: Number of worker processes (default: processor count)
+    public func enableCryptoPool(workerCount: Int = ProcessInfo.processInfo.processorCount) throws {
+        guard state == .stopped else { return }
+        self.cryptoPool = try CryptoProcessPool(workerCount: workerCount)
+    }
+
+    /// Enable signature process pool for offloading Ed25519 verification.
+    /// Must be called before start(). Only functional on Linux.
+    /// - Parameter workerCount: Number of worker processes (default: 2)
+    public func enableSignaturePool(workerCount: Int = 2) throws {
+        guard state == .stopped else { return }
+        self.signaturePool = try SignatureProcessPool(workerCount: workerCount)
     }
 
     // MARK: - Lifecycle
@@ -139,7 +163,7 @@ public actor MeshNetwork: ChannelProvider {
                 self.eventLogger = try? MeshEventLogger(logDir: config.eventLogDir)
             }
 
-            let node = try MeshNode(identity: identity, config: nodeConfig, eventLogger: eventLogger)
+            let node = try MeshNode(identity: identity, config: nodeConfig, eventLogger: eventLogger, cryptoPool: cryptoPool, signaturePool: signaturePool)
             self.meshNode = node
 
             // Start the node
@@ -196,6 +220,11 @@ public actor MeshNetwork: ChannelProvider {
             await node.stop()
             meshNode = nil
         }
+
+        cryptoPool?.shutdown()
+        cryptoPool = nil
+        signaturePool?.shutdown()
+        signaturePool = nil
 
         if ownsEventLoopGroup, let elg = eventLoopGroup {
             try? await elg.shutdownGracefully()
@@ -447,6 +476,14 @@ public actor MeshNetwork: ChannelProvider {
         try await node.flushChannel(channel)
     }
 
+    /// Send data on a channel to a specific endpoint via an optional auxiliary port.
+    public func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        try await node.sendOnChannel(data, toEndpoint: endpoint, viaPort: localPort, toMachine: machineId, channel: channel)
+    }
+
     /// Register a handler with a batch config override.
     public func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
         guard ChannelUtils.isValid(channel) else {
@@ -461,6 +498,26 @@ public actor MeshNetwork: ChannelProvider {
     }
 
     // MARK: - Batch Monitors
+
+    // MARK: - Auxiliary Port Provider
+
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    public func bindAuxiliaryPort() async throws -> UInt16 {
+        guard state == .running, let node = meshNode else {
+            throw MeshError.notStarted
+        }
+        return try await node.bindAuxiliaryPort()
+    }
+
+    /// Close and remove an auxiliary socket.
+    public func unbindAuxiliaryPort(_ port: UInt16) async {
+        await meshNode?.unbindAuxiliaryPort(port)
+    }
+
+    /// Get the local address that a remote machine can reach us on.
+    public func localAddressForMachine(_ machineId: MachineId) async -> String? {
+        await meshNode?.localAddressForMachine(machineId)
+    }
 
     /// Registered batch monitors
     private var batchMonitors: [any BatchMonitor] = []

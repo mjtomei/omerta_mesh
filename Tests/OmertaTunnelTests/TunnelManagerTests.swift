@@ -899,6 +899,150 @@ final class TunnelSessionTests: XCTestCase {
     }
 }
 
+// MARK: - Probe / Delivered Stats Tests
+
+final class TunnelProbeTests: XCTestCase {
+
+    func testProbePayloadEncoding() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create a session and dispatch some data to it
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { _ in })
+        await provider.clearSentMessages()
+
+        // Dispatch data to accumulate receive stats
+        for _ in 0..<5 {
+            await provider.simulateMessage(from: "machine-1", on: "tunnel-data", data: BatchWireFormat.packSingle(Data(repeating: 0xAA, count: 100)))
+        }
+
+        // Wait briefly then trigger a probe by creating a second session to same machine on different channel
+        // Instead, just check the probe messages sent so far
+        // The health monitor sends probes periodically. Let's wait a bit for one.
+        try await Task.sleep(for: .seconds(1))
+
+        // Check probe messages
+        let probeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertGreaterThan(probeMessages.count, 0, "Expected at least one probe to be sent")
+
+        // Parse the last probe
+        let lastProbe = probeMessages.last!.data
+        XCTAssertGreaterThanOrEqual(lastProbe.count, 1)
+
+        // First byte is channel count
+        let channelCount = Int(lastProbe[0])
+        XCTAssertGreaterThanOrEqual(channelCount, 0)
+        // If data was accumulated, we should see a channel
+        if channelCount > 0 {
+            let nameLen = Int(lastProbe[1])
+            let nameBytes = lastProbe[2..<(2 + nameLen)]
+            let name = String(bytes: nameBytes, encoding: .utf8)
+            XCTAssertEqual(name, "data")
+        }
+
+        await manager.stop()
+    }
+
+    func testProbePayloadDecoding() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create a session so the manager has context
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { _ in })
+
+        // Build a fake probe payload from "machine-1" reporting stats for channel "data"
+        var payload = Data()
+        payload.append(1) // 1 channel
+        let channelName = "data"
+        let nameBytes = Array(channelName.utf8)
+        payload.append(UInt8(nameBytes.count))
+        payload.append(contentsOf: nameBytes)
+        var bps: UInt64 = 50000
+        var pps: UInt64 = 100
+        payload.append(Data(bytes: &bps, count: 8)) // already LE on LE platforms
+        payload.append(Data(bytes: &pps, count: 8))
+
+        // Simulate receiving this probe
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-health-probe", data: payload)
+
+        // Check delivered stats
+        let key = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        let stats = await manager.deliveredTrafficStats(for: key)
+        XCTAssertNotNil(stats)
+        XCTAssertEqual(stats?.bytesPerSecond, 50000)
+        XCTAssertEqual(stats?.packetsPerSecond, 100)
+
+        await manager.stop()
+    }
+
+    func testRoundRobinProbeChannels() async throws {
+        let config = TunnelManagerConfig(maxSessionsPerMachine: 20, maxTotalSessions: 100)
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider, config: config)
+        try await manager.start()
+
+        // Create 12 sessions to one machine
+        for i in 0..<12 {
+            _ = try await manager.getSession(machineId: "machine-1", channel: "ch-\(String(format: "%02d", i))", receiveHandler: { _ in })
+        }
+
+        // Dispatch data on all channels so accumulators exist
+        for i in 0..<12 {
+            await provider.simulateMessage(from: "machine-1", on: "tunnel-ch-\(String(format: "%02d", i))", data: BatchWireFormat.packSingle(Data([0x01])))
+        }
+
+        await provider.clearSentMessages()
+
+        // Wait for probe
+        try await Task.sleep(for: .seconds(1.5))
+
+        let probeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        guard let firstProbe = probeMessages.first else {
+            XCTFail("No probe sent")
+            return
+        }
+
+        let channelCount = Int(firstProbe.data[0])
+        XCTAssertLessThanOrEqual(channelCount, 10, "Should include at most 10 channels per probe")
+
+        await manager.stop()
+    }
+
+    func testDeliveredStatsCleanedOnClose() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data", receiveHandler: { _ in })
+
+        // Simulate a probe with delivered stats
+        var payload = Data()
+        payload.append(1)
+        let nameBytes = Array("data".utf8)
+        payload.append(UInt8(nameBytes.count))
+        payload.append(contentsOf: nameBytes)
+        var bps: UInt64 = 1000
+        var pps: UInt64 = 10
+        payload.append(Data(bytes: &bps, count: 8))
+        payload.append(Data(bytes: &pps, count: 8))
+        await provider.simulateMessage(from: "machine-1", on: "tunnel-health-probe", data: payload)
+
+        let key = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        let statsBefore = await manager.deliveredTrafficStats(for: key)
+        XCTAssertNotNil(statsBefore)
+
+        // Close the session
+        await manager.closeSession(key: key)
+
+        let statsAfter = await manager.deliveredTrafficStats(for: key)
+        XCTAssertNil(statsAfter)
+
+        await manager.stop()
+    }
+}
+
 final class TunnelConfigTests: XCTestCase {
 
     func testTunnelSessionKeyEquality() {

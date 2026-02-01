@@ -54,6 +54,24 @@ public actor TunnelManager {
     private let pendingDataMaxPerKey = 32
     private let pendingDataTTL: Duration = .seconds(5)
 
+    /// Per-session receive accumulators (bytes and packets since last probe)
+    private var receiveAccum: [TunnelSessionKey: (bytes: UInt64, packets: UInt64)] = [:]
+
+    /// Timestamp of last probe sent to each machine (for computing per-second rates)
+    private var lastProbeTime: [MachineId: ContinuousClock.Instant] = [:]
+
+    /// Per-machine round-robin offset for probe channel selection
+    private var probeRoundRobinOffset: [MachineId: Int] = [:]
+
+    /// Remote-reported delivered stats per session
+    private var deliveredStats: [TunnelSessionKey: (bytesPerSecond: UInt64, packetsPerSecond: UInt64)] = [:]
+
+    /// Per-session endpoint sets for multi-endpoint tunnels
+    private var endpointSets: [TunnelSessionKey: EndpointSet] = [:]
+
+    /// Auxiliary ports bound by this manager (port → set of session keys using it)
+    private var auxiliaryPorts: [UInt16: Set<TunnelSessionKey>] = [:]
+
     /// Whether the manager is running
     private var isRunning: Bool = false
 
@@ -78,6 +96,11 @@ public actor TunnelManager {
     /// All active session keys
     public var activeSessionKeys: [TunnelSessionKey] {
         Array(sessions.keys)
+    }
+
+    /// Get the endpoint set for a session (for test observation)
+    public func getEndpointSet(for key: TunnelSessionKey) -> EndpointSet? {
+        endpointSets[key]
     }
 
     /// Get the health monitor for a specific machine (for test observation)
@@ -110,11 +133,10 @@ public actor TunnelManager {
 
         // Register health probe handler — receiving a probe means remote is alive.
         // Both sides run monitors and send probes independently. No echo response needed.
-        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, _ in
+        // Probes carry per-channel receive stats reported by the remote side.
+        try await provider.onChannel(healthProbeChannel) { [weak self] machineId, data in
             guard let self else { return }
-            let hasMonitor = await self.healthMonitors[machineId] != nil
-            await self.logger.debug("Health probe received from \(machineId.prefix(8)), monitor exists: \(hasMonitor)")
-            await self.notifyPacketReceived(from: machineId)
+            await self.handleHealthProbe(from: machineId, data: data)
         }
 
         isRunning = true
@@ -159,6 +181,12 @@ public actor TunnelManager {
         sessions.removeAll()
         sessionIds.removeAll()
         pendingData.removeAll()
+        receiveAccum.removeAll()
+        deliveredStats.removeAll()
+        endpointSets.removeAll()
+        auxiliaryPorts.removeAll()
+        lastProbeTime.removeAll()
+        probeRoundRobinOffset.removeAll()
 
         isRunning = false
         logger.info("Tunnel manager stopped")
@@ -178,7 +206,7 @@ public actor TunnelManager {
     ///   - machineId: The remote machine ID
     ///   - channel: The logical channel name (defaults to "data")
     /// - Returns: The tunnel session (existing or newly created)
-    public func getSession(machineId: MachineId, channel: String = "data", receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
+    public func getSession(machineId: MachineId, channel: String = "data", extraEndpoints: Int? = nil, receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
         guard isRunning else {
             throw TunnelError.notConnected
         }
@@ -203,8 +231,11 @@ public actor TunnelManager {
         // Generate session ID for this session
         let sid = UUID().uuidString.prefix(8).lowercased()
 
-        // Send handshake with channel info
-        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid))
+        // Send handshake with channel info (include extra endpoints request if configured)
+        let effectiveExtra = extraEndpoints ?? config.extraEndpoints
+        let extraRequested = effectiveExtra > 0 ? effectiveExtra : nil
+        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid),
+                                         extraEndpointsRequested: extraRequested)
         let data = try JSONEncoder().encode(handshake)
         try await provider.sendOnChannel(data, toMachine: machineId, channel: handshakeChannel)
 
@@ -221,6 +252,11 @@ public actor TunnelManager {
         sessionIds[key] = String(sid)
         await ensureWireChannelRegistered(for: channel)
 
+        // Initialize endpoint set (primary endpoint will be added when ack arrives with extras)
+        let endpointSet = EndpointSet()
+        endpointSets[key] = endpointSet
+        await newSession.setEndpointSet(endpointSet)
+
         // Start health monitor for this machine if first session
         if healthMonitors[machineId] == nil {
             logger.info("Creating health monitor for machine \(machineId.prefix(8))...")
@@ -234,8 +270,7 @@ public actor TunnelManager {
             await monitor.startMonitoring(
                 machineId: machineId,
                 sendProbe: { [weak self] id in
-                    guard let self else { return }
-                    try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                    await self?.sendProbeToAllEndpoints(machineId: id)
                 },
                 onFailure: { [weak self] id in
                     guard let self else { return }
@@ -265,6 +300,27 @@ public actor TunnelManager {
     public func closeSession(key: TunnelSessionKey) async {
         guard let session = sessions.removeValue(forKey: key) else { return }
         let sid = sessionIds.removeValue(forKey: key)
+        receiveAccum.removeValue(forKey: key)
+        deliveredStats.removeValue(forKey: key)
+        endpointSets.removeValue(forKey: key)
+
+        // Unbind auxiliary ports associated with this session
+        if let auxProvider = provider as? AuxiliaryPortProvider {
+            var portsToUnbind: [UInt16] = []
+            for (port, var keys) in auxiliaryPorts {
+                keys.remove(key)
+                if keys.isEmpty {
+                    portsToUnbind.append(port)
+                    auxiliaryPorts.removeValue(forKey: port)
+                } else {
+                    auxiliaryPorts[port] = keys
+                }
+            }
+            for port in portsToUnbind {
+                await auxProvider.unbindAuxiliaryPort(port)
+                logger.info("Unbound auxiliary port \(port) for closed session")
+            }
+        }
 
         logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
@@ -288,6 +344,8 @@ public actor TunnelManager {
         if let monitor = healthMonitors.removeValue(forKey: machineId) {
             await monitor.stopMonitoring()
         }
+        lastProbeTime.removeValue(forKey: machineId)
+        probeRoundRobinOffset.removeValue(forKey: machineId)
     }
 
     /// Close the default "data" channel session (backward compatibility)
@@ -341,6 +399,8 @@ public actor TunnelManager {
     private func dispatchToSession(_ data: Data, from machineId: MachineId, channel: String) async {
         let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
         if let session = sessions[key] {
+            receiveAccum[key, default: (bytes: 0, packets: 0)].bytes += UInt64(data.count)
+            receiveAccum[key, default: (bytes: 0, packets: 0)].packets += 1
             await session.deliverIncoming(data)
         } else {
             // Buffer data that arrives before the session handshake completes
@@ -422,10 +482,45 @@ public actor TunnelManager {
                     }
                 }
 
-                // Send ack
-                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
-                if let ackData = try? JSONEncoder().encode(ack) {
-                    try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                // Initialize endpoint set for inbound session
+                let endpointSet = EndpointSet()
+                endpointSets[key] = endpointSet
+                await newSession.setEndpointSet(endpointSet)
+
+                // Bind auxiliary ports if requested and provider supports it
+                var extraEndpointAddrs: [String]? = nil
+                if let requested = handshake.extraEndpointsRequested, requested > 0,
+                   let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var addrs: [String] = []
+                        for _ in 0..<requested {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                addrs.append(addr)
+                                await endpointSet.add(address: addr, localPort: auxPort)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                logger.info("Bound auxiliary port \(auxPort) for inbound session")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !addrs.isEmpty {
+                            extraEndpointAddrs = addrs
+                        }
+                    }
+                }
+
+                // Send ack (with extra endpoints if we bound any)
+                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId,
+                                           extraEndpoints: extraEndpointAddrs)
+                do {
+                    let ackData = try JSONEncoder().encode(ack)
+                    try await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                    logger.info("Sent ack with \(extraEndpointAddrs?.count ?? 0) extra endpoint(s)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                } catch {
+                    logger.error("Failed to send ack: \(error)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
                 }
 
                 // Start health monitor for this machine if first session
@@ -440,8 +535,7 @@ public actor TunnelManager {
                     await monitor.startMonitoring(
                         machineId: machineId,
                         sendProbe: { [weak self] id in
-                            guard let self else { return }
-                            try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                            await self?.sendProbeToAllEndpoints(machineId: id)
                         },
                         onFailure: { [weak self] id in
                             await self?.handleHealthFailure(machineId: id)
@@ -459,7 +553,73 @@ public actor TunnelManager {
             }
 
         case .ack:
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            // If ack includes extra endpoints, add them to our EndpointSet
+            if let extras = handshake.extraEndpoints, !extras.isEmpty,
+               let endpointSet = endpointSets[key] {
+                // Add primary endpoint first (localPort nil = primary socket, address "primary" = sentinel)
+                await endpointSet.add(address: "primary", localPort: nil)
+
+                for ep in extras {
+                    await endpointSet.add(address: ep, localPort: nil)
+                }
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from ack, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+
+                // Bind our own auxiliary ports (one per remote extra endpoint)
+                // and pair each with a remote endpoint for sending.
+                // Also send our aux port addresses back so the remote can send to us.
+                if let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var ourAddrs: [String] = []
+                        // Re-add remote extras with paired local aux ports
+                        for remoteEp in extras {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                ourAddrs.append(addr)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                // Update the endpoint entry with the local port for sending
+                                await endpointSet.updateLocalPort(for: remoteEp, localPort: auxPort)
+                                logger.info("Bound auxiliary port \(auxPort) → remote \(remoteEp)")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !ourAddrs.isEmpty {
+                            let offer = SessionHandshake(type: .endpointOffer, channel: channel,
+                                                          sessionId: handshake.sessionId,
+                                                          extraEndpoints: ourAddrs)
+                            if let offerData = try? JSONEncoder().encode(offer) {
+                                try? await provider.sendOnChannel(offerData, toMachine: machineId, channel: handshakeChannel)
+                            }
+                        }
+                    }
+                }
+            }
             logger.debug("Session ack received", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+
+        case .endpointOffer:
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            if let extras = handshake.extraEndpoints, !extras.isEmpty,
+               let endpointSet = endpointSets[key] {
+                // Add primary endpoint first
+                await endpointSet.add(address: "primary", localPort: nil)
+
+                // The responder already has its own aux ports bound (from the .request handler).
+                // Now pair each remote extra endpoint with one of our local aux ports.
+                let ourAuxPorts = auxiliaryPorts.keys.filter { port in
+                    auxiliaryPorts[port]?.contains(key) == true
+                }.sorted()
+
+                for (i, ep) in extras.enumerated() {
+                    let localPort = i < ourAuxPorts.count ? ourAuxPorts[i] : nil
+                    await endpointSet.add(address: ep, localPort: localPort)
+                }
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from offer, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+            }
 
         case .reject:
             logger.info("Session rejected by machine", metadata: ["machine": "\(machineId)"])
@@ -480,6 +640,147 @@ public actor TunnelManager {
             }
         }
     }
+    // MARK: - Delivered Stats
+
+    /// Get delivered traffic stats for a session, as reported by the remote side.
+    public func deliveredTrafficStats(for key: TunnelSessionKey) -> (bytesPerSecond: UInt64, packetsPerSecond: UInt64)? {
+        deliveredStats[key]
+    }
+
+    // MARK: - Probe Encoding/Decoding
+
+    /// Send health probe to all endpoints for a machine (primary + extras from EndpointSets).
+    private func sendProbeToAllEndpoints(machineId: MachineId) async {
+        let payload = buildProbePayload(for: machineId)
+
+        // Always send on primary channel
+        try? await provider.sendOnChannel(payload, toMachine: machineId, channel: healthProbeChannel)
+
+        // Also send on any extra endpoints from this machine's sessions
+        let machineKeys = endpointSets.keys.filter { $0.remoteMachineId == machineId }
+        var sentAddresses = Set<String>()
+        for key in machineKeys {
+            guard let endpointSet = endpointSets[key] else { continue }
+            let addresses = await endpointSet.activeAddresses
+            for addr in addresses {
+                guard !sentAddresses.contains(addr) else { continue }
+                sentAddresses.insert(addr)
+                try? await provider.sendOnChannel(payload, toEndpoint: addr, viaPort: nil,
+                                                   toMachine: machineId, channel: healthProbeChannel)
+            }
+        }
+    }
+
+    /// Build a probe payload with per-channel receive stats for the given machine.
+    /// Format: [1B channelCount] then per channel: [1B nameLen][name bytes][8B bytesPerSec LE][8B packetsPerSec LE]
+    private func buildProbePayload(for machineId: MachineId) -> Data {
+        let now = ContinuousClock.now
+        let elapsed: Duration
+        if let last = lastProbeTime[machineId] {
+            elapsed = now - last
+        } else {
+            elapsed = .zero
+        }
+        lastProbeTime[machineId] = now
+
+        let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+
+        // Gather channels for this machine, sorted for stability
+        let relevantKeys = receiveAccum.keys
+            .filter { $0.remoteMachineId == machineId }
+            .sorted { $0.channel < $1.channel }
+
+        // Round-robin: pick up to 10
+        let maxChannels = 10
+        let total = relevantKeys.count
+        let selected: [TunnelSessionKey]
+        if total <= maxChannels {
+            selected = relevantKeys
+        } else {
+            let offset = probeRoundRobinOffset[machineId, default: 0] % total
+            var picks: [TunnelSessionKey] = []
+            for i in 0..<maxChannels {
+                picks.append(relevantKeys[(offset + i) % total])
+            }
+            selected = picks
+            probeRoundRobinOffset[machineId] = offset + maxChannels
+        }
+
+        // Encode
+        var payload = Data()
+        payload.append(UInt8(selected.count))
+
+        for key in selected {
+            let accum = receiveAccum[key] ?? (bytes: 0, packets: 0)
+            let bps: UInt64
+            let pps: UInt64
+            if elapsedSeconds > 0 {
+                bps = UInt64(Double(accum.bytes) / elapsedSeconds)
+                pps = UInt64(Double(accum.packets) / elapsedSeconds)
+            } else {
+                bps = 0
+                pps = 0
+            }
+
+            // Reset accumulator for this channel
+            receiveAccum.removeValue(forKey: key)
+
+            let nameBytes = Array(key.channel.utf8)
+            payload.append(UInt8(min(nameBytes.count, 255)))
+            payload.append(contentsOf: nameBytes.prefix(255))
+            var bpsLE = bps.littleEndian
+            var ppsLE = pps.littleEndian
+            payload.append(Data(bytes: &bpsLE, count: 8))
+            payload.append(Data(bytes: &ppsLE, count: 8))
+        }
+
+        return payload
+    }
+
+    /// Handle an incoming health probe, parsing per-channel stats.
+    private func handleHealthProbe(from machineId: MachineId, data: Data) async {
+        logger.debug("Health probe received from \(machineId.prefix(8))")
+
+        // Parse stats if payload is present
+        if data.count >= 1 {
+            parseProbeStats(from: machineId, data: data)
+        }
+
+        await notifyPacketReceived(from: machineId)
+    }
+
+    /// Parse probe payload and store delivered stats.
+    private func parseProbeStats(from machineId: MachineId, data: Data) {
+        var offset = 0
+        guard offset < data.count else { return }
+
+        let channelCount = Int(data[offset])
+        offset += 1
+
+        for _ in 0..<channelCount {
+            guard offset < data.count else { return }
+            let nameLen = Int(data[offset])
+            offset += 1
+
+            guard offset + nameLen + 16 <= data.count else { return }
+
+            let nameBytes = data[offset..<(offset + nameLen)]
+            offset += nameLen
+
+            guard let channelName = String(bytes: nameBytes, encoding: .utf8) else {
+                offset += 16
+                continue
+            }
+
+            let bps = data[offset..<(offset + 8)].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+            offset += 8
+            let pps = data[offset..<(offset + 8)].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+            offset += 8
+
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channelName)
+            deliveredStats[key] = (bytesPerSecond: UInt64(littleEndian: bps), packetsPerSecond: UInt64(littleEndian: pps))
+        }
+    }
 }
 
 // MARK: - Internal Types
@@ -490,15 +791,24 @@ struct SessionHandshake: Codable, Sendable {
         case ack
         case reject
         case close
+        case endpointOffer
     }
 
     let type: HandshakeType
     let channel: String?
     let sessionId: String?
 
-    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil) {
+    /// Number of extra endpoints the initiator is requesting (request only)
+    let extraEndpointsRequested: Int?
+    /// Extra endpoints offered by this side ("host:port" strings)
+    let extraEndpoints: [String]?
+
+    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil,
+         extraEndpointsRequested: Int? = nil, extraEndpoints: [String]? = nil) {
         self.type = type
         self.channel = channel
         self.sessionId = sessionId
+        self.extraEndpointsRequested = extraEndpointsRequested
+        self.extraEndpoints = extraEndpoints
     }
 }
