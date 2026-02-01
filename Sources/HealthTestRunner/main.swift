@@ -489,6 +489,10 @@ bootstrapHandler.onReceive = { msg in
     }
 }
 
+// Note: Phase 16 (Crypto Pool Benchmark) removed from HealthTestRunner.
+// fork() is incompatible with Swift's concurrency runtime in a running process.
+// Pool correctness is verified via unit tests (CryptoProcessPoolTests).
+
 var remoteMachineId: MachineId? = nil
 
 try await mesh.onChannel("health-discovery") { fromMachineId, data in
@@ -2999,84 +3003,7 @@ do {
 
 } // end phase 15 guard
 
-#if os(Linux)
-// MARK: - Phase 16: Crypto Pool Benchmark
-
-if targetPhase == nil || targetPhase == 16 {
-
-logPhase("Phase 16: Crypto Pool Bandwidth")
-
-do {
-    let networkKey = Data(repeating: 0xBE, count: 32)
-    let payloadSizes = [512, 2048, 8192, 16384]
-    let iterations = 50
-
-    // --- Inline baseline ---
-    var inlineResults: [(size: Int, throughputMbps: Double)] = []
-
-    for size in payloadSizes {
-        let payload = Data(repeating: 0xAA, count: size)
-        let identity = IdentityKeypair()
-        let message = MeshMessage.data(payload)
-
-        let start = ContinuousClock.now
-        for _ in 0..<iterations {
-            let envelope = try MeshEnvelope.signed(from: identity, machineId: "bench", to: nil, channel: "bench", payload: message)
-            let sealed = try envelope.encodeV2(networkKey: networkKey)
-            let _ = try MeshEnvelope.decodeV2(sealed.data, networkKey: networkKey)
-        }
-        let elapsed = ContinuousClock.now - start
-        let elapsedSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let totalBytes = Double(size * iterations * 2)
-        let mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000)
-        inlineResults.append((size: size, throughputMbps: mbps))
-    }
-
-    // --- Pool crypto ---
-    let workerCounts = [2, 4]
-    var poolResults: [(workers: Int, size: Int, throughputMbps: Double)] = []
-
-    for workers in workerCounts {
-        let pool = try CryptoProcessPool(workerCount: workers, slotCount: 16)
-
-        for size in payloadSizes {
-            let payload = Data(repeating: 0xAA, count: size)
-            let identity = IdentityKeypair()
-            let message = MeshMessage.data(payload)
-
-            let start = ContinuousClock.now
-            for _ in 0..<iterations {
-                let envelope = try MeshEnvelope.signed(from: identity, machineId: "bench", to: nil, channel: "bench", payload: message)
-                let sealed = try await envelope.encodeV2(networkKey: networkKey, pool: pool)
-                let _ = try await MeshEnvelope.decodeV2WithHash(sealed.data, networkKey: networkKey, pool: pool)
-            }
-            let elapsed = ContinuousClock.now - start
-            let elapsedSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-            let totalBytes = Double(size * iterations * 2)
-            let mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000)
-            poolResults.append((workers: workers, size: size, throughputMbps: mbps))
-        }
-
-        pool.shutdown()
-    }
-
-    logger.info("")
-    logger.info("=== CRYPTO POOL BENCHMARK ===")
-    logger.info("Payload Size    Inline (Mbps)    Pool-2W (Mbps)    Pool-4W (Mbps)")
-    for size in payloadSizes {
-        let inlineMbps = inlineResults.first(where: { $0.size == size })?.throughputMbps ?? 0
-        let pool2 = poolResults.first(where: { $0.workers == 2 && $0.size == size })?.throughputMbps ?? 0
-        let pool4 = poolResults.first(where: { $0.workers == 4 && $0.size == size })?.throughputMbps ?? 0
-        logger.info("\(String(format: "%10d B", size))    \(String(format: "%12.1f", inlineMbps))    \(String(format: "%14.1f", pool2))    \(String(format: "%14.1f", pool4))")
-    }
-
-    record("Phase 16: Crypto Pool BW", passed: true, detail: "Inline vs pool benchmark complete")
-} catch {
-    record("Phase 16: Crypto Pool BW", passed: false, detail: "Error: \(error)")
-}
-
-} // end phase 16 guard
-#endif
+// Phase 16 removed — fork() incompatible with Swift concurrency runtime
 
 // MARK: - Phase 17: Summary
 
