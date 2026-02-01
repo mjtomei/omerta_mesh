@@ -288,8 +288,6 @@ public actor MeshNode {
     ///   - identity: The cryptographic identity (peer ID is derived from this)
     ///   - config: Node configuration (must include encryption key)
     ///   - eventLogger: Optional event logger for persistent storage
-    ///   - cryptoPool: Optional crypto process pool for parallel chunk crypto
-    ///   - signaturePool: Optional signature process pool for parallel verification
     public init(identity: IdentityKeypair, config: Config, eventLogger: MeshEventLogger? = nil, cryptoPool: CryptoProcessPool? = nil, signaturePool: SignatureProcessPool? = nil) throws {
         self.identity = identity
         self.machineId = try getOrCreateMachineId()

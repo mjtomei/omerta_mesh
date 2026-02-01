@@ -3,12 +3,12 @@
 // Provides the low-level shared memory infrastructure for process pool workers.
 // Uses mmap(MAP_SHARED|MAP_ANONYMOUS) regions with fixed-size slots and
 // pipe-based signaling for low-latency parent↔worker communication.
+//
+// Process pools use fork() which is only available on Linux.
 
-#if canImport(Glibc)
+#if os(Linux)
+
 import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Foundation
 
 // MARK: - Constants
@@ -444,3 +444,5 @@ enum ProcessPoolError: Error, CustomStringConvertible {
         }
     }
 }
+
+#endif // os(Linux)

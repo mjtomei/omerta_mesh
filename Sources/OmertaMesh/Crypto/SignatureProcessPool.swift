@@ -5,12 +5,12 @@
 // - Different performance characteristics than symmetric crypto
 // - Can run fully in parallel with chunk decryption
 // - Fewer workers needed (signatures are less frequent)
+//
+// Only available on Linux (uses fork()).
 
-#if canImport(Glibc)
+#if os(Linux)
+
 import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Foundation
 import Crypto
 
@@ -270,3 +270,30 @@ public final class SignatureProcessPool: @unchecked Sendable {
         self.monitorThread = thread
     }
 }
+
+#else
+
+import Foundation
+
+/// Stub for non-Linux platforms. Process pools require fork() which is only available on Linux.
+public final class SignatureProcessPool: @unchecked Sendable {
+    public let workerCount: Int
+    public let slotCount: Int
+
+    public init(workerCount: Int = 2, slotCount: Int = 16) throws {
+        fatalError("SignatureProcessPool is only available on Linux")
+    }
+
+    public func verify(data: Data, signature: Data, publicKey: Data) async throws -> Bool {
+        fatalError("SignatureProcessPool is only available on Linux")
+    }
+
+    public func sign(data: Data, privateKey: Data) async throws -> Data {
+        fatalError("SignatureProcessPool is only available on Linux")
+    }
+
+    public func shutdown() {}
+    public func checkWorkers() {}
+}
+
+#endif // os(Linux)

@@ -2999,6 +2999,7 @@ do {
 
 } // end phase 15 guard
 
+#if os(Linux)
 // MARK: - Phase 16: Crypto Pool Benchmark
 
 if targetPhase == nil || targetPhase == 16 {
@@ -3075,6 +3076,7 @@ do {
 }
 
 } // end phase 16 guard
+#endif
 
 // MARK: - Phase 17: Summary
 

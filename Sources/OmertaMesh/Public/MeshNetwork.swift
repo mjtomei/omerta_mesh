@@ -97,7 +97,7 @@ public actor MeshNetwork: ChannelProvider, AuxiliaryPortProvider {
     // MARK: - Process Pools
 
     /// Enable crypto process pool for offloading ChaCha20-Poly1305 chunk operations.
-    /// Must be called before start().
+    /// Must be called before start(). Only functional on Linux.
     /// - Parameter workerCount: Number of worker processes (default: processor count)
     public func enableCryptoPool(workerCount: Int = ProcessInfo.processInfo.processorCount) throws {
         guard state == .stopped else { return }
@@ -105,7 +105,7 @@ public actor MeshNetwork: ChannelProvider, AuxiliaryPortProvider {
     }
 
     /// Enable signature process pool for offloading Ed25519 verification.
-    /// Must be called before start().
+    /// Must be called before start(). Only functional on Linux.
     /// - Parameter workerCount: Number of worker processes (default: 2)
     public func enableSignaturePool(workerCount: Int = 2) throws {
         guard state == .stopped else { return }

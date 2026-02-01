@@ -4,11 +4,9 @@
 // They run a simple C-style event loop: wait for eventfd → process slots → signal completion.
 // No Swift concurrency runtime is used in workers (no actors, no Tasks).
 
-#if canImport(Glibc)
+#if os(Linux)
+
 import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Foundation
 import Crypto
 
@@ -273,3 +271,5 @@ private func processSignatureSlot(_ slotIndex: Int, region: SharedMemoryRegion) 
 
     region.setStatus(slotIndex, .done)
 }
+
+#endif // os(Linux)

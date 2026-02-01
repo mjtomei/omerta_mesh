@@ -3,12 +3,12 @@
 // Offloads chunked payload encryption/decryption to forked worker processes
 // communicating via shared memory rings and eventfd signaling.
 // This breaks the actor serialization bottleneck in MeshNode for high-throughput scenarios.
+//
+// Only available on Linux (uses fork()).
 
-#if canImport(Glibc)
+#if os(Linux)
+
 import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 import Foundation
 import Crypto
 
@@ -340,3 +340,31 @@ public final class CryptoProcessPool: @unchecked Sendable {
         self.monitorThread = thread
     }
 }
+
+#else
+
+import Foundation
+import Crypto
+
+/// Stub for non-Linux platforms. Process pools require fork() which is only available on Linux.
+public final class CryptoProcessPool: @unchecked Sendable {
+    public let workerCount: Int
+    public let slotCount: Int
+
+    public init(workerCount: Int = 1, slotCount: Int = 4) throws {
+        fatalError("CryptoProcessPool is only available on Linux")
+    }
+
+    public func decrypt(encryptedPayload: Data, chunkCount: Int, totalPlaintextLen: Int, key: SymmetricKey, baseNonce: [UInt8]) async throws -> Data {
+        fatalError("CryptoProcessPool is only available on Linux")
+    }
+
+    public func encrypt(plaintext: Data, chunkCount: Int, key: SymmetricKey, baseNonce: [UInt8]) async throws -> Data {
+        fatalError("CryptoProcessPool is only available on Linux")
+    }
+
+    public func shutdown() {}
+    public func checkWorkers() {}
+}
+
+#endif // os(Linux)
