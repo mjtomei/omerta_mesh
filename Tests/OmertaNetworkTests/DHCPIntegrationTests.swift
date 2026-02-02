@@ -424,10 +424,13 @@ final class DHCPIntegrationTests: XCTestCase {
         // Release
         try await peer.releaseLease()
 
-        // Wait for relay
-        try await Task.sleep(for: .milliseconds(50))
-
-        let poolAfterRelease = await gateway.dhcpService!.availableIPCount()
+        // Wait for release to propagate through relay to gateway
+        var poolAfterRelease = await gateway.dhcpService!.availableIPCount()
+        for _ in 0..<50 {
+            if poolAfterRelease == poolBefore { break }
+            try await Task.sleep(for: .milliseconds(20))
+            poolAfterRelease = await gateway.dhcpService!.availableIPCount()
+        }
         XCTAssertEqual(poolAfterRelease, poolBefore)
 
         // Re-acquire (may get same or different IP)
