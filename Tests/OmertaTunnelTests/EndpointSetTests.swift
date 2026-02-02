@@ -25,13 +25,16 @@ final class EndpointSetTests: XCTestCase {
 
         var counts: [String: Int] = [:]
         for _ in 0..<100 {
-            let ep = await set.next(byteCount: 100)
-            counts[ep!.address, default: 0] += 1
+            guard let ep = await set.next(byteCount: 100) else {
+                XCTFail("next() returned nil unexpectedly")
+                return
+            }
+            counts[ep.address, default: 0] += 1
         }
 
         // With equal weights, expect roughly 50/50 (allow 30-70 range)
-        XCTAssertGreaterThan(counts["10.0.0.1:5000"]!, 30)
-        XCTAssertGreaterThan(counts["10.0.0.2:5000"]!, 30)
+        XCTAssertGreaterThan(counts["10.0.0.1:5000"] ?? 0, 30)
+        XCTAssertGreaterThan(counts["10.0.0.2:5000"] ?? 0, 30)
     }
 
     func testUnequalWeightsDistributeProportionally() async {
@@ -43,12 +46,15 @@ final class EndpointSetTests: XCTestCase {
         // For now, test that with default equal weights both get traffic
         var counts: [String: Int] = [:]
         for _ in 0..<100 {
-            let ep = await set.next(byteCount: 100)
-            counts[ep!.address, default: 0] += 1
+            guard let ep = await set.next(byteCount: 100) else {
+                XCTFail("next() returned nil unexpectedly")
+                return
+            }
+            counts[ep.address, default: 0] += 1
         }
 
-        XCTAssertGreaterThan(counts["10.0.0.1:5000"]!, 0)
-        XCTAssertGreaterThan(counts["10.0.0.2:5000"]!, 0)
+        XCTAssertGreaterThan(counts["10.0.0.1:5000"] ?? 0, 0)
+        XCTAssertGreaterThan(counts["10.0.0.2:5000"] ?? 0, 0)
     }
 
     func testEmptySetReturnsNil() async {

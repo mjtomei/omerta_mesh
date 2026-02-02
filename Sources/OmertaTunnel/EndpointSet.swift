@@ -137,8 +137,9 @@ public actor EndpointSet {
         for i in endpoints.indices {
             guard endpoints[i].bytesSent > 0 else { continue }
             let ratio = Double(endpoints[i].bytesAcked) / Double(endpoints[i].bytesSent)
-            // Clamp weight between 0.1 and 10.0
-            endpoints[i].weight = max(0.1, min(10.0, ratio * 1.0 + 0.5))
+            // Weight = delivery ratio + 0.5 baseline so even endpoints with 0% delivery
+            // keep some traffic (needed to detect recovery). Clamped to [0.1, 10.0].
+            endpoints[i].weight = max(0.1, min(10.0, ratio + 0.5))
         }
     }
 

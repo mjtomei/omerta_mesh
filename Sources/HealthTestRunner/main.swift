@@ -3089,7 +3089,7 @@ do {
 
         logger.info("  Peak sent: \(String(format: "%.1f", peak)) Mbps")
 
-        logger.info("  Received: \(String(format: "%.1f", receivedMbps)) Mbps")
+        logger.info("  Peak received: \(String(format: "%.1f", receivedMbps)) Mbps")
         let lossPct = peak > 0 && receivedMbps > 0 ? max(0, (1.0 - receivedMbps / peak) * 100.0) : 0.0
 
         // Close session before next run to free aux ports, and allow actor queues to drain
