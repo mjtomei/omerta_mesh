@@ -590,9 +590,6 @@ public actor TunnelManager {
                         onDegraded: { [weak self] id in
                             await self?.handleHealthDegraded(machineId: id)
                         },
-                        onDegraded: { [weak self] id in
-                            await self?.handleHealthDegraded(machineId: id)
-                        },
                         onFailure: { [weak self] id in
                             await self?.handleHealthFailure(machineId: id)
                         },
