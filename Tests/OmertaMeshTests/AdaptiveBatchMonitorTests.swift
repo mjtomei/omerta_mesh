@@ -21,13 +21,15 @@ struct AdaptiveBatchMonitorTests {
         bytesPerSecond: UInt64 = 0,
         packetsPerSecond: UInt64 = 0,
         activeEndpoints: Int = 1,
-        averageLatencyMicroseconds: Double = 100
+        averageLatencyMicroseconds: Double = 100,
+        deliveredBytesPerSecond: UInt64? = nil
     ) -> TrafficStats {
         TrafficStats(
             bytesPerSecond: bytesPerSecond,
             packetsPerSecond: packetsPerSecond,
             activeEndpoints: activeEndpoints,
-            averageLatencyMicroseconds: averageLatencyMicroseconds
+            averageLatencyMicroseconds: averageLatencyMicroseconds,
+            deliveredBytesPerSecond: deliveredBytesPerSecond
         )
     }
 
@@ -421,6 +423,51 @@ struct AdaptiveBatchMonitorTests {
         // Allow 0 through 4 but the oscillation should prevent sitting at extremes
         #expect(idx! >= 0)
         #expect(idx! <= 4)
+    }
+
+    @Test("Delivered bandwidth preferred over sent bandwidth")
+    func testDeliveredBandwidthPreferred() async {
+        let monitor = makeMonitor()
+
+        // First call with high sent bandwidth but low delivered bandwidth
+        // The monitor should use the delivered value (low) → stay at low delay
+        _ = await monitor.recommendedConfig(
+            for: "ep-delivered",
+            currentTraffic: traffic(bytesPerSecond: 10_000_000, packetsPerSecond: 50, deliveredBytesPerSecond: 100)
+        )
+
+        // Feed several rounds — low delivered bandwidth should keep index low
+        for _ in 0..<6 {
+            _ = await monitor.recommendedConfig(
+                for: "ep-delivered",
+                currentTraffic: traffic(bytesPerSecond: 10_000_000, packetsPerSecond: 50, deliveredBytesPerSecond: 100)
+            )
+        }
+
+        let idx = await monitor.currentDelayIndex(for: "ep-delivered")
+        #expect(idx != nil)
+        #expect(idx! == 0, "Should stay at minimum delay when delivered bandwidth is low")
+    }
+
+    @Test("Falls back to sent bandwidth when delivered is nil")
+    func testFallbackToSentBandwidth() async {
+        let monitor = makeMonitor()
+
+        // High sent bandwidth, no delivered stats
+        _ = await monitor.recommendedConfig(
+            for: "ep-fallback",
+            currentTraffic: traffic(bytesPerSecond: 5_000_000, packetsPerSecond: 10_000)
+        )
+        for _ in 0..<5 {
+            _ = await monitor.recommendedConfig(
+                for: "ep-fallback",
+                currentTraffic: traffic(bytesPerSecond: 5_000_000, packetsPerSecond: 10_000)
+            )
+        }
+
+        let idx = await monitor.currentDelayIndex(for: "ep-fallback")
+        #expect(idx != nil)
+        #expect(idx! > 0, "Should increase delay based on sent bandwidth when delivered is nil")
     }
 
     @Test("Constant traffic stabilizes config after enough iterations")

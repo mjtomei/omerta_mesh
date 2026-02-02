@@ -51,6 +51,62 @@ final class EncryptionEnforcementTests: XCTestCase {
         }
     }
 
+    /// Verify that the encryption audit infrastructure detects all known attack patterns.
+    /// This catches wire format changes (magic bytes, version) that would silently break
+    /// the observer and demo patches.
+    func testEncryptionAuditInfrastructureIntegrity() throws {
+        let testKey = Data(repeating: 0x42, count: 32)
+
+        // 1. Verify valid encrypted data passes prefix check
+        let keypair = IdentityKeypair()
+        let envelope = try MeshEnvelope.signed(
+            from: keypair,
+            machineId: UUID().uuidString,
+            to: nil,
+            payload: .data(Data("test".utf8))
+        )
+        let sealed = try envelope.encodeV2(networkKey: testKey)
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(sealed.data),
+                     "Encrypted envelope must pass prefix check")
+
+        // 2. Verify plaintext is rejected by prefix check
+        let plaintext = try JSONEncoder().encode(envelope)
+        XCTAssertFalse(BinaryEnvelope.isValidPrefix(plaintext),
+                      "Plaintext JSON must fail prefix check")
+
+        // 3. Verify spoofed prefix with garbage body passes prefix but fails decrypt
+        var spoofed = BinaryEnvelope.magic
+        spoofed.append(BinaryEnvelope.version)
+        spoofed.append(Data(repeating: 0xAA, count: 100))
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(spoofed),
+                     "Spoofed prefix must pass prefix check (this is why we need decryption audit)")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(spoofed, networkKey: testKey),
+                            "Spoofed body must fail decryption")
+
+        // 4. Verify corrupted ciphertext fails decryption
+        var corrupted = sealed.data
+        let start = corrupted.count - 32
+        corrupted.replaceSubrange(start..<corrupted.count,
+                                  with: Data(repeating: 0x00, count: 32))
+        XCTAssertTrue(BinaryEnvelope.isValidPrefix(corrupted),
+                     "Corrupted data still has valid prefix")
+        XCTAssertThrowsError(try BinaryEnvelope.decode(corrupted, networkKey: testKey),
+                            "Corrupted ciphertext must fail decryption")
+
+        // 5. Verify wrong key fails decryption
+        let wrongKey = Data(repeating: 0xFF, count: 32)
+        XCTAssertThrowsError(try BinaryEnvelope.decode(sealed.data, networkKey: wrongKey),
+                            "Wrong key must fail decryption")
+
+        // 6. Verify demo patch magic bytes match current wire format
+        // This is the exact sequence used in demo-encryption-audit/03-spoofed-magic-prefix.patch
+        var demoSpoofed = Data("OMR".utf8)
+        demoSpoofed.append(0x03)
+        XCTAssertEqual(demoSpoofed, BinaryEnvelope.magic + Data([BinaryEnvelope.version]),
+                      "Demo patch prefix must match current BinaryEnvelope wire format. " +
+                      "If this fails, update demo-encryption-audit/*.patch files.")
+    }
+
     #if DEBUG
     /// Verify that all packets sent through UDPSocket have the BinaryEnvelope prefix.
     func testAllTrafficIsEncrypted() async throws {

@@ -2,7 +2,7 @@
 //
 // Per-machine health monitor (not per-session). Multiple sessions to the same
 // machine share health state. Probes only when idle, backs off on success,
-// and calls onFailure after consecutive probe failures exceed threshold.
+// and calls onDegraded/onFailure after consecutive probe failures exceed thresholds.
 //
 // Liveness is determined by whether we've received any packet (probes, data,
 // etc.) from the remote machine recently. Both sides run monitors and send
@@ -23,17 +23,20 @@ public actor TunnelHealthMonitor {
 
     private let minProbeInterval: Duration
     private let maxProbeInterval: Duration
+    private let degradedThreshold: Int
     private let failureThreshold: Int
     private let graceIntervals: Int
 
     public init(
         minProbeInterval: Duration = .milliseconds(500),
         maxProbeInterval: Duration = .seconds(15),
-        failureThreshold: Int = 3,
+        degradedThreshold: Int = 3,
+        failureThreshold: Int = 6,
         graceIntervals: Int = 0
     ) {
         self.minProbeInterval = minProbeInterval
         self.maxProbeInterval = maxProbeInterval
+        self.degradedThreshold = degradedThreshold
         self.failureThreshold = failureThreshold
         self.graceIntervals = graceIntervals
         self.currentProbeInterval = minProbeInterval
@@ -43,21 +46,33 @@ public actor TunnelHealthMonitor {
     /// Called when any packet arrives from the remote machine (application data, probes, etc.)
     /// Resets probe interval to minimum and clears failure count.
     public func onPacketReceived() {
+        let wasDegraded = consecutiveFailures >= degradedThreshold
         lastPacketTime = ContinuousClock.now
         currentProbeInterval = minProbeInterval
         consecutiveFailures = 0
+        if wasDegraded {
+            pendingRecovery = true
+        }
     }
 
     /// Start the monitoring loop
     public func startMonitoring(
         machineId: MachineId,
         sendProbe: @escaping (MachineId) async throws -> Void,
-        onFailure: @escaping (MachineId) async -> Void
+        onDegraded: @escaping (MachineId) async -> Void = { _ in },
+        onFailure: @escaping (MachineId) async -> Void,
+        onRecovered: @escaping (MachineId) async -> Void = { _ in }
     ) {
         monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
             guard let self else { return }
-            await self.monitorLoop(machineId: machineId, sendProbe: sendProbe, onFailure: onFailure)
+            await self.monitorLoop(
+                machineId: machineId,
+                sendProbe: sendProbe,
+                onDegraded: onDegraded,
+                onFailure: onFailure,
+                onRecovered: onRecovered
+            )
         }
     }
 
@@ -73,10 +88,15 @@ public actor TunnelHealthMonitor {
 
     // MARK: - Private
 
+    private var pendingRecovery = false
+    private var degradedFired = false
+
     private func monitorLoop(
         machineId: MachineId,
         sendProbe: @escaping (MachineId) async throws -> Void,
-        onFailure: @escaping (MachineId) async -> Void
+        onDegraded: @escaping (MachineId) async -> Void,
+        onFailure: @escaping (MachineId) async -> Void,
+        onRecovered: @escaping (MachineId) async -> Void
     ) async {
         var graceRemaining = graceIntervals
 
@@ -91,6 +111,15 @@ public actor TunnelHealthMonitor {
             // Wait for the probe interval
             try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { break }
+
+            // Check for pending recovery (set by onPacketReceived)
+            if pendingRecovery {
+                pendingRecovery = false
+                if degradedFired {
+                    degradedFired = false
+                    await onRecovered(machineId)
+                }
+            }
 
             // During grace period, don't count failures
             if graceRemaining > 0 {
@@ -110,6 +139,13 @@ public actor TunnelHealthMonitor {
             // No packet received since last check — count as failure
             consecutiveFailures += 1
             logger.warning("Health MISS for \(machineId.prefix(8)): failures=\(consecutiveFailures)/\(failureThreshold), interval=\(interval)")
+
+            if consecutiveFailures == degradedThreshold && !degradedFired {
+                degradedFired = true
+                logger.warning("Health DEGRADED for \(machineId.prefix(8)): triggering onDegraded")
+                await onDegraded(machineId)
+            }
+
             if consecutiveFailures >= failureThreshold {
                 logger.warning("Health FAIL for \(machineId.prefix(8)): triggering onFailure")
                 await onFailure(machineId)

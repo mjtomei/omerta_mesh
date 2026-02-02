@@ -44,6 +44,17 @@ final class BatchConfigTests: XCTestCase {
         XCTAssertEqual(decoded, original)
     }
 
+    func testTrafficStatsDeliveredField() {
+        // Default is nil
+        let stats = TrafficStats()
+        XCTAssertNil(stats.deliveredBytesPerSecond)
+
+        // Can be set
+        let statsWithDelivered = TrafficStats(bytesPerSecond: 1000, deliveredBytesPerSecond: 500)
+        XCTAssertEqual(statsWithDelivered.deliveredBytesPerSecond, 500)
+        XCTAssertEqual(statsWithDelivered.bytesPerSecond, 1000)
+    }
+
     func testEquatable() {
         let a = BatchConfig(maxFlushDelay: .milliseconds(5), maxBufferSize: 100)
         let b = BatchConfig(maxFlushDelay: .milliseconds(5), maxBufferSize: 100)

@@ -285,12 +285,13 @@ public actor CloisterClient {
 
             // Derive invite key and encrypt the network key
             let inviteKey = try await state.session.deriveInviteKey()
-            let encryptedNetworkKey = try ChaChaPoly.seal(state.networkKey, using: inviteKey).combined
+            let inviteKeyBytes = inviteKey.withUnsafeBytes { [UInt8]($0) }
+            let encryptedNetworkKey = Data(try DirectCrypto.sealCombined([UInt8](state.networkKey), key: inviteKeyBytes))
 
             // Optionally encrypt network name
             var encryptedNetworkName: Data? = nil
             if let name = state.networkName {
-                encryptedNetworkName = try ChaChaPoly.seal(Data(name.utf8), using: inviteKey).combined
+                encryptedNetworkName = Data(try DirectCrypto.sealCombined([UInt8](name.utf8), key: inviteKeyBytes))
             }
 
             // Round 2: Send encrypted invite payload to the responding machine
