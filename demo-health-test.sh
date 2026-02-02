@@ -32,10 +32,19 @@ fi
 
 REMOTE_HOST="$1"
 REMOTE_PATH="$2"
-PHASE_FLAG=""
-if [ "${3:-}" = "--phase" ] && [ -n "${4:-}" ]; then
-    PHASE_FLAG="--phase $4"
-fi
+shift 2
+PHASE_ARG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --phase)
+            PHASE_ARG="--phase $2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 # Validate remote-path is absolute
 if [[ "$REMOTE_PATH" != /* ]]; then
@@ -159,7 +168,7 @@ ssh "$REMOTE_HOST" "command -v codesign >/dev/null 2>&1 && codesign -s - --force
 
 # --- Step 6: Start Node B (remote) ---
 echo "[6/7] Starting Node B on $REMOTE_HOST..."
-ssh "$REMOTE_HOST" "sudo -n $REMOTE_BIN --role nodeB --port $PORT --lan --remote-host $LOCAL_IP $PHASE_FLAG" > "$NODE_B_LOG" 2>&1 &
+ssh "$REMOTE_HOST" "sudo -n $REMOTE_BIN --role nodeB --port $PORT --lan --remote-host $LOCAL_IP $PHASE_ARG" > "$NODE_B_LOG" 2>&1 &
 NODE_B_PID=$!
 sleep 3
 
@@ -173,7 +182,7 @@ echo "  Node B running (PID $NODE_B_PID)"
 
 # --- Step 7: Start Node A (local, orchestrator) ---
 echo "[7/7] Starting Node A locally..."
-sudo -n "$LOCAL_BIN" --role nodeA --port "$PORT" --lan --remote-host "$REMOTE_IP" $PHASE_FLAG > "$NODE_A_LOG" 2>&1 &
+sudo -n "$LOCAL_BIN" --role nodeA --port "$PORT" --lan --remote-host "$REMOTE_IP" $PHASE_ARG > "$NODE_A_LOG" 2>&1 &
 NODE_A_PID=$!
 
 # Wait for Node A to finish (it's the orchestrator)
