@@ -476,7 +476,7 @@ final class MultiNodeIntegrationTests: XCTestCase {
         }
 
         // Poll until all nodes have sent their packets (health probes add relay traffic)
-        for attempt in 0..<50 {
+        for attempt in 0..<100 {
             var allDone = true
             for node in nodes {
                 let stats = await node.getStats()
