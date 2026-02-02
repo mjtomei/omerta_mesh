@@ -271,6 +271,66 @@ public enum BinaryEnvelope {
         try encode(header: header, payload: payload, networkKey: networkKey)
     }
 
+    // MARK: - Pool-Accelerated Encoding
+
+    /// Encode using a crypto process pool for payload chunk encryption.
+    /// Header encryption stays inline (too small to benefit from offloading).
+    public static func encode(
+        header: EnvelopeHeader,
+        payload: Data,
+        networkKey: Data,
+        pool: CryptoProcessPool
+    ) async throws -> SealedEnvelope {
+        // Generate random base nonce
+        let baseNonceValue = ChaChaPoly.Nonce()
+        let baseNonce = Array(baseNonceValue)
+
+        // Derive keys
+        let headerKey = deriveHeaderKey(from: networkKey)
+        let payloadKey = SymmetricKey(data: networkKey)
+
+        // Encode and encrypt headers inline (small, not worth offloading)
+        let routingData = try header.encodeRouting()
+        let authData = try header.encodeAuth()
+
+        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingSealedBox = try ChaChaPoly.seal(routingData, using: headerKey, nonce: routingNonce)
+
+        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
+        let authSealedBox = try ChaChaPoly.seal(authData, using: payloadKey, nonce: authNonce)
+
+        // Encrypt payload chunks via pool
+        let chunkCount: Int
+        if payload.isEmpty {
+            chunkCount = 1
+        } else {
+            chunkCount = (payload.count + chunkSize - 1) / chunkSize
+        }
+
+        let encryptedChunksData = try await pool.encrypt(
+            plaintext: payload,
+            chunkCount: chunkCount,
+            key: payloadKey,
+            baseNonce: baseNonce
+        )
+
+        // Build the packet
+        let totalSize = headerOverhead + encryptedChunksData.count
+        var writer = BinaryWriter(capacity: totalSize)
+
+        writer.writeBytes(magic)
+        writer.writeByte(version)
+        writer.writeBytes(Data(baseNonce))
+        writer.writeBytes(routingSealedBox.tag)
+        writer.writeBytes(routingSealedBox.ciphertext)
+        writer.writeBytes(authSealedBox.tag)
+        writer.writeBytes(authSealedBox.ciphertext)
+        writer.writeUInt32(UInt32(payload.count))
+        writer.writeBytes(encryptedChunksData)
+
+        return SealedEnvelope(data: writer.data)
+    }
+
     // MARK: - Fast Path Rejection
 
     /// Check if data has valid magic and version (O(1) check)
@@ -470,6 +530,97 @@ public enum BinaryEnvelope {
 
         return (header, payload)
     }
+
+    // MARK: - Pool-Accelerated Decoding
+
+    /// Decode using a crypto process pool for payload chunk decryption.
+    /// Header decryption stays inline (too small to benefit from offloading).
+    public static func decode(
+        _ data: Data,
+        networkKey: Data,
+        pool: CryptoProcessPool
+    ) async throws -> (header: EnvelopeHeader, payload: Data) {
+        let routingEnd = prefixSize + nonceSize + tagSize + RoutingHeader.encodedSize
+        let authEnd = routingEnd + tagSize + AuthHeader.encodedSize
+        let minSize = authEnd + 4
+        guard data.count >= minSize else {
+            throw EnvelopeError.truncatedPacket
+        }
+
+        guard data.prefix(3) == magic else { throw EnvelopeError.invalidMagic }
+        guard data[3] == version else { throw EnvelopeError.unsupportedVersion(data[3]) }
+
+        let nonceStart = prefixSize
+        let baseNonce = Array(data[nonceStart..<(nonceStart + nonceSize)])
+
+        let headerKey = deriveHeaderKey(from: networkKey)
+        let payloadKey = SymmetricKey(data: networkKey)
+
+        // Decrypt routing header inline
+        let routingTagStart = nonceStart + nonceSize
+        let routingTag = Data(data[routingTagStart..<(routingTagStart + tagSize)])
+        let routingDataStart = routingTagStart + tagSize
+        let routingDataEnd = routingDataStart + RoutingHeader.encodedSize
+        let encryptedRouting = Data(data[routingDataStart..<routingDataEnd])
+
+        let routingNonce = try deriveNonce(baseNonce, xor: routingNonceXor)
+        let routingSealedBox = try ChaChaPoly.SealedBox(nonce: routingNonce, ciphertext: encryptedRouting, tag: routingTag)
+        let routingBytes = try ChaChaPoly.open(routingSealedBox, using: headerKey)
+        let routingHeader = try RoutingHeader.decode(from: routingBytes)
+
+        let expectedHash = computeNetworkHash(networkKey)
+        guard routingHeader.networkHash == expectedHash else { throw EnvelopeError.networkMismatch }
+
+        // Decrypt auth header inline
+        let authTagStart = routingDataEnd
+        let authTag = Data(data[authTagStart..<(authTagStart + tagSize)])
+        let authDataStart = authTagStart + tagSize
+        let authDataEnd = authDataStart + AuthHeader.encodedSize
+        let encryptedAuth = Data(data[authDataStart..<authDataEnd])
+
+        let authNonce = try deriveNonce(baseNonce, xor: authNonceXor)
+        let authSealedBox = try ChaChaPoly.SealedBox(nonce: authNonce, ciphertext: encryptedAuth, tag: authTag)
+        let authBytes = try ChaChaPoly.open(authSealedBox, using: payloadKey)
+        let authHeader = try AuthHeader.decode(from: authBytes)
+
+        // Read payload metadata
+        var reader = BinaryReader(data)
+        reader.offset = authDataEnd
+        let totalPayloadLength = Int(try reader.readUInt32())
+
+        let chunkCount: Int
+        if totalPayloadLength == 0 {
+            chunkCount = 1
+        } else {
+            chunkCount = (totalPayloadLength + chunkSize - 1) / chunkSize
+        }
+
+        // Extract encrypted chunk region and send to pool
+        let chunkRegionStart = authDataEnd + 4
+        let chunkRegionData = Data(data[chunkRegionStart...])
+
+        let payload = try await pool.decrypt(
+            encryptedPayload: chunkRegionData,
+            chunkCount: chunkCount,
+            totalPlaintextLen: totalPayloadLength,
+            key: payloadKey,
+            baseNonce: baseNonce
+        )
+
+        // Reconstruct header
+        let machineIdStr = MachineIdCompact.toString(authHeader.machineId)
+        let fromPeerIdFull = IdentityKeypair.derivePeerId(from: authHeader.publicKey)
+        let header = EnvelopeHeader(
+            routing: routingHeader,
+            auth: authHeader,
+            channelString: "",
+            fromPeerIdFull: fromPeerIdFull,
+            toPeerIdFull: routingHeader.isBroadcast ? nil : routingHeader.toPeerId.map { String(format: "%02x", $0) }.joined(),
+            machineIdString: machineIdStr
+        )
+
+        return (header, payload)
+    }
 }
 
 // MARK: - MeshEnvelope Integration
@@ -536,6 +687,71 @@ extension MeshEnvelope {
             payload: payload,
             signature: signature
         )
+    }
+
+    /// Encode envelope using v3 wire format with crypto pool acceleration
+    public func encodeV2(networkKey: Data, pool: CryptoProcessPool) async throws -> SealedEnvelope {
+        let networkHash = BinaryEnvelope.computeNetworkHash(networkKey)
+        let channelHash = ChannelHash.hash(channel)
+
+        let messageUUID: UUID
+        if let uuid = UUID(uuidString: messageId) {
+            messageUUID = uuid
+        } else {
+            messageUUID = UUID.fromString(messageId)
+        }
+
+        guard let publicKeyData = Data(base64Encoded: publicKey),
+              publicKeyData.count == AuthHeader.publicKeySize else {
+            throw EnvelopeError.invalidPublicKeySize
+        }
+
+        guard let signatureData = Data(base64Encoded: signature),
+              signatureData.count == AuthHeader.signatureSize else {
+            throw EnvelopeError.invalidSignatureSize
+        }
+
+        let header = EnvelopeHeader(
+            networkHash: networkHash,
+            fromPeerId: fromPeerId,
+            toPeerId: toPeerId,
+            channel: channelHash,
+            channelString: channel,
+            hopCount: UInt8(min(max(hopCount, 0), 255)),
+            timestamp: timestamp,
+            messageId: messageUUID,
+            machineId: machineId,
+            publicKey: publicKeyData,
+            signature: signatureData
+        )
+
+        let payloadData = try JSONCoding.encoder.encode(payload)
+        return try await BinaryEnvelope.encode(header: header, payload: payloadData, networkKey: networkKey, pool: pool)
+    }
+
+    /// Decode envelope from v3 wire format with crypto pool acceleration
+    public static func decodeV2WithHash(_ data: Data, networkKey: Data, pool: CryptoProcessPool) async throws -> (envelope: MeshEnvelope, channelHash: UInt16) {
+        let (header, payloadData) = try await BinaryEnvelope.decode(data, networkKey: networkKey, pool: pool)
+        let payload = try JSONCoding.decoder.decode(MeshMessage.self, from: payloadData)
+
+        let messageId = header.messageId.uuidString
+        let publicKey = header.publicKey.base64EncodedString()
+        let signature = header.signature.base64EncodedString()
+
+        let envelope = MeshEnvelope(
+            messageId: messageId,
+            fromPeerId: header.fromPeerId,
+            publicKey: publicKey,
+            machineId: header.machineId,
+            toPeerId: header.toPeerId,
+            channel: header.channelString,
+            hopCount: Int(header.hopCount),
+            timestamp: header.timestamp,
+            payload: payload,
+            signature: signature
+        )
+
+        return (envelope, header.channel)
     }
 
     /// Decode envelope from v3 wire format, returning the raw channel hash

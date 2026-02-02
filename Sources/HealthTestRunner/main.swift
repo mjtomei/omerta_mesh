@@ -498,6 +498,10 @@ bootstrapHandler.onReceive = { msg in
     }
 }
 
+// Note: Phase 16 (Crypto Pool Benchmark) removed from HealthTestRunner.
+// fork() is incompatible with Swift's concurrency runtime in a running process.
+// Pool correctness is verified via unit tests (CryptoProcessPoolTests).
+
 var remoteMachineId: MachineId? = nil
 
 try await mesh.onChannel("health-discovery") { fromMachineId, data in
