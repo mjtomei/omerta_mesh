@@ -55,6 +55,11 @@ public protocol ChannelSender: Sendable {
 
     /// Flush all buffered data for a channel, sending it as a single batch.
     func flushChannel(_ channel: String) async throws
+
+    /// Send data to a specific endpoint address, optionally via an auxiliary port.
+    /// Used by multi-endpoint tunnels to target specific remote endpoints.
+    /// Default implementation delegates to `sendOnChannel(_:toMachine:channel:)`.
+    func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws
 }
 
 /// Protocol for types that provide channel-based messaging.
@@ -101,4 +106,31 @@ public protocol ChannelProvider: ChannelSender {
     /// Unregister a handler for a channel.
     /// - Parameter channel: Channel name to stop listening on
     func offChannel(_ channel: String) async
+}
+
+// MARK: - Default Implementations
+
+public extension ChannelSender {
+    /// Default: ignores endpoint/port and falls back to machine-targeted send.
+    func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+}
+
+// MARK: - Auxiliary Port Provider
+
+/// Protocol for providers that can bind auxiliary UDP ports for multi-endpoint tunnels.
+/// Conforming types can create extra sockets on OS-assigned ports and send envelope-wrapped
+/// data through them.
+public protocol AuxiliaryPortProvider: AnyObject, Sendable {
+    /// Bind an auxiliary UDP socket on an OS-assigned port.
+    /// Returns the bound port number.
+    func bindAuxiliaryPort() async throws -> UInt16
+
+    /// Close and remove an auxiliary socket.
+    func unbindAuxiliaryPort(_ port: UInt16) async
+
+    /// Get the local address (host) that a given remote machine can reach us on.
+    /// Returns "host:primaryPort" or just "host", depending on implementation.
+    func localAddressForMachine(_ machineId: MachineId) async -> String?
 }

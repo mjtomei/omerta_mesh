@@ -11,6 +11,7 @@ actor MockChannelProvider: ChannelProvider {
 
     private var handlers: [String: @Sendable (MachineId, Data) async -> Void] = [:]
     private var sentMessages: [(to: String, channel: String, data: Data)] = []
+    private(set) var sendToEndpointCalls: [(endpoint: String, port: UInt16?, machineId: String, channel: String, data: Data)] = []
 
     func onChannel(_ channel: String, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
         handlers[channel] = handler
@@ -38,6 +39,11 @@ actor MockChannelProvider: ChannelProvider {
 
     func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
         try await sendOnChannel(data, toMachine: machineId, channel: channel)
+    }
+
+    func sendOnChannel(_ data: Data, toEndpoint endpoint: String, viaPort localPort: UInt16?, toMachine machineId: MachineId, channel: String) async throws {
+        sendToEndpointCalls.append((endpoint: endpoint, port: localPort, machineId: machineId, channel: channel, data: data))
+        sentMessages.append((to: machineId, channel: channel, data: data))
     }
 
     func flushChannel(_ channel: String) async throws {}
@@ -495,6 +501,88 @@ final class TunnelManagerTests: XCTestCase {
 
         let channels = await provider.getRegisteredChannels()
         XCTAssertFalse(channels.contains("tunnel-handshake"))
+    }
+
+    // MARK: - Health Monitoring Suspend/Resume Tests
+
+    func testSuspendHealthMonitoring() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create a session — this should start a health monitor
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+
+        // Suspend health monitoring
+        await manager.suspendHealthMonitoring()
+
+        await provider.clearSentMessages()
+
+        // Wait to verify no probes are sent while suspended
+        try await Task.sleep(for: .seconds(1.5))
+        let probeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertEqual(probeMessages.count, 0, "No probes should be sent while monitoring is suspended")
+
+        // Create another session — should NOT start a new monitor
+        _ = try await manager.getSession(machineId: "machine-2", channel: "data")
+        await provider.clearSentMessages()
+
+        try await Task.sleep(for: .seconds(1.5))
+        let probeMessages2 = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertEqual(probeMessages2.count, 0, "No probes for new sessions while monitoring is suspended")
+
+        await manager.stop()
+    }
+
+    func testResumeHealthMonitoring() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Suspend, then resume
+        await manager.suspendHealthMonitoring()
+        await manager.resumeHealthMonitoring()
+
+        // Create a session — should start a health monitor since monitoring is resumed
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+
+        // Wait for a probe
+        try await Task.sleep(for: .seconds(1.5))
+        let probeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertGreaterThan(probeMessages.count, 0, "Probes should resume after resumeHealthMonitoring")
+
+        await manager.stop()
+    }
+
+    func testSendProbeToAllEndpoints() async throws {
+        let provider = MockChannelProvider()
+        let manager = TunnelManager(provider: provider)
+        try await manager.start()
+
+        // Create a session — manager auto-creates an EndpointSet
+        _ = try await manager.getSession(machineId: "machine-1", channel: "data")
+
+        // Add extra endpoints to the session's EndpointSet
+        let key = TunnelSessionKey(remoteMachineId: "machine-1", channel: "data")
+        if let endpointSet = await manager.getEndpointSet(for: key) {
+            await endpointSet.add(address: "primary", localPort: nil)
+            await endpointSet.add(address: "10.0.0.2:5000", localPort: nil)
+        }
+
+        await provider.clearSentMessages()
+
+        // Wait for a probe cycle
+        try await Task.sleep(for: .seconds(1.5))
+
+        // Should have sent probes — at least one on the primary health probe channel
+        let probeMessages = await provider.getSentMessages().filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertGreaterThan(probeMessages.count, 0, "Should have sent at least one health probe")
+
+        // Check if endpoint-specific sends happened (probes to extra endpoints)
+        let endpointCalls = await provider.sendToEndpointCalls.filter { $0.channel == "tunnel-health-probe" }
+        XCTAssertGreaterThan(endpointCalls.count, 0, "Should have sent probes to extra endpoints")
+
+        await manager.stop()
     }
 
     func testHandshakeIncludesChannel() async throws {

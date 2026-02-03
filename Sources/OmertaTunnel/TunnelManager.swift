@@ -66,8 +66,17 @@ public actor TunnelManager {
     /// Remote-reported delivered stats per session
     private var deliveredStats: [TunnelSessionKey: (bytesPerSecond: UInt64, packetsPerSecond: UInt64)] = [:]
 
+    /// Per-session endpoint sets for multi-endpoint tunnels
+    private var endpointSets: [TunnelSessionKey: EndpointSet] = [:]
+
+    /// Auxiliary ports bound by this manager (port → set of session keys using it)
+    private var auxiliaryPorts: [UInt16: Set<TunnelSessionKey>] = [:]
+
     /// Whether the manager is running
-    private var isRunning: Bool = false
+    public private(set) var isRunning: Bool = false
+
+    /// When true, health monitors are not created for new sessions
+    private var healthMonitoringSuspended: Bool = false
 
     /// Task consuming endpoint change events
     private var endpointChangeTask: Task<Void, Never>?
@@ -90,6 +99,11 @@ public actor TunnelManager {
     /// All active session keys
     public var activeSessionKeys: [TunnelSessionKey] {
         Array(sessions.keys)
+    }
+
+    /// Get the endpoint set for a session (for test observation)
+    public func getEndpointSet(for key: TunnelSessionKey) -> EndpointSet? {
+        endpointSets[key]
     }
 
     /// Get the health monitor for a specific machine (for test observation)
@@ -172,6 +186,8 @@ public actor TunnelManager {
         pendingData.removeAll()
         receiveAccum.removeAll()
         deliveredStats.removeAll()
+        endpointSets.removeAll()
+        auxiliaryPorts.removeAll()
         lastProbeTime.removeAll()
         probeRoundRobinOffset.removeAll()
 
@@ -193,7 +209,7 @@ public actor TunnelManager {
     ///   - machineId: The remote machine ID
     ///   - channel: The logical channel name (defaults to "data")
     /// - Returns: The tunnel session (existing or newly created)
-    public func getSession(machineId: MachineId, channel: String = "data", receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
+    public func getSession(machineId: MachineId, channel: String = "data", extraEndpoints: Int? = nil, receiveHandler: (@Sendable (Data) async -> Void)? = nil) async throws -> TunnelSession {
         guard isRunning else {
             throw TunnelError.notConnected
         }
@@ -218,8 +234,11 @@ public actor TunnelManager {
         // Generate session ID for this session
         let sid = UUID().uuidString.prefix(8).lowercased()
 
-        // Send handshake with channel info
-        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid))
+        // Send handshake with channel info (include extra endpoints request if configured)
+        let effectiveExtra = extraEndpoints ?? config.extraEndpoints
+        let extraRequested = effectiveExtra > 0 ? effectiveExtra : nil
+        let handshake = SessionHandshake(type: .request, channel: channel, sessionId: String(sid),
+                                         extraEndpointsRequested: extraRequested)
         let data = try JSONEncoder().encode(handshake)
         try await provider.sendOnChannel(data, toMachine: machineId, channel: handshakeChannel)
 
@@ -236,8 +255,13 @@ public actor TunnelManager {
         sessionIds[key] = String(sid)
         await ensureWireChannelRegistered(for: channel)
 
+        // Initialize endpoint set (primary endpoint will be added when ack arrives with extras)
+        let endpointSet = EndpointSet()
+        endpointSets[key] = endpointSet
+        await newSession.setEndpointSet(endpointSet)
+
         // Start health monitor for this machine if first session
-        if healthMonitors[machineId] == nil {
+        if !healthMonitoringSuspended, healthMonitors[machineId] == nil {
             logger.info("Creating health monitor for machine \(machineId.prefix(8))...")
             let monitor = TunnelHealthMonitor(
                 minProbeInterval: config.healthProbeMinInterval,
@@ -250,9 +274,7 @@ public actor TunnelManager {
             await monitor.startMonitoring(
                 machineId: machineId,
                 sendProbe: { [weak self] id in
-                    guard let self else { return }
-                    let payload = await self.buildProbePayload(for: id)
-                    try await self.provider.sendOnChannel(payload, toMachine: id, channel: self.healthProbeChannel)
+                    await self?.sendProbeToAllEndpoints(machineId: id)
                 },
                 onDegraded: { [weak self] id in
                     await self?.handleHealthDegraded(machineId: id)
@@ -265,6 +287,8 @@ public actor TunnelManager {
                     await self?.handleHealthRecovered(machineId: id)
                 }
             )
+        } else if healthMonitoringSuspended {
+            logger.debug("Health monitoring suspended, skipping monitor for \(machineId.prefix(8))")
         } else {
             logger.debug("Health monitor already exists for \(machineId.prefix(8))...")
         }
@@ -290,6 +314,25 @@ public actor TunnelManager {
         let sid = sessionIds.removeValue(forKey: key)
         receiveAccum.removeValue(forKey: key)
         deliveredStats.removeValue(forKey: key)
+        endpointSets.removeValue(forKey: key)
+
+        // Unbind auxiliary ports associated with this session
+        if let auxProvider = provider as? AuxiliaryPortProvider {
+            var portsToUnbind: [UInt16] = []
+            for (port, var keys) in auxiliaryPorts {
+                keys.remove(key)
+                if keys.isEmpty {
+                    portsToUnbind.append(port)
+                    auxiliaryPorts.removeValue(forKey: port)
+                } else {
+                    auxiliaryPorts[port] = keys
+                }
+            }
+            for port in portsToUnbind {
+                await auxProvider.unbindAuxiliaryPort(port)
+                logger.info("Unbound auxiliary port \(port) for closed session")
+            }
+        }
 
         logger.info("closeSession: sending close handshake", metadata: ["machine": "\(key.remoteMachineId)", "channel": "\(key.channel)"])
 
@@ -360,6 +403,22 @@ public actor TunnelManager {
                 await session.recover()
             }
         }
+    }
+
+    /// Suspend health monitoring: stop all monitors and prevent new ones from being created.
+    /// Call `resumeHealthMonitoring()` to re-enable.
+    public func suspendHealthMonitoring() async {
+        healthMonitoringSuspended = true
+        for (id, monitor) in healthMonitors {
+            await monitor.stopMonitoring()
+            logger.info("Suspended health monitor for \(id.prefix(8))")
+        }
+        healthMonitors.removeAll()
+    }
+
+    /// Resume health monitoring for future sessions.
+    public func resumeHealthMonitoring() {
+        healthMonitoringSuspended = false
     }
 
     private func reprobeAllMachines() async {
@@ -472,14 +531,49 @@ public actor TunnelManager {
                     }
                 }
 
-                // Send ack
-                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId)
-                if let ackData = try? JSONEncoder().encode(ack) {
-                    try? await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                // Initialize endpoint set for inbound session
+                let endpointSet = EndpointSet()
+                endpointSets[key] = endpointSet
+                await newSession.setEndpointSet(endpointSet)
+
+                // Bind auxiliary ports if requested and provider supports it
+                var extraEndpointAddrs: [String]? = nil
+                if let requested = handshake.extraEndpointsRequested, requested > 0,
+                   let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var addrs: [String] = []
+                        for _ in 0..<requested {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                addrs.append(addr)
+                                await endpointSet.add(address: addr, localPort: auxPort)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                logger.info("Bound auxiliary port \(auxPort) for inbound session")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !addrs.isEmpty {
+                            extraEndpointAddrs = addrs
+                        }
+                    }
+                }
+
+                // Send ack (with extra endpoints if we bound any)
+                let ack = SessionHandshake(type: .ack, channel: channel, sessionId: handshake.sessionId,
+                                           extraEndpoints: extraEndpointAddrs)
+                do {
+                    let ackData = try JSONEncoder().encode(ack)
+                    try await provider.sendOnChannel(ackData, toMachine: machineId, channel: handshakeChannel)
+                    logger.info("Sent ack with \(extraEndpointAddrs?.count ?? 0) extra endpoint(s)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+                } catch {
+                    logger.error("Failed to send ack: \(error)", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
                 }
 
                 // Start health monitor for this machine if first session
-                if healthMonitors[machineId] == nil {
+                if !healthMonitoringSuspended, healthMonitors[machineId] == nil {
                     let monitor = TunnelHealthMonitor(
                         minProbeInterval: config.healthProbeMinInterval,
                         maxProbeInterval: config.healthProbeMaxInterval,
@@ -491,8 +585,7 @@ public actor TunnelManager {
                     await monitor.startMonitoring(
                         machineId: machineId,
                         sendProbe: { [weak self] id in
-                            guard let self else { return }
-                            try await self.provider.sendOnChannel(Data([0x01]), toMachine: id, channel: self.healthProbeChannel)
+                            await self?.sendProbeToAllEndpoints(machineId: id)
                         },
                         onDegraded: { [weak self] id in
                             await self?.handleHealthDegraded(machineId: id)
@@ -516,7 +609,73 @@ public actor TunnelManager {
             }
 
         case .ack:
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            // If ack includes extra endpoints, add them to our EndpointSet
+            if let extras = handshake.extraEndpoints, !extras.isEmpty,
+               let endpointSet = endpointSets[key] {
+                // Add primary endpoint first (localPort nil = primary socket, address "primary" = sentinel)
+                await endpointSet.add(address: "primary", localPort: nil)
+
+                for ep in extras {
+                    await endpointSet.add(address: ep, localPort: nil)
+                }
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from ack, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+
+                // Bind our own auxiliary ports (one per remote extra endpoint)
+                // and pair each with a remote endpoint for sending.
+                // Also send our aux port addresses back so the remote can send to us.
+                if let auxProvider = provider as? AuxiliaryPortProvider {
+                    let localHost = await auxProvider.localAddressForMachine(machineId)
+                    if let host = localHost {
+                        var ourAddrs: [String] = []
+                        // Re-add remote extras with paired local aux ports
+                        for remoteEp in extras {
+                            do {
+                                let auxPort = try await auxProvider.bindAuxiliaryPort()
+                                let addr = "\(host):\(auxPort)"
+                                ourAddrs.append(addr)
+                                auxiliaryPorts[auxPort, default: []].insert(key)
+                                // Update the endpoint entry with the local port for sending
+                                await endpointSet.updateLocalPort(for: remoteEp, localPort: auxPort)
+                                logger.info("Bound auxiliary port \(auxPort) → remote \(remoteEp)")
+                            } catch {
+                                logger.warning("Failed to bind auxiliary port: \(error)")
+                            }
+                        }
+                        if !ourAddrs.isEmpty {
+                            let offer = SessionHandshake(type: .endpointOffer, channel: channel,
+                                                          sessionId: handshake.sessionId,
+                                                          extraEndpoints: ourAddrs)
+                            if let offerData = try? JSONEncoder().encode(offer) {
+                                try? await provider.sendOnChannel(offerData, toMachine: machineId, channel: handshakeChannel)
+                            }
+                        }
+                    }
+                }
+            }
             logger.debug("Session ack received", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+
+        case .endpointOffer:
+            let key = TunnelSessionKey(remoteMachineId: machineId, channel: channel)
+            if let extras = handshake.extraEndpoints, !extras.isEmpty,
+               let endpointSet = endpointSets[key] {
+                // Add primary endpoint first
+                await endpointSet.add(address: "primary", localPort: nil)
+
+                // The responder already has its own aux ports bound (from the .request handler).
+                // Now pair each remote extra endpoint with one of our local aux ports.
+                let ourAuxPorts = auxiliaryPorts.keys.filter { port in
+                    auxiliaryPorts[port]?.contains(key) == true
+                }.sorted()
+
+                for (i, ep) in extras.enumerated() {
+                    let localPort = i < ourAuxPorts.count ? ourAuxPorts[i] : nil
+                    await endpointSet.add(address: ep, localPort: localPort)
+                }
+                let totalCount = await endpointSet.count
+                logger.info("Received \(extras.count) extra endpoint(s) from offer, total \(totalCount) endpoints", metadata: ["machine": "\(machineId)", "channel": "\(channel)"])
+            }
 
         case .reject:
             logger.info("Session rejected by machine", metadata: ["machine": "\(machineId)"])
@@ -545,6 +704,28 @@ public actor TunnelManager {
     }
 
     // MARK: - Probe Encoding/Decoding
+
+    /// Send health probe to all endpoints for a machine (primary + extras from EndpointSets).
+    private func sendProbeToAllEndpoints(machineId: MachineId) async {
+        let payload = buildProbePayload(for: machineId)
+
+        // Always send on primary channel
+        try? await provider.sendOnChannel(payload, toMachine: machineId, channel: healthProbeChannel)
+
+        // Also send on any extra endpoints from this machine's sessions
+        let machineKeys = endpointSets.keys.filter { $0.remoteMachineId == machineId }
+        var sentAddresses = Set<String>()
+        for key in machineKeys {
+            guard let endpointSet = endpointSets[key] else { continue }
+            let addresses = await endpointSet.activeAddresses
+            for addr in addresses {
+                guard !sentAddresses.contains(addr) else { continue }
+                sentAddresses.insert(addr)
+                try? await provider.sendOnChannel(payload, toEndpoint: addr, viaPort: nil,
+                                                   toMachine: machineId, channel: healthProbeChannel)
+            }
+        }
+    }
 
     /// Build a probe payload with per-channel receive stats for the given machine.
     /// Format: [1B channelCount] then per channel: [1B nameLen][name bytes][8B bytesPerSec LE][8B packetsPerSec LE]
@@ -666,15 +847,24 @@ struct SessionHandshake: Codable, Sendable {
         case ack
         case reject
         case close
+        case endpointOffer
     }
 
     let type: HandshakeType
     let channel: String?
     let sessionId: String?
 
-    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil) {
+    /// Number of extra endpoints the initiator is requesting (request only)
+    let extraEndpointsRequested: Int?
+    /// Extra endpoints offered by this side ("host:port" strings)
+    let extraEndpoints: [String]?
+
+    init(type: HandshakeType, channel: String? = nil, sessionId: String? = nil,
+         extraEndpointsRequested: Int? = nil, extraEndpoints: [String]? = nil) {
         self.type = type
         self.channel = channel
         self.sessionId = sessionId
+        self.extraEndpointsRequested = extraEndpointsRequested
+        self.extraEndpoints = extraEndpoints
     }
 }

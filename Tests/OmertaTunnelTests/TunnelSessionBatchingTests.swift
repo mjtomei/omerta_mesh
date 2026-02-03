@@ -278,6 +278,148 @@ final class TunnelSessionBatchingTests: XCTestCase {
         await session.close()
     }
 
+    // MARK: - Multi-Endpoint Routing Tests
+
+    /// 11. flush() with multiple endpoints uses DWRR scheduling.
+    func testFlushWithMultipleEndpointsUsesDWRR() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 0)
+        )
+
+        // Set up an EndpointSet with primary + a second endpoint
+        let endpointSet = EndpointSet()
+        await endpointSet.add(address: "primary", localPort: nil)
+        await endpointSet.add(address: "10.0.0.2:5000", localPort: 6000)
+        await session.setEndpointSet(endpointSet)
+
+        // Send and flush
+        try await session.send(Data([1, 2, 3]))
+        try await session.flush()
+
+        // Provider should have received the send
+        let calls = await provider.sendCalls
+        XCTAssertEqual(calls.count, 1, "flush() should send exactly once via DWRR-selected endpoint")
+
+        // EndpointSet should have recorded the send
+        let endpoints = await endpointSet.allEndpoints
+        let totalBytesSent = endpoints.reduce(0) { $0 + $1.bytesSent }
+        XCTAssertGreaterThan(totalBytesSent, 0, "EndpointSet should record the send")
+
+        await session.close()
+    }
+
+    /// 12. flush() falls back to standard send when EndpointSet returns nil (empty set).
+    func testFlushFallbackWhenEndpointSetReturnsNil() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 0)
+        )
+
+        // Set an empty EndpointSet (count=0, next() returns nil)
+        let endpointSet = EndpointSet()
+        await session.setEndpointSet(endpointSet)
+
+        // The EndpointSet has 0 endpoints, so count <= 1 — flush should use standard path
+        try await session.send(Data([4, 5, 6]))
+        try await session.flush()
+
+        let calls = await provider.sendCalls
+        XCTAssertEqual(calls.count, 1, "flush() should fall back to standard send with empty EndpointSet")
+
+        await session.close()
+    }
+
+    // MARK: - Degraded State Tests
+
+    /// 13. Degraded state still allows send and flush.
+    func testDegradedStateAllowsSendAndFlush() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(
+            provider: provider,
+            batchConfig: BatchConfig(maxFlushDelay: .seconds(60), maxBufferSize: 0)
+        )
+
+        await session.setDegraded()
+        let state = await session.state
+        XCTAssertEqual(state, .degraded)
+
+        // send() and flush() should still work in degraded state
+        try await session.send(Data([7, 8, 9]))
+        try await session.flush()
+
+        let calls = await provider.sendCalls
+        XCTAssertEqual(calls.count, 1, "send+flush should work in degraded state")
+
+        await session.close()
+    }
+
+    /// 14. recover() transitions from degraded back to active.
+    func testRecoverFromDegraded() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(provider: provider)
+
+        await session.setDegraded()
+        let degradedState = await session.state
+        XCTAssertEqual(degradedState, .degraded)
+
+        await session.recover()
+        let activeState = await session.state
+        XCTAssertEqual(activeState, .active)
+
+        await session.close()
+    }
+
+    /// 15. setDegraded() is a no-op when state is not .active.
+    func testSetDegradedOnlyFromActive() async throws {
+        let provider = BatchTestProvider()
+        // Session is in .connecting state (not activated)
+        let session = TunnelSession(
+            remoteMachineId: "remote-machine",
+            channel: "data",
+            provider: provider
+        )
+
+        await session.setDegraded()
+        let state = await session.state
+        XCTAssertEqual(state, .connecting, "setDegraded() should be no-op from .connecting")
+
+        // Also test from .disconnected
+        await session.activate()
+        await session.close()
+        let disconnectedState = await session.state
+        XCTAssertEqual(disconnectedState, .disconnected)
+
+        await session.setDegraded()
+        let stillDisconnected = await session.state
+        XCTAssertEqual(stillDisconnected, .disconnected, "setDegraded() should be no-op from .disconnected")
+    }
+
+    /// 16. recover() is a no-op when state is not .degraded.
+    func testRecoverOnlyFromDegraded() async throws {
+        let provider = BatchTestProvider()
+        let session = await makeActiveSession(provider: provider)
+
+        // recover() from .active should be no-op
+        await session.recover()
+        let state = await session.state
+        XCTAssertEqual(state, .active, "recover() should be no-op from .active")
+
+        // recover() from .connecting should be no-op
+        let session2 = TunnelSession(
+            remoteMachineId: "remote-machine",
+            channel: "data",
+            provider: provider
+        )
+        await session2.recover()
+        let state2 = await session2.state
+        XCTAssertEqual(state2, .connecting, "recover() should be no-op from .connecting")
+
+        await session.close()
+    }
+
     /// 10. flush() on a non-active session throws TunnelError.notConnected.
     func testFlushWhileNotActive() async throws {
         let provider = BatchTestProvider()
