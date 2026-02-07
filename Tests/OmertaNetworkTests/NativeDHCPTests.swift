@@ -1,206 +1,364 @@
-// NativeDHCPTests.swift - Tests for native DHCP service and client
+// NativeDHCPTests.swift - Tests for RFC 2131 packet-based DHCP service and client
 
 import XCTest
 @testable import OmertaNetwork
-@testable import OmertaMesh
 
-// MARK: - Mock Channel Provider for DHCP Tests
+// MARK: - DHCPPacket Tests
 
-/// Mock channel provider that can route messages between service and client
-actor MockDHCPChannelProvider: ChannelProvider {
-    let _peerId: PeerId
+final class DHCPPacketTests: XCTestCase {
 
-    private var handlers: [String: @Sendable (MachineId, Data) async -> Void] = [:]
-    var sentMessages: [(data: Data, target: String, channel: String)] = []
+    // MARK: - Parse/Build Round-Trip
 
-    init(peerId: PeerId = "mock-peer") {
-        self._peerId = peerId
+    func testPacketRoundTrip() throws {
+        var packet = DHCPPacket()
+        packet.op = DHCPPacket.bootRequest
+        packet.htype = DHCPPacket.htypeEthernet
+        packet.hlen = DHCPPacket.hlenEthernet
+        packet.xid = 0xDEADBEEF
+        packet.flags = DHCPPacket.broadcastFlag
+        packet.chaddr = DHCPPacket.machineIdToChaddr("test-machine")
+
+        packet.setMessageType(.discover)
+        packet.setHostname("testhost")
+        packet.options[DHCPOptionTag.parameterList.rawValue] = [1, 3, 6, 51]
+
+        let data = packet.toData()
+        let parsed = try DHCPPacket.parse(data)
+
+        XCTAssertEqual(parsed.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(parsed.htype, DHCPPacket.htypeEthernet)
+        XCTAssertEqual(parsed.hlen, DHCPPacket.hlenEthernet)
+        XCTAssertEqual(parsed.xid, 0xDEADBEEF)
+        XCTAssertEqual(parsed.flags, DHCPPacket.broadcastFlag)
+        XCTAssertEqual(parsed.messageType, .discover)
+        XCTAssertEqual(parsed.hostname, "testhost")
+        XCTAssertEqual(Array(parsed.chaddr.prefix(6)), Array(packet.chaddr.prefix(6)))
     }
 
-    var peerId: PeerId {
-        get async { _peerId }
+    func testMinimumPacketSize() {
+        let packet = DHCPPacket()
+        let data = packet.toData()
+
+        // RFC 2131: minimum 552 bytes (236 header + 4 cookie + 312 options)
+        XCTAssertGreaterThanOrEqual(data.count, DHCPPacket.minimumPacketSize)
     }
 
-    func onChannel(_ channel: String, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
-        handlers[channel] = handler
+    func testMagicCookie() throws {
+        let packet = DHCPPacket()
+        let data = packet.toData()
+        let bytes = [UInt8](data)
+
+        // Magic cookie at offset 236 (after header)
+        XCTAssertEqual(bytes[236], 99)
+        XCTAssertEqual(bytes[237], 130)
+        XCTAssertEqual(bytes[238], 83)
+        XCTAssertEqual(bytes[239], 99)
     }
 
-    func onChannel(_ channel: String, batchConfig: BatchConfig?, handler: @escaping @Sendable (MachineId, Data) async -> Void) async throws {
-        try await onChannel(channel, handler: handler)
-    }
+    func testInvalidMagicCookieThrows() {
+        var bytes = [UInt8](repeating: 0, count: 300)
+        bytes[0] = 1  // op
+        // Don't set magic cookie
+        let data = Data(bytes)
 
-    func offChannel(_ channel: String) async {
-        handlers.removeValue(forKey: channel)
-    }
-
-    func sendOnChannel(_ data: Data, to peerId: PeerId, channel: String) async throws {
-        sentMessages.append((data, peerId, channel))
-    }
-
-    func sendOnChannel(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
-        sentMessages.append((data, machineId, channel))
-    }
-
-    func sendOnChannelBuffered(_ data: Data, to peerId: PeerId, channel: String) async throws {
-        try await sendOnChannel(data, to: peerId, channel: channel)
-    }
-
-    func sendOnChannelBuffered(_ data: Data, toMachine machineId: MachineId, channel: String) async throws {
-        try await sendOnChannel(data, toMachine: machineId, channel: channel)
-    }
-
-    func flushChannel(_ channel: String) async throws {}
-
-    func simulateReceive(_ data: Data, from machineId: MachineId, on channel: String) async {
-        if let handler = handlers[channel] {
-            await handler(machineId, data)
+        XCTAssertThrowsError(try DHCPPacket.parse(data)) { error in
+            if case DHCPError.invalidPacket(let msg) = error {
+                XCTAssertTrue(msg.contains("magic cookie"))
+            } else {
+                XCTFail("Expected invalidPacket error, got \(error)")
+            }
         }
     }
 
-    func drainMessages() -> [(data: Data, target: String, channel: String)] {
-        let msgs = sentMessages
-        sentMessages.removeAll()
-        return msgs
+    func testTooShortPacketThrows() {
+        let data = Data([1, 2, 3])  // Way too short
+        XCTAssertThrowsError(try DHCPPacket.parse(data))
     }
 
-    func clearMessages() {
-        sentMessages.removeAll()
+    // MARK: - IP Address Helpers
+
+    func testParseAndFormatIP() {
+        let ip = DHCPPacket.parseIP("10.42.0.1")
+        XCTAssertNotNil(ip)
+        XCTAssertEqual(ip, 0x0A2A0001)
+
+        let formatted = DHCPPacket.formatIP(0x0A2A0001)
+        XCTAssertEqual(formatted, "10.42.0.1")
     }
 
-    func clearMessages(for target: String) {
-        sentMessages.removeAll { $0.target == target }
+    func testParseIPBroadcast() {
+        let ip = DHCPPacket.parseIP("255.255.255.255")
+        XCTAssertEqual(ip, 0xFFFFFFFF)
+    }
+
+    func testParseInvalidIP() {
+        XCTAssertNil(DHCPPacket.parseIP("not.an.ip"))
+        XCTAssertNil(DHCPPacket.parseIP("10.0.0"))
+        XCTAssertNil(DHCPPacket.parseIP(""))
+    }
+
+    // MARK: - Machine ID to chaddr
+
+    func testMachineIdToChaddr() {
+        let chaddr = DHCPPacket.machineIdToChaddr("test-machine")
+
+        // Should be 16 bytes
+        XCTAssertEqual(chaddr.count, 16)
+
+        // Locally-administered bit set, multicast bit cleared
+        XCTAssertTrue(chaddr[0] & 0x02 != 0, "Locally-administered bit should be set")
+        XCTAssertTrue(chaddr[0] & 0x01 == 0, "Multicast bit should be cleared")
+
+        // Last 10 bytes should be zero (padding)
+        for i in 6..<16 {
+            XCTAssertEqual(chaddr[i], 0)
+        }
+
+        // Deterministic: same input → same output
+        let chaddr2 = DHCPPacket.machineIdToChaddr("test-machine")
+        XCTAssertEqual(chaddr, chaddr2)
+
+        // Different input → different output
+        let chaddr3 = DHCPPacket.machineIdToChaddr("other-machine")
+        XCTAssertNotEqual(Array(chaddr.prefix(6)), Array(chaddr3.prefix(6)))
+    }
+
+    // MARK: - Option Accessors
+
+    func testOptionAccessors() {
+        var packet = DHCPPacket()
+
+        packet.setMessageType(.offer)
+        XCTAssertEqual(packet.messageType, .offer)
+
+        packet.setSubnetMask(0xFFFF0000)
+        XCTAssertEqual(packet.subnetMask, 0xFFFF0000)
+
+        packet.setRouter(0x0A2A0001)
+        XCTAssertEqual(packet.router, 0x0A2A0001)
+
+        packet.setLeaseTime(3600)
+        XCTAssertEqual(packet.leaseTime, 3600)
+
+        packet.setServerIdentifier(0x0A2A0001)
+        XCTAssertEqual(packet.serverIdentifier, 0x0A2A0001)
+
+        packet.setRequestedIP(0x0A2A0064)
+        XCTAssertEqual(packet.requestedIP, 0x0A2A0064)
+
+        packet.setDNSServers([0x08080808, 0x08080404])
+        XCTAssertEqual(packet.dnsServers, [0x08080808, 0x08080404])
+
+        packet.setHostname("testhost")
+        XCTAssertEqual(packet.hostname, "testhost")
+    }
+
+    // MARK: - IPv4/UDP Wrapping
+
+    func testIPv4UDPRoundTrip() throws {
+        var dhcp = DHCPPacket()
+        dhcp.op = DHCPPacket.bootRequest
+        dhcp.xid = 0x12345678
+        dhcp.setMessageType(.discover)
+
+        let wrapped = dhcp.toIPv4UDP(
+            srcIP: 0,
+            dstIP: 0xFFFFFFFF,
+            srcPort: DHCPPacket.clientPort,
+            dstPort: DHCPPacket.serverPort
+        )
+
+        let (parsed, srcIP, dstIP) = try DHCPPacket.fromIPv4UDP(wrapped)
+
+        XCTAssertEqual(srcIP, 0)
+        XCTAssertEqual(dstIP, 0xFFFFFFFF)
+        XCTAssertEqual(parsed.xid, 0x12345678)
+        XCTAssertEqual(parsed.messageType, .discover)
+    }
+
+    // MARK: - Packet Builders
+
+    func testBuildDiscover() throws {
+        let packet = DHCPPacket.buildDiscover(
+            machineId: "test-machine",
+            xid: 0xAABBCCDD,
+            hostname: "myhost"
+        )
+
+        let (dhcp, srcIP, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(dhcp.xid, 0xAABBCCDD)
+        XCTAssertEqual(dhcp.messageType, .discover)
+        XCTAssertEqual(dhcp.hostname, "myhost")
+        XCTAssertEqual(dhcp.flags, DHCPPacket.broadcastFlag)
+        XCTAssertEqual(srcIP, 0)
+        XCTAssertEqual(dstIP, 0xFFFFFFFF)
+    }
+
+    func testBuildOffer() throws {
+        let chaddr = DHCPPacket.machineIdToChaddr("test-machine")
+        let packet = DHCPPacket.buildOffer(
+            xid: 0x11223344,
+            clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: DHCPPacket.parseIP("255.255.0.0")!,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [DHCPPacket.parseIP("8.8.8.8")!],
+            leaseTime: 3600
+        )
+
+        let (dhcp, _, _) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootReply)
+        XCTAssertEqual(dhcp.messageType, .offer)
+        XCTAssertEqual(dhcp.yiaddr, DHCPPacket.parseIP("10.0.0.100"))
+        XCTAssertEqual(dhcp.leaseTime, 3600)
+        XCTAssertEqual(dhcp.subnetMask, DHCPPacket.parseIP("255.255.0.0"))
+        XCTAssertEqual(dhcp.router, DHCPPacket.parseIP("10.0.0.1"))
+    }
+
+    func testBuildRequestSelecting() throws {
+        let packet = DHCPPacket.buildRequest(
+            machineId: "test-machine",
+            xid: 0x55667788,
+            requestedIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!
+        )
+
+        let (dhcp, srcIP, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(dhcp.messageType, .request)
+        XCTAssertEqual(dhcp.ciaddr, 0)  // Must be 0 in SELECTING
+        XCTAssertEqual(dhcp.requestedIP, DHCPPacket.parseIP("10.0.0.100"))
+        XCTAssertEqual(dhcp.serverIdentifier, DHCPPacket.parseIP("10.0.0.1"))
+        XCTAssertEqual(srcIP, 0)
+        XCTAssertEqual(dstIP, 0xFFFFFFFF)  // Broadcast
+    }
+
+    func testBuildRenewRequest() throws {
+        let clientIP = DHCPPacket.parseIP("10.0.0.100")!
+        let serverIP = DHCPPacket.parseIP("10.0.0.1")!
+
+        let packet = DHCPPacket.buildRenewRequest(
+            machineId: "test-machine",
+            xid: 0x99AABBCC,
+            clientIP: clientIP,
+            serverIP: serverIP
+        )
+
+        let (dhcp, srcIP, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(dhcp.messageType, .request)
+        XCTAssertEqual(dhcp.ciaddr, clientIP)  // Must be filled in RENEWING
+        XCTAssertNil(dhcp.requestedIP)          // Must NOT be set in RENEWING
+        XCTAssertNil(dhcp.serverIdentifier)     // Must NOT be set in RENEWING
+        XCTAssertEqual(srcIP, clientIP)
+        XCTAssertEqual(dstIP, serverIP)  // Unicast to server
+    }
+
+    func testBuildRebindRequest() throws {
+        let clientIP = DHCPPacket.parseIP("10.0.0.100")!
+
+        let packet = DHCPPacket.buildRebindRequest(
+            machineId: "test-machine",
+            xid: 0xDDEEFF00,
+            clientIP: clientIP
+        )
+
+        let (dhcp, _, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(dhcp.messageType, .request)
+        XCTAssertEqual(dhcp.ciaddr, clientIP)
+        XCTAssertNil(dhcp.requestedIP)
+        XCTAssertNil(dhcp.serverIdentifier)
+        XCTAssertEqual(dstIP, 0xFFFFFFFF)  // Broadcast
+    }
+
+    func testBuildACK() throws {
+        let chaddr = DHCPPacket.machineIdToChaddr("test-machine")
+        let packet = DHCPPacket.buildACK(
+            xid: 0x11111111,
+            clientChaddr: chaddr,
+            assignedIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: DHCPPacket.parseIP("255.255.0.0")!,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [],
+            leaseTime: 7200
+        )
+
+        let (dhcp, _, _) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootReply)
+        XCTAssertEqual(dhcp.messageType, .ack)
+        XCTAssertEqual(dhcp.yiaddr, DHCPPacket.parseIP("10.0.0.100"))
+        XCTAssertEqual(dhcp.leaseTime, 7200)
+    }
+
+    func testBuildNAK() throws {
+        let chaddr = DHCPPacket.machineIdToChaddr("test-machine")
+        let packet = DHCPPacket.buildNAK(
+            xid: 0x22222222,
+            clientChaddr: chaddr,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!
+        )
+
+        let (dhcp, _, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootReply)
+        XCTAssertEqual(dhcp.messageType, .nak)
+        XCTAssertEqual(dstIP, 0xFFFFFFFF)  // Must be broadcast
+    }
+
+    func testBuildRelease() throws {
+        let clientIP = DHCPPacket.parseIP("10.0.0.100")!
+        let serverIP = DHCPPacket.parseIP("10.0.0.1")!
+
+        let packet = DHCPPacket.buildRelease(
+            machineId: "test-machine",
+            xid: 0x33333333,
+            clientIP: clientIP,
+            serverIP: serverIP
+        )
+
+        let (dhcp, srcIP, dstIP) = try DHCPPacket.fromIPv4UDP(packet)
+
+        XCTAssertEqual(dhcp.op, DHCPPacket.bootRequest)
+        XCTAssertEqual(dhcp.messageType, .release)
+        XCTAssertEqual(dhcp.ciaddr, clientIP)
+        XCTAssertEqual(srcIP, clientIP)
+        XCTAssertEqual(dstIP, serverIP)  // Unicast
+    }
+
+    // MARK: - Constants
+
+    func testT1T2Constants() {
+        XCTAssertEqual(DHCPPacket.t1Factor, 0.5)
+        XCTAssertEqual(DHCPPacket.t2Factor, 0.875)
     }
 }
 
-// MARK: - DHCP Messages Tests
+// MARK: - DHCPService Tests
 
-final class DHCPMessagesTests: XCTestCase {
-
-    func testDHCPRequestEncoding() throws {
-        let request = DHCPRequest(machineId: "machine-1", requestedIP: "10.0.0.50", hostname: "myhost")
-        let message = DHCPMessage.request(request)
-
-        let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(DHCPMessage.self, from: data)
-
-        if case .request(let req) = decoded {
-            XCTAssertEqual(req.machineId, "machine-1")
-            XCTAssertEqual(req.requestedIP, "10.0.0.50")
-            XCTAssertEqual(req.hostname, "myhost")
-        } else {
-            XCTFail("Expected request message")
-        }
-    }
-
-    func testDHCPResponseEncoding() throws {
-        let response = DHCPResponse(
-            machineId: "machine-1",
-            assignedIP: "10.0.0.50",
-            netmask: "255.255.0.0",
-            gateway: "10.0.0.1",
-            dnsServers: ["8.8.8.8", "8.8.4.4"],
-            leaseSeconds: 3600
-        )
-        let message = DHCPMessage.response(response)
-
-        let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(DHCPMessage.self, from: data)
-
-        if case .response(let resp) = decoded {
-            XCTAssertEqual(resp.machineId, "machine-1")
-            XCTAssertEqual(resp.assignedIP, "10.0.0.50")
-            XCTAssertEqual(resp.netmask, "255.255.0.0")
-            XCTAssertEqual(resp.gateway, "10.0.0.1")
-            XCTAssertEqual(resp.dnsServers, ["8.8.8.8", "8.8.4.4"])
-            XCTAssertEqual(resp.leaseSeconds, 3600)
-        } else {
-            XCTFail("Expected response message")
-        }
-    }
-
-    func testDHCPReleaseEncoding() throws {
-        let release = DHCPRelease(machineId: "machine-1", ip: "10.0.0.50")
-        let message = DHCPMessage.release(release)
-
-        let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(DHCPMessage.self, from: data)
-
-        if case .release(let rel) = decoded {
-            XCTAssertEqual(rel.machineId, "machine-1")
-            XCTAssertEqual(rel.ip, "10.0.0.50")
-        } else {
-            XCTFail("Expected release message")
-        }
-    }
-
-    func testDHCPRenewalEncoding() throws {
-        let renewal = DHCPRenewal(machineId: "machine-1", currentIP: "10.0.0.50")
-        let message = DHCPMessage.renewal(renewal)
-
-        let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(DHCPMessage.self, from: data)
-
-        if case .renewal(let ren) = decoded {
-            XCTAssertEqual(ren.machineId, "machine-1")
-            XCTAssertEqual(ren.currentIP, "10.0.0.50")
-        } else {
-            XCTFail("Expected renewal message")
-        }
-    }
-
-    func testDHCPNakEncoding() throws {
-        let message = DHCPMessage.nak("No addresses available")
-
-        let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(DHCPMessage.self, from: data)
-
-        if case .nak(let reason) = decoded {
-            XCTAssertEqual(reason, "No addresses available")
-        } else {
-            XCTFail("Expected nak message")
-        }
-    }
-}
-
-// MARK: - DHCP Service Tests
-
-final class NativeDHCPServiceTests: XCTestCase {
-
-    func testServiceConfigFromVirtualNetworkConfig() {
-        let vnetConfig = VirtualNetworkConfig(
-            subnet: "10.42.0.0",
-            netmask: "255.255.0.0",
-            prefixLength: 16,
-            gatewayIP: "10.42.0.1",
-            poolStart: "10.42.0.100",
-            poolEnd: "10.42.0.200"
-        )
-
-        let dhcpConfig = DHCPServiceConfig(from: vnetConfig, leaseTime: 7200, dnsServers: ["8.8.8.8"])
-
-        XCTAssertEqual(dhcpConfig.subnet, "10.42.0.0")
-        XCTAssertEqual(dhcpConfig.netmask, "255.255.0.0")
-        XCTAssertEqual(dhcpConfig.gatewayIP, "10.42.0.1")
-        XCTAssertEqual(dhcpConfig.poolStart, "10.42.0.100")
-        XCTAssertEqual(dhcpConfig.poolEnd, "10.42.0.200")
-        XCTAssertEqual(dhcpConfig.leaseTime, 7200)
-        XCTAssertEqual(dhcpConfig.dnsServers, ["8.8.8.8"])
-    }
+final class DHCPServiceTests: XCTestCase {
 
     func testServiceInitializesPool() async {
         let config = DHCPServiceConfig(
             poolStart: "10.0.0.1",
             poolEnd: "10.0.0.10"
         )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
+        let service = DHCPService(config: config)
 
-        // Pool should have 10 IPs (1-10)
         let count = await service.availableIPCount()
         XCTAssertEqual(count, 10)
     }
 
-    func testServiceHandleRequest() async {
+    func testServiceHandleDiscover() async throws {
         let config = DHCPServiceConfig(
             netmask: "255.255.0.0",
             gatewayIP: "10.0.0.1",
@@ -208,294 +366,23 @@ final class NativeDHCPServiceTests: XCTestCase {
             poolEnd: "10.0.0.200",
             leaseTime: 3600
         )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
+        let service = DHCPService(config: config)
 
-        let request = DHCPRequest(machineId: "m1", requestedIP: nil, hostname: "host1")
-        let response = await service.handleRequest(request)
+        // Build a DISCOVER
+        let discover = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
 
+        // Service should respond with OFFER
+        let response = await service.handlePacket(discover)
         XCTAssertNotNil(response)
-        XCTAssertEqual(response?.machineId, "m1")
-        XCTAssertEqual(response?.netmask, "255.255.0.0")
-        XCTAssertEqual(response?.gateway, "10.0.0.1")
-        XCTAssertEqual(response?.leaseSeconds, 3600)
 
-        // Should have allocated one IP
-        let leases = await service.getLeases()
-        XCTAssertEqual(leases.count, 1)
-        XCTAssertEqual(leases[0].machineId, "m1")
-        XCTAssertEqual(leases[0].hostname, "host1")
+        let (dhcp, _, _) = try DHCPPacket.fromIPv4UDP(response!)
+        XCTAssertEqual(dhcp.messageType, .offer)
+        XCTAssertNotEqual(dhcp.yiaddr, 0)
+        XCTAssertEqual(dhcp.leaseTime, 3600)
     }
 
-    func testServiceReturnsExistingLease() async {
+    func testServiceHandleFullFlow() async throws {
         let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // First request
-        let request1 = DHCPRequest(machineId: "m1")
-        let response1 = await service.handleRequest(request1)
-
-        // Second request from same machine
-        let request2 = DHCPRequest(machineId: "m1")
-        let response2 = await service.handleRequest(request2)
-
-        // Should return same IP
-        XCTAssertEqual(response1?.assignedIP, response2?.assignedIP)
-
-        // Should only have one lease
-        let leases = await service.getLeases()
-        XCTAssertEqual(leases.count, 1)
-    }
-
-    func testServiceHonorsRequestedIP() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        let request = DHCPRequest(machineId: "m1", requestedIP: "10.0.0.150")
-        let response = await service.handleRequest(request)
-
-        XCTAssertEqual(response?.assignedIP, "10.0.0.150")
-    }
-
-    func testServiceRejectsUnavailableRequestedIP() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // First machine gets 10.0.0.150
-        let request1 = DHCPRequest(machineId: "m1", requestedIP: "10.0.0.150")
-        _ = await service.handleRequest(request1)
-
-        // Second machine requests same IP
-        let request2 = DHCPRequest(machineId: "m2", requestedIP: "10.0.0.150")
-        let response2 = await service.handleRequest(request2)
-
-        // Should get a different IP
-        XCTAssertNotEqual(response2?.assignedIP, "10.0.0.150")
-    }
-
-    func testServiceHandleRelease() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        let initialCount = await service.availableIPCount()
-
-        // Allocate
-        let request = DHCPRequest(machineId: "m1")
-        let response = await service.handleRequest(request)
-        let allocatedIP = response!.assignedIP
-
-        let afterAllocCount = await service.availableIPCount()
-        XCTAssertEqual(afterAllocCount, initialCount - 1)
-
-        // Release
-        let release = DHCPRelease(machineId: "m1", ip: allocatedIP)
-        await service.handleRelease(release)
-
-        let afterReleaseCount = await service.availableIPCount()
-        XCTAssertEqual(afterReleaseCount, initialCount)
-
-        let leases = await service.getLeases()
-        XCTAssertTrue(leases.isEmpty)
-    }
-
-    func testServiceHandleRenewal() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200",
-            leaseTime: 3600
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // Allocate
-        let request = DHCPRequest(machineId: "m1")
-        let response = await service.handleRequest(request)
-        let allocatedIP = response!.assignedIP
-
-        // Renew
-        let renewal = DHCPRenewal(machineId: "m1", currentIP: allocatedIP)
-        let renewResponse = await service.handleRenewal(renewal)
-
-        XCTAssertNotNil(renewResponse)
-        XCTAssertEqual(renewResponse?.assignedIP, allocatedIP)
-        XCTAssertEqual(renewResponse?.leaseSeconds, 3600)
-    }
-
-    func testServiceRejectsRenewalMismatch() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // Allocate
-        let request = DHCPRequest(machineId: "m1")
-        _ = await service.handleRequest(request)
-
-        // Try to renew with an IP outside the pool range
-        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.50")
-        let renewResponse = await service.handleRenewal(renewal)
-
-        XCTAssertNil(renewResponse)
-    }
-
-    func testServiceRejectsUnknownRenewal() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // Try to renew without allocation
-        let renewal = DHCPRenewal(machineId: "m1", currentIP: "10.0.0.150")
-        let response = await service.handleRenewal(renewal)
-
-        XCTAssertNil(response)
-    }
-
-    func testServicePoolExhaustion() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.1",
-            poolEnd: "10.0.0.3"  // Only 3 IPs
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        // Allocate 3 IPs
-        for i in 1...3 {
-            let request = DHCPRequest(machineId: "m\(i)")
-            let response = await service.handleRequest(request)
-            XCTAssertNotNil(response)
-        }
-
-        // 4th request should fail
-        let request4 = DHCPRequest(machineId: "m4")
-        let response4 = await service.handleRequest(request4)
-        XCTAssertNil(response4)
-    }
-
-    func testServiceCleanupExpiredLeases() async {
-        let config = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200",
-            leaseTime: 1  // 1 second lease
-        )
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        let initialCount = await service.availableIPCount()
-
-        // Allocate
-        let request = DHCPRequest(machineId: "m1")
-        _ = await service.handleRequest(request)
-
-        // Wait for lease to expire
-        try? await Task.sleep(for: .seconds(2))
-
-        // Cleanup
-        await service.cleanupExpiredLeases()
-
-        let afterCleanupCount = await service.availableIPCount()
-        XCTAssertEqual(afterCleanupCount, initialCount)
-
-        let leases = await service.getLeases()
-        XCTAssertTrue(leases.isEmpty)
-    }
-
-    func testServiceStartStop() async throws {
-        let config = DHCPServiceConfig()
-        let provider = MockDHCPChannelProvider()
-        let service = DHCPService(config: config, provider: provider)
-
-        try await service.start()
-        // Starting again should be no-op
-        try await service.start()
-
-        await service.stop()
-        // Stopping again should be no-op
-        await service.stop()
-    }
-}
-
-// MARK: - DHCP Client Tests
-
-final class NativeDHCPClientTests: XCTestCase {
-
-    func testClientConfig() {
-        let config = NativeDHCPClientConfig(
-            gatewayMachineId: "gateway",
-            timeout: 15,
-            retries: 5,
-            autoRenew: false,
-            hostname: "myhost"
-        )
-
-        XCTAssertEqual(config.gatewayMachineId, "gateway")
-        XCTAssertEqual(config.timeout, 15)
-        XCTAssertEqual(config.retries, 5)
-        XCTAssertFalse(config.autoRenew)
-        XCTAssertEqual(config.hostname, "myhost")
-    }
-
-    func testClientStartStop() async throws {
-        let config = NativeDHCPClientConfig(gatewayMachineId: "gateway")
-        let provider = MockDHCPChannelProvider()
-        let client = DHCPClient(machineId: "m1", config: config, provider: provider)
-
-        try await client.start()
-        // Starting again should be no-op
-        try await client.start()
-
-        await client.stop()
-        // Stopping again should be no-op
-        await client.stop()
-    }
-
-    func testClientInitiallyNoLease() async throws {
-        let config = NativeDHCPClientConfig(gatewayMachineId: "gateway")
-        let provider = MockDHCPChannelProvider()
-        let client = DHCPClient(machineId: "m1", config: config, provider: provider)
-
-        try await client.start()
-
-        let lease = await client.getCurrentLease()
-        XCTAssertNil(lease)
-
-        let valid = await client.isLeaseValid()
-        XCTAssertFalse(valid)
-
-        let remaining = await client.leaseTimeRemaining()
-        XCTAssertEqual(remaining, 0)
-
-        await client.stop()
-    }
-}
-
-// MARK: - DHCP Integration Tests
-
-final class NativeDHCPIntegrationTests: XCTestCase {
-
-    func testClientServerIntegration() async throws {
-        // Set up service (gateway)
-        let serviceConfig = DHCPServiceConfig(
             netmask: "255.255.0.0",
             gatewayIP: "10.0.0.1",
             poolStart: "10.0.0.100",
@@ -503,265 +390,576 @@ final class NativeDHCPIntegrationTests: XCTestCase {
             leaseTime: 3600,
             dnsServers: ["8.8.8.8"]
         )
-        let serviceProvider = MockDHCPChannelProvider(peerId: "gateway")
-        let service = DHCPService(config: serviceConfig, provider: serviceProvider)
-        try await service.start()
+        let service = DHCPService(config: config)
 
-        // Set up client (peer)
-        let clientConfig = NativeDHCPClientConfig(
-            gatewayMachineId: "gateway",
-            timeout: 5,
-            retries: 1,
-            autoRenew: false,
-            hostname: "testhost"
+        // DISCOVER
+        let discover = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offerData = await service.handlePacket(discover)
+        XCTAssertNotNil(offerData)
+
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData!)
+        XCTAssertEqual(offer.messageType, .offer)
+
+        // REQUEST for the offered IP
+        let request = DHCPPacket.buildRequest(
+            machineId: "m1",
+            xid: 2,
+            requestedIP: offer.yiaddr,
+            serverIP: offer.serverIdentifier!
         )
-        let clientProvider = MockDHCPChannelProvider(peerId: "peer1")
-        let client = DHCPClient(machineId: "m1", config: clientConfig, provider: clientProvider)
-        try await client.start()
+        let ackData = await service.handlePacket(request)
+        XCTAssertNotNil(ackData)
 
-        // Wire up message relay between client and service
-        let relayTask = Task {
-            while !Task.isCancelled {
-                // Relay client -> service
-                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
-                    await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
-                }
+        let (ack, _, _) = try DHCPPacket.fromIPv4UDP(ackData!)
+        XCTAssertEqual(ack.messageType, .ack)
+        XCTAssertEqual(ack.yiaddr, offer.yiaddr)
+        XCTAssertEqual(ack.leaseTime, 3600)
 
-                // Relay service -> client
-                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
-                    await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
-                }
-
-                try? await Task.sleep(for: .milliseconds(10))
-            }
-        }
-
-        // Request address
-        let response = try await client.requestAddress()
-
-        XCTAssertEqual(response.machineId, "m1")
-        XCTAssertEqual(response.netmask, "255.255.0.0")
-        XCTAssertEqual(response.gateway, "10.0.0.1")
-        XCTAssertEqual(response.dnsServers, ["8.8.8.8"])
-        XCTAssertEqual(response.leaseSeconds, 3600)
-
-        // Verify client state
-        let lease = await client.getCurrentLease()
-        XCTAssertNotNil(lease)
-        XCTAssertEqual(lease?.assignedIP, response.assignedIP)
-
-        let valid = await client.isLeaseValid()
-        XCTAssertTrue(valid)
-
-        // Cleanup
-        relayTask.cancel()
-        await client.stop()
-        await service.stop()
+        // Verify lease was recorded
+        let leases = await service.getActiveLeases()
+        XCTAssertEqual(leases.count, 1)
+        XCTAssertEqual(leases[0].ip, offer.yiaddr)
     }
 
-    func testClientServerRenewal() async throws {
-        let serviceConfig = DHCPServiceConfig(
+    func testServiceHonorsRequestedIP() async throws {
+        let config = DHCPServiceConfig(
+            poolStart: "10.0.0.100",
+            poolEnd: "10.0.0.200"
+        )
+        let service = DHCPService(config: config)
+
+        // DISCOVER with requested IP
+        var discoverPacket = DHCPPacket()
+        discoverPacket.op = DHCPPacket.bootRequest
+        discoverPacket.xid = 1
+        discoverPacket.flags = DHCPPacket.broadcastFlag
+        discoverPacket.chaddr = DHCPPacket.machineIdToChaddr("m1")
+        discoverPacket.setMessageType(.discover)
+        discoverPacket.setRequestedIP(DHCPPacket.parseIP("10.0.0.150")!)
+
+        let discoverData = discoverPacket.toIPv4UDP(
+            srcIP: 0, dstIP: 0xFFFFFFFF,
+            srcPort: DHCPPacket.clientPort, dstPort: DHCPPacket.serverPort
+        )
+
+        let offerData = await service.handlePacket(discoverData)
+        XCTAssertNotNil(offerData)
+
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData!)
+        XCTAssertEqual(offer.yiaddr, DHCPPacket.parseIP("10.0.0.150"))
+    }
+
+    func testServiceReturnsSameIPForExistingClient() async throws {
+        let config = DHCPServiceConfig(
+            poolStart: "10.0.0.100",
+            poolEnd: "10.0.0.200"
+        )
+        let service = DHCPService(config: config)
+
+        // First full DISCOVER→REQUEST flow
+        let discover1 = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offer1Data = await service.handlePacket(discover1)!
+        let (offer1, _, _) = try DHCPPacket.fromIPv4UDP(offer1Data)
+
+        let request1 = DHCPPacket.buildRequest(
+            machineId: "m1", xid: 2,
+            requestedIP: offer1.yiaddr, serverIP: offer1.serverIdentifier!
+        )
+        _ = await service.handlePacket(request1)
+
+        // Second DISCOVER from same client
+        let discover2 = DHCPPacket.buildDiscover(machineId: "m1", xid: 3)
+        let offer2Data = await service.handlePacket(discover2)!
+        let (offer2, _, _) = try DHCPPacket.fromIPv4UDP(offer2Data)
+
+        // Should offer the same IP
+        XCTAssertEqual(offer1.yiaddr, offer2.yiaddr)
+    }
+
+    func testServiceHandleRelease() async throws {
+        let config = DHCPServiceConfig(
+            poolStart: "10.0.0.100",
+            poolEnd: "10.0.0.200"
+        )
+        let service = DHCPService(config: config)
+        let initialCount = await service.availableIPCount()
+
+        // Allocate
+        let discover = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offerData = await service.handlePacket(discover)!
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData)
+
+        let request = DHCPPacket.buildRequest(
+            machineId: "m1", xid: 2,
+            requestedIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+        )
+        _ = await service.handlePacket(request)
+
+        let afterAlloc = await service.availableIPCount()
+        XCTAssertEqual(afterAlloc, initialCount - 1)
+
+        // Release
+        let release = DHCPPacket.buildRelease(
+            machineId: "m1", xid: 3,
+            clientIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+        )
+        _ = await service.handlePacket(release)
+
+        let afterRelease = await service.availableIPCount()
+        XCTAssertEqual(afterRelease, initialCount)
+
+        let leases = await service.getLeases()
+        XCTAssertTrue(leases.isEmpty)
+    }
+
+    func testServiceHandleRenewal() async throws {
+        let config = DHCPServiceConfig(
             poolStart: "10.0.0.100",
             poolEnd: "10.0.0.200",
             leaseTime: 3600
         )
-        let serviceProvider = MockDHCPChannelProvider(peerId: "gateway")
-        let service = DHCPService(config: serviceConfig, provider: serviceProvider)
-        try await service.start()
+        let service = DHCPService(config: config)
 
-        let clientConfig = NativeDHCPClientConfig(
-            gatewayMachineId: "gateway",
-            timeout: 5,
-            retries: 1,
-            autoRenew: false
+        // Allocate via DISCOVER→REQUEST
+        let discover = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offerData = await service.handlePacket(discover)!
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData)
+
+        let request = DHCPPacket.buildRequest(
+            machineId: "m1", xid: 2,
+            requestedIP: offer.yiaddr, serverIP: offer.serverIdentifier!
         )
-        let clientProvider = MockDHCPChannelProvider(peerId: "peer1")
-        let client = DHCPClient(machineId: "m1", config: clientConfig, provider: clientProvider)
-        try await client.start()
+        _ = await service.handlePacket(request)
 
-        let relayTask = Task {
-            while !Task.isCancelled {
-                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
-                    await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
-                }
+        // Renew (RENEWING state: ciaddr filled, no requestedIP/serverIdentifier)
+        let renew = DHCPPacket.buildRenewRequest(
+            machineId: "m1", xid: 4,
+            clientIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+        )
+        let renewAckData = await service.handlePacket(renew)
+        XCTAssertNotNil(renewAckData)
 
-                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
-                    await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
-                }
-
-                try? await Task.sleep(for: .milliseconds(10))
-            }
-        }
-
-        // Request address
-        let response = try await client.requestAddress()
-        let assignedIP = response.assignedIP
-
-        // Renew
-        let renewed = try await client.renewLease()
-        XCTAssertEqual(renewed.assignedIP, assignedIP)
-
-        // Cleanup
-        relayTask.cancel()
-        await client.stop()
-        await service.stop()
+        let (renewAck, _, _) = try DHCPPacket.fromIPv4UDP(renewAckData!)
+        XCTAssertEqual(renewAck.messageType, .ack)
+        XCTAssertEqual(renewAck.yiaddr, offer.yiaddr)
     }
 
-    func testClientServerRelease() async throws {
-        let serviceConfig = DHCPServiceConfig(
-            poolStart: "10.0.0.100",
-            poolEnd: "10.0.0.200"
+    func testServicePoolExhaustion() async throws {
+        let config = DHCPServiceConfig(
+            poolStart: "10.0.0.1",
+            poolEnd: "10.0.0.3"  // Only 3 IPs
         )
-        let serviceProvider = MockDHCPChannelProvider(peerId: "gateway")
-        let service = DHCPService(config: serviceConfig, provider: serviceProvider)
-        try await service.start()
+        let service = DHCPService(config: config)
 
-        let clientConfig = NativeDHCPClientConfig(
-            gatewayMachineId: "gateway",
-            timeout: 5,
-            retries: 1,
-            autoRenew: false
-        )
-        let clientProvider = MockDHCPChannelProvider(peerId: "peer1")
-        let client = DHCPClient(machineId: "m1", config: clientConfig, provider: clientProvider)
-        try await client.start()
+        // Allocate all 3 IPs
+        for i in 1...3 {
+            let discover = DHCPPacket.buildDiscover(machineId: "m\(i)", xid: UInt32(i * 10))
+            let offerData = await service.handlePacket(discover)
+            XCTAssertNotNil(offerData)
 
-        let relayTask = Task {
-            while !Task.isCancelled {
-                for msg in await clientProvider.drainMessages() where msg.target == "gateway" {
-                    await serviceProvider.simulateReceive(msg.data, from: "m1", on: msg.channel)
-                }
-
-                for msg in await serviceProvider.drainMessages() where msg.target == "m1" {
-                    await clientProvider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
-                }
-
-                try? await Task.sleep(for: .milliseconds(10))
-            }
+            let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData!)
+            let request = DHCPPacket.buildRequest(
+                machineId: "m\(i)", xid: UInt32(i * 10 + 1),
+                requestedIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+            )
+            _ = await service.handlePacket(request)
         }
 
+        // 4th DISCOVER should get no response
+        let discover4 = DHCPPacket.buildDiscover(machineId: "m4", xid: 40)
+        let response = await service.handlePacket(discover4)
+        XCTAssertNil(response)
+    }
+
+    func testServiceCleanupExpiredLeases() async throws {
+        let config = DHCPServiceConfig(
+            poolStart: "10.0.0.100",
+            poolEnd: "10.0.0.200",
+            leaseTime: 1  // 1 second lease
+        )
+        let service = DHCPService(config: config)
         let initialCount = await service.availableIPCount()
 
-        // Request address
-        _ = try await client.requestAddress()
+        // Allocate
+        let discover = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offerData = await service.handlePacket(discover)!
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData)
+        let request = DHCPPacket.buildRequest(
+            machineId: "m1", xid: 2,
+            requestedIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+        )
+        _ = await service.handlePacket(request)
 
-        let afterAllocCount = await service.availableIPCount()
-        XCTAssertEqual(afterAllocCount, initialCount - 1)
+        // Wait for lease to expire
+        try await Task.sleep(for: .seconds(2))
 
-        // Release
-        try await client.releaseLease()
+        await service.cleanupExpiredLeases()
 
-        // Poll until release is processed (IP returned to pool)
-        let deadline = ContinuousClock.now + .seconds(5)
-        var afterReleaseCount = await service.availableIPCount()
-        while afterReleaseCount != initialCount && ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-            afterReleaseCount = await service.availableIPCount()
-        }
-        XCTAssertEqual(afterReleaseCount, initialCount)
-
-        // Client should have no lease
-        let lease = await client.getCurrentLease()
-        XCTAssertNil(lease)
-
-        // Cleanup
-        relayTask.cancel()
-        await client.stop()
-        await service.stop()
+        let afterCleanup = await service.availableIPCount()
+        XCTAssertEqual(afterCleanup, initialCount)
     }
 
-    func testMultipleClientsGetDifferentIPs() async throws {
-        let serviceConfig = DHCPServiceConfig(
+    func testServiceNAKsUnavailableIP() async throws {
+        let config = DHCPServiceConfig(
             poolStart: "10.0.0.100",
             poolEnd: "10.0.0.200"
         )
-        let serviceProvider = MockDHCPChannelProvider(peerId: "gateway")
-        let service = DHCPService(config: serviceConfig, provider: serviceProvider)
-        try await service.start()
+        let service = DHCPService(config: config)
 
-        // Create multiple clients
-        var clients: [DHCPClient] = []
-        var clientProviders: [MockDHCPChannelProvider] = []
-        var assignedIPs: Set<String> = []
+        // Machine 1 gets 10.0.0.150 through DISCOVER→REQUEST
+        let discover1 = DHCPPacket.buildDiscover(machineId: "m1", xid: 1)
+        let offerData = await service.handlePacket(discover1)!
+        let (offer, _, _) = try DHCPPacket.fromIPv4UDP(offerData)
 
-        for i in 1...5 {
-            let clientConfig = NativeDHCPClientConfig(
-                gatewayMachineId: "gateway",
-                timeout: 10,
-                retries: 2,
-                autoRenew: false
-            )
-            let provider = MockDHCPChannelProvider(peerId: "peer\(i)")
-            let client = DHCPClient(machineId: "m\(i)", config: clientConfig, provider: provider)
-            try await client.start()
-            clients.append(client)
-            clientProviders.append(provider)
-        }
+        let req1 = DHCPPacket.buildRequest(
+            machineId: "m1", xid: 2,
+            requestedIP: offer.yiaddr, serverIP: offer.serverIdentifier!
+        )
+        _ = await service.handlePacket(req1)
+        let allocatedIP = offer.yiaddr
 
-        // Request addresses sequentially to ensure proper message routing
-        for (i, client) in clients.enumerated() {
-            let provider = clientProviders[i]
-            let machineId = "m\(i + 1)"
+        // Machine 2 tries to REQUEST the same IP directly
+        let req2 = DHCPPacket.buildRequest(
+            machineId: "m2", xid: 3,
+            requestedIP: allocatedIP, serverIP: offer.serverIdentifier!
+        )
+        let nakData = await service.handlePacket(req2)
+        XCTAssertNotNil(nakData)
 
-            // Clear any leftover messages before starting this client's relay
-            await serviceProvider.clearMessages()
-            await provider.clearMessages()
-
-            let relayTask = Task {
-                while !Task.isCancelled {
-                    for msg in await provider.drainMessages() where msg.target == "gateway" {
-                        await serviceProvider.simulateReceive(msg.data, from: machineId, on: msg.channel)
-                    }
-
-                    for msg in await serviceProvider.drainMessages() where msg.target == machineId {
-                        await provider.simulateReceive(msg.data, from: "gateway", on: msg.channel)
-                    }
-
-                    try? await Task.sleep(for: .milliseconds(5))
-                }
-            }
-
-            let response = try await client.requestAddress()
-            assignedIPs.insert(response.assignedIP)
-
-            relayTask.cancel()
-        }
-
-        // All IPs should be unique
-        XCTAssertEqual(assignedIPs.count, 5)
-
-        // Cleanup
-        for client in clients {
-            await client.stop()
-        }
-        await service.stop()
+        let (nak, _, _) = try DHCPPacket.fromIPv4UDP(nakData!)
+        XCTAssertEqual(nak.messageType, .nak)
     }
 }
 
-// MARK: - Native DHCP Lease Tests
+// MARK: - DHCPClient Tests
 
-final class NativeDHCPLeaseTests: XCTestCase {
+final class DHCPClientTests: XCTestCase {
+
+    func testClientInitialState() {
+        let client = DHCPClient(machineId: "m1")
+        XCTAssertEqual(client.state, .initial)
+        XCTAssertNil(client.assignedIPString)
+        XCTAssertNil(client.renewalTime)
+        XCTAssertNil(client.rebindingTime)
+        XCTAssertNil(client.leaseExpiry)
+    }
+
+    func testBuildDiscoverTransitionsToDiscovering() throws {
+        let client = DHCPClient(machineId: "m1", hostname: "myhost")
+        let data = client.buildDiscover()
+
+        XCTAssertEqual(client.state, .discovering)
+
+        let (dhcp, _, _) = try DHCPPacket.fromIPv4UDP(data)
+        XCTAssertEqual(dhcp.messageType, .discover)
+        XCTAssertEqual(dhcp.hostname, "myhost")
+        XCTAssertNotEqual(client.xid, 0)
+    }
+
+    func testHandleOfferTransitionsToRequesting() throws {
+        let client = DHCPClient(machineId: "m1")
+        _ = client.buildDiscover()
+        let clientXid = client.xid
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+
+        // Build an OFFER matching the client's xid
+        let offer = DHCPPacket.buildOffer(
+            xid: clientXid,
+            clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: DHCPPacket.parseIP("255.255.0.0")!,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [DHCPPacket.parseIP("8.8.8.8")!],
+            leaseTime: 3600
+        )
+
+        let action = client.handlePacket(offer)
+
+        XCTAssertEqual(client.state, .requesting)
+        if case .sendPacket(let reqData) = action {
+            let (req, _, _) = try DHCPPacket.fromIPv4UDP(reqData)
+            XCTAssertEqual(req.messageType, .request)
+            XCTAssertEqual(req.requestedIP, DHCPPacket.parseIP("10.0.0.100"))
+        } else {
+            XCTFail("Expected sendPacket action")
+        }
+    }
+
+    func testFullDHCPFlow() throws {
+        let client = DHCPClient(machineId: "m1")
+        let config = DHCPServiceConfig(
+            netmask: "255.255.0.0",
+            gatewayIP: "10.0.0.1",
+            poolStart: "10.0.0.100",
+            poolEnd: "10.0.0.200",
+            leaseTime: 3600,
+            dnsServers: ["8.8.8.8"]
+        )
+
+        // Simulate the full DORA flow using real service
+        // We can't use async service here since client is synchronous,
+        // so we simulate packet exchange manually
+
+        // 1. DISCOVER
+        let discoverData = client.buildDiscover()
+        XCTAssertEqual(client.state, .discovering)
+        let clientXid = client.xid
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+
+        // 2. OFFER (simulated from server)
+        let serverIP = DHCPPacket.parseIP("10.0.0.1")!
+        let offeredIP = DHCPPacket.parseIP("10.0.0.100")!
+        let offerPacket = DHCPPacket.buildOffer(
+            xid: clientXid,
+            clientChaddr: chaddr,
+            offeredIP: offeredIP,
+            serverIP: serverIP,
+            subnetMask: DHCPPacket.parseIP("255.255.0.0")!,
+            router: serverIP,
+            dnsServers: [DHCPPacket.parseIP("8.8.8.8")!],
+            leaseTime: 3600
+        )
+
+        let offerAction = client.handlePacket(offerPacket)
+        XCTAssertEqual(client.state, .requesting)
+
+        guard case .sendPacket(let requestData) = offerAction else {
+            XCTFail("Expected sendPacket action from OFFER")
+            return
+        }
+
+        // 3. ACK (simulated from server)
+        let requestXid = client.xid
+        let ackPacket = DHCPPacket.buildACK(
+            xid: requestXid,
+            clientChaddr: chaddr,
+            assignedIP: offeredIP,
+            serverIP: serverIP,
+            subnetMask: DHCPPacket.parseIP("255.255.0.0")!,
+            router: serverIP,
+            dnsServers: [DHCPPacket.parseIP("8.8.8.8")!],
+            leaseTime: 3600
+        )
+
+        let ackAction = client.handlePacket(ackPacket)
+        XCTAssertEqual(client.state, .bound)
+
+        if case .configured(let ip, let netmask, let gateway, let dns, let leaseTime) = ackAction {
+            XCTAssertEqual(ip, "10.0.0.100")
+            XCTAssertEqual(netmask, "255.255.0.0")
+            XCTAssertEqual(gateway, "10.0.0.1")
+            XCTAssertEqual(dns, ["8.8.8.8"])
+            XCTAssertEqual(leaseTime, 3600)
+        } else {
+            XCTFail("Expected configured action from ACK")
+        }
+
+        // Verify state
+        XCTAssertEqual(client.assignedIPString, "10.0.0.100")
+        XCTAssertNotNil(client.renewalTime)
+        XCTAssertNotNil(client.rebindingTime)
+        XCTAssertNotNil(client.leaseExpiry)
+    }
+
+    func testHandleNAKRestartsClient() {
+        let client = DHCPClient(machineId: "m1")
+        _ = client.buildDiscover()
+        let clientXid = client.xid
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+
+        // Simulate receiving an OFFER
+        let offer = DHCPPacket.buildOffer(
+            xid: clientXid,
+            clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [],
+            leaseTime: 3600
+        )
+        _ = client.handlePacket(offer)
+        XCTAssertEqual(client.state, .requesting)
+
+        // Send NAK
+        let requestXid = client.xid
+        let nak = DHCPPacket.buildNAK(
+            xid: requestXid,
+            clientChaddr: chaddr,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!
+        )
+
+        let action = client.handlePacket(nak)
+
+        XCTAssertEqual(client.state, .initial)
+        if case .restart = action {
+            // Expected
+        } else {
+            XCTFail("Expected restart action from NAK")
+        }
+    }
+
+    func testIgnoresMismatchedXid() {
+        let client = DHCPClient(machineId: "m1")
+        _ = client.buildDiscover()
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+
+        // OFFER with wrong xid
+        let offer = DHCPPacket.buildOffer(
+            xid: 0xBADBAD,  // Wrong xid
+            clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [],
+            leaseTime: 3600
+        )
+
+        let action = client.handlePacket(offer)
+        XCTAssertNil(action)
+        XCTAssertEqual(client.state, .discovering)  // Still discovering
+    }
+
+    func testIgnoresMismatchedChaddr() {
+        let client = DHCPClient(machineId: "m1")
+        _ = client.buildDiscover()
+        let clientXid = client.xid
+
+        // OFFER with different chaddr
+        let otherChaddr = DHCPPacket.machineIdToChaddr("m2")
+        let offer = DHCPPacket.buildOffer(
+            xid: clientXid,
+            clientChaddr: otherChaddr,  // Wrong client
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000,
+            router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [],
+            leaseTime: 3600
+        )
+
+        let action = client.handlePacket(offer)
+        XCTAssertNil(action)
+    }
+
+    func testBuildRelease() throws {
+        let client = DHCPClient(machineId: "m1")
+
+        // Can't release without being bound
+        XCTAssertNil(client.buildRelease())
+
+        // Get bound (simulate DORA)
+        _ = client.buildDiscover()
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+        let offer = DHCPPacket.buildOffer(
+            xid: client.xid, clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000, router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [], leaseTime: 3600
+        )
+        _ = client.handlePacket(offer)
+        let ack = DHCPPacket.buildACK(
+            xid: client.xid, clientChaddr: chaddr,
+            assignedIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000, router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [], leaseTime: 3600
+        )
+        _ = client.handlePacket(ack)
+        XCTAssertEqual(client.state, .bound)
+
+        // Release
+        let releaseData = client.buildRelease()
+        XCTAssertNotNil(releaseData)
+        XCTAssertEqual(client.state, .initial)
+        XCTAssertNil(client.assignedIPString)
+
+        let (rel, _, _) = try DHCPPacket.fromIPv4UDP(releaseData!)
+        XCTAssertEqual(rel.messageType, .release)
+    }
+
+    func testBuildRenewAndRebind() throws {
+        let client = DHCPClient(machineId: "m1")
+
+        // Can't renew without being bound
+        XCTAssertNil(client.buildRenew())
+
+        // Get bound
+        _ = client.buildDiscover()
+        let chaddr = DHCPPacket.machineIdToChaddr("m1")
+        let offer = DHCPPacket.buildOffer(
+            xid: client.xid, clientChaddr: chaddr,
+            offeredIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000, router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [], leaseTime: 3600
+        )
+        _ = client.handlePacket(offer)
+        let ack = DHCPPacket.buildACK(
+            xid: client.xid, clientChaddr: chaddr,
+            assignedIP: DHCPPacket.parseIP("10.0.0.100")!,
+            serverIP: DHCPPacket.parseIP("10.0.0.1")!,
+            subnetMask: 0xFFFF0000, router: DHCPPacket.parseIP("10.0.0.1")!,
+            dnsServers: [], leaseTime: 3600
+        )
+        _ = client.handlePacket(ack)
+        XCTAssertEqual(client.state, .bound)
+
+        // Renew
+        let renewData = client.buildRenew()
+        XCTAssertNotNil(renewData)
+        XCTAssertEqual(client.state, .renewing)
+
+        let (renReq, _, dstIP) = try DHCPPacket.fromIPv4UDP(renewData!)
+        XCTAssertEqual(renReq.messageType, .request)
+        XCTAssertEqual(dstIP, DHCPPacket.parseIP("10.0.0.1"))  // Unicast
+
+        // Rebind
+        let rebindData = client.buildRebind()
+        XCTAssertNotNil(rebindData)
+        XCTAssertEqual(client.state, .rebinding)
+
+        let (rebReq, _, rebDstIP) = try DHCPPacket.fromIPv4UDP(rebindData!)
+        XCTAssertEqual(rebReq.messageType, .request)
+        XCTAssertEqual(rebDstIP, 0xFFFFFFFF)  // Broadcast
+    }
+
+    func testReset() {
+        let client = DHCPClient(machineId: "m1")
+        _ = client.buildDiscover()
+        XCTAssertEqual(client.state, .discovering)
+
+        client.reset()
+        XCTAssertEqual(client.state, .initial)
+    }
+}
+
+// MARK: - DHCPServiceLease Tests
+
+final class DHCPServiceLeaseTests: XCTestCase {
 
     func testLeaseCreation() {
-        let lease = NativeDHCPLease(
-            ip: "10.0.0.100",
-            machineId: "m1",
+        let lease = DHCPServiceLease(
+            ip: DHCPPacket.parseIP("10.0.0.100")!,
+            chaddr: DHCPPacket.machineIdToChaddr("m1"),
             hostname: "host1",
             grantedAt: Date(),
             expiresAt: Date().addingTimeInterval(3600)
         )
 
-        XCTAssertEqual(lease.ip, "10.0.0.100")
-        XCTAssertEqual(lease.machineId, "m1")
+        XCTAssertEqual(lease.ipString, "10.0.0.100")
         XCTAssertEqual(lease.hostname, "host1")
         XCTAssertFalse(lease.isExpired)
         XCTAssertGreaterThan(lease.remainingTime, 3590)
     }
 
     func testLeaseExpiration() {
-        let lease = NativeDHCPLease(
-            ip: "10.0.0.100",
-            machineId: "m1",
+        let lease = DHCPServiceLease(
+            ip: DHCPPacket.parseIP("10.0.0.100")!,
+            chaddr: DHCPPacket.machineIdToChaddr("m1"),
             hostname: nil,
             grantedAt: Date().addingTimeInterval(-7200),
             expiresAt: Date().addingTimeInterval(-3600)
@@ -769,17 +967,5 @@ final class NativeDHCPLeaseTests: XCTestCase {
 
         XCTAssertTrue(lease.isExpired)
         XCTAssertEqual(lease.remainingTime, 0)
-    }
-
-    func testLeaseEquatable() {
-        let now = Date()
-        let expires = now.addingTimeInterval(3600)
-
-        let lease1 = NativeDHCPLease(ip: "10.0.0.100", machineId: "m1", hostname: "h1", grantedAt: now, expiresAt: expires)
-        let lease2 = NativeDHCPLease(ip: "10.0.0.100", machineId: "m1", hostname: "h1", grantedAt: now, expiresAt: expires)
-        let lease3 = NativeDHCPLease(ip: "10.0.0.101", machineId: "m1", hostname: "h1", grantedAt: now, expiresAt: expires)
-
-        XCTAssertEqual(lease1, lease2)
-        XCTAssertNotEqual(lease1, lease3)
     }
 }

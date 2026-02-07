@@ -1,352 +1,418 @@
-// DHCPClient.swift - Native DHCP client for mesh networks
+// DHCPClient.swift - RFC 2131 DHCP client state machine
 //
-// Runs on peers to obtain IP addresses from the gateway's DHCP service.
-// Sends requests over the "dhcp" mesh channel and handles lease renewals.
+// Pure packet processor: builds outbound DHCP packets and processes inbound
+// packets, returning actions for the caller (PacketRouter) to execute.
+// No ChannelProvider dependency.
+//
+// State machine: initial → discovering → requesting → bound → renewing → rebinding
+//
+// PacketRouter feeds inbound UDP port 68 packets to handlePacket() and sends
+// outbound packets that buildDiscover()/buildRenew()/buildRebind()/buildRelease()
+// produce.
 
 import Foundation
-import OmertaMesh
 import Logging
 
-/// Configuration for the native DHCP client
-public struct NativeDHCPClientConfig: Sendable {
-    /// Machine ID of the gateway (DHCP server)
-    public let gatewayMachineId: MachineId
-
-    /// Timeout for DHCP operations in seconds
-    public let timeout: TimeInterval
-
-    /// Number of retries before giving up
-    public let retries: Int
-
-    /// Whether to auto-renew leases before expiration
-    public let autoRenew: Bool
-
-    /// Hostname to send in DHCP requests
-    public let hostname: String?
-
-    public init(
-        gatewayMachineId: MachineId,
-        timeout: TimeInterval = 10,
-        retries: Int = 3,
-        autoRenew: Bool = true,
-        hostname: String? = nil
-    ) {
-        self.gatewayMachineId = gatewayMachineId
-        self.timeout = timeout
-        self.retries = retries
-        self.autoRenew = autoRenew
-        self.hostname = hostname
-    }
-}
-
-/// Native DHCP client for mesh networks
+/// RFC 2131 DHCP client — pure packet-based state machine
 ///
-/// Usage on peer:
+/// Usage:
 /// ```swift
-/// let client = DHCPClient(machineId: myMachineId, config: config, provider: meshNetwork)
-/// try await client.start()
-/// let lease = try await client.requestAddress()
-/// print("Got IP: \(lease.assignedIP)")
+/// let client = DHCPClient(machineId: myMachineId)
+///
+/// // Start discovery
+/// let discover = client.buildDiscover()
+/// sendToInterface(discover)
+///
+/// // When packets arrive on UDP port 68:
+/// if let action = client.handlePacket(inboundPacket) {
+///     switch action {
+///     case .sendPacket(let data):
+///         sendToInterface(data)  // REQUEST in response to OFFER
+///     case .configured(let ip, let netmask, let gateway, let dns, let leaseTime):
+///         configureInterface(ip: ip, netmask: netmask)
+///     case .restart:
+///         let discover = client.buildDiscover()
+///         sendToInterface(discover)
+///     }
+/// }
 /// ```
-public actor DHCPClient {
-    private let machineId: MachineId
-    private let config: NativeDHCPClientConfig
-    private let provider: any ChannelProvider
+public final class DHCPClient: @unchecked Sendable {
+    // MARK: - Configuration (immutable)
+
+    private let machineId: String
+    private let hostname: String?
+    private let chaddr: [UInt8]
     private let logger: Logger
 
-    /// Current lease (if any)
-    private var currentLease: DHCPResponse?
+    // MARK: - Mutable State (synchronized via lock)
 
-    /// When the current lease was obtained
-    private var leaseObtainedAt: Date?
+    private let lock = NSLock()
 
-    /// Pending response continuation for request/response matching
-    private var pendingResponse: CheckedContinuation<DHCPMessage, Never>?
+    private struct State {
+        var clientState: DHCPClientState = .initial
+        var xid: UInt32 = 0
+        var assignedIP: UInt32 = 0
+        var serverIP: UInt32 = 0
+        var leaseTime: UInt32 = 0
+        var leaseStart: Date?
+    }
 
-    /// Whether the client is running (listening for responses)
-    private var isRunning = false
+    private var _state = State()
 
-    /// Renewal task handle
-    private var renewalTask: Task<Void, Never>?
+    // MARK: - Init
 
     /// Initialize the DHCP client
     /// - Parameters:
-    ///   - machineId: This machine's ID
-    ///   - config: Client configuration
-    ///   - provider: Channel provider for sending/receiving messages
-    public init(machineId: MachineId, config: NativeDHCPClientConfig, provider: any ChannelProvider) {
+    ///   - machineId: Used to derive the client hardware address (chaddr)
+    ///   - hostname: Optional hostname for DHCP requests (option 12)
+    public init(machineId: String, hostname: String? = nil) {
         self.machineId = machineId
-        self.config = config
-        self.provider = provider
+        self.hostname = hostname
+        self.chaddr = DHCPPacket.machineIdToChaddr(machineId)
         self.logger = Logger(label: "io.omerta.dhcp.client")
     }
 
-    /// Start the DHCP client (begin listening for responses)
-    public func start() async throws {
-        guard !isRunning else { return }
+    // MARK: - Public State Accessors
 
-        // Register handler for DHCP responses
-        try await provider.onChannel(DHCPService.channelName) { [weak self] _, data in
-            await self?.handleMessage(data: data)
-        }
-
-        isRunning = true
-        logger.info("DHCP client started")
+    /// Current client state
+    public var state: DHCPClientState {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state.clientState
     }
 
-    /// Stop the DHCP client
-    public func stop() async {
-        guard isRunning else { return }
-
-        renewalTask?.cancel()
-        renewalTask = nil
-
-        await provider.offChannel(DHCPService.channelName)
-
-        // Cancel any pending request - not possible with Never error, so just clear
-        pendingResponse = nil
-
-        isRunning = false
-        logger.info("DHCP client stopped")
+    /// Current transaction ID
+    public var xid: UInt32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state.xid
     }
 
-    /// Request an IP address from the DHCP server
-    /// - Parameter requestedIP: Optional preferred IP address
-    /// - Returns: The DHCP response with assigned address
-    /// - Throws: DHCPError if request fails
-    public func requestAddress(requestedIP: String? = nil) async throws -> DHCPResponse {
-        guard isRunning else {
-            throw DHCPError.notRunning
-        }
+    /// The assigned IP (valid when state is .bound, .renewing, or .rebinding)
+    public var assignedIP: UInt32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state.assignedIP
+    }
 
-        let request = DHCPRequest(
+    /// The assigned IP as a dotted-quad string, or nil if not bound
+    public var assignedIPString: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _state.assignedIP != 0 else { return nil }
+        return DHCPPacket.formatIP(_state.assignedIP)
+    }
+
+    /// The server IP that granted the lease
+    public var serverIP: UInt32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _state.serverIP
+    }
+
+    /// When T1 (renewal) timer fires — 50% of lease time
+    public var renewalTime: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let start = _state.leaseStart, _state.leaseTime > 0 else { return nil }
+        return start.addingTimeInterval(Double(_state.leaseTime) * DHCPPacket.t1Factor)
+    }
+
+    /// When T2 (rebinding) timer fires — 87.5% of lease time
+    public var rebindingTime: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let start = _state.leaseStart, _state.leaseTime > 0 else { return nil }
+        return start.addingTimeInterval(Double(_state.leaseTime) * DHCPPacket.t2Factor)
+    }
+
+    /// When the lease expires
+    public var leaseExpiry: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let start = _state.leaseStart, _state.leaseTime > 0 else { return nil }
+        return start.addingTimeInterval(Double(_state.leaseTime))
+    }
+
+    // MARK: - Packet Builders
+
+    /// Build a DHCP DISCOVER packet. Transitions state to .discovering.
+    /// - Returns: Raw IPv4/UDP/DHCP DISCOVER packet
+    public func buildDiscover() -> Data {
+        lock.lock()
+        _state.xid = UInt32.random(in: 1...UInt32.max)
+        _state.clientState = .discovering
+        let currentXid = _state.xid
+        lock.unlock()
+
+        logger.debug("Building DISCOVER", metadata: ["xid": "\(currentXid)"])
+
+        return DHCPPacket.buildDiscover(
             machineId: machineId,
-            requestedIP: requestedIP,
-            hostname: config.hostname
+            xid: currentXid,
+            hostname: hostname
         )
-
-        var lastError: Error = DHCPError.timeout
-
-        for attempt in 1...config.retries {
-            logger.debug("Sending DHCP request", metadata: [
-                "attempt": "\(attempt)",
-                "requestedIP": "\(requestedIP ?? "none")"
-            ])
-
-            do {
-                let response = try await sendRequestAndWait(.request(request))
-
-                switch response {
-                case .response(let dhcpResponse):
-                    currentLease = dhcpResponse
-                    leaseObtainedAt = Date()
-
-                    logger.info("IP address obtained", metadata: [
-                        "ip": "\(dhcpResponse.assignedIP)",
-                        "lease": "\(dhcpResponse.leaseSeconds)s"
-                    ])
-
-                    // Start renewal task if auto-renew is enabled
-                    if config.autoRenew {
-                        startRenewalTask()
-                    }
-
-                    return dhcpResponse
-
-                case .nak(let reason):
-                    logger.warning("DHCP request rejected", metadata: ["reason": "\(reason)"])
-                    throw DHCPError.noAddressAvailable
-
-                default:
-                    logger.warning("Unexpected response type")
-                    lastError = DHCPError.invalidRequest("Unexpected response type")
-                }
-
-            } catch {
-                lastError = error
-                if attempt < config.retries {
-                    logger.debug("Retrying after error", metadata: ["error": "\(error)"])
-                    try? await Task.sleep(for: .milliseconds(500 * UInt64(attempt)))
-                }
-            }
-        }
-
-        throw lastError
     }
 
-    /// Renew the current lease
-    /// - Returns: The renewed DHCP response
-    /// - Throws: DHCPError if renewal fails
-    public func renewLease() async throws -> DHCPResponse {
-        guard isRunning else {
-            throw DHCPError.notRunning
+    /// Build a DHCP RELEASE packet. Transitions state back to .initial.
+    /// - Returns: Raw IPv4/UDP/DHCP RELEASE packet, or nil if not bound
+    public func buildRelease() -> Data? {
+        lock.lock()
+        guard _state.assignedIP != 0, _state.serverIP != 0 else {
+            lock.unlock()
+            return nil
         }
+        let ip = _state.assignedIP
+        let server = _state.serverIP
+        let xid = UInt32.random(in: 1...UInt32.max)
+        _state.clientState = .initial
+        _state.assignedIP = 0
+        _state.serverIP = 0
+        _state.leaseTime = 0
+        _state.leaseStart = nil
+        lock.unlock()
 
-        guard let lease = currentLease else {
-            throw DHCPError.leaseExpired
-        }
+        logger.info("Building RELEASE", metadata: [
+            "ip": "\(DHCPPacket.formatIP(ip))"
+        ])
 
-        let renewal = DHCPRenewal(
+        return DHCPPacket.buildRelease(
             machineId: machineId,
-            currentIP: lease.assignedIP
+            xid: xid,
+            clientIP: ip,
+            serverIP: server
         )
+    }
 
-        logger.debug("Sending lease renewal", metadata: ["ip": "\(lease.assignedIP)"])
+    /// Build a DHCP REQUEST for T1 renewal (unicast to server).
+    /// Transitions state to .renewing.
+    /// - Returns: Raw IPv4/UDP/DHCP REQUEST packet, or nil if not bound
+    public func buildRenew() -> Data? {
+        lock.lock()
+        guard _state.clientState == .bound,
+              _state.assignedIP != 0,
+              _state.serverIP != 0 else {
+            lock.unlock()
+            return nil
+        }
+        _state.clientState = .renewing
+        _state.xid = UInt32.random(in: 1...UInt32.max)
+        let currentXid = _state.xid
+        let ip = _state.assignedIP
+        let server = _state.serverIP
+        lock.unlock()
 
-        let response = try await sendRequestAndWait(.renewal(renewal))
+        logger.debug("Building RENEW request", metadata: [
+            "xid": "\(currentXid)",
+            "ip": "\(DHCPPacket.formatIP(ip))"
+        ])
 
-        switch response {
-        case .response(let dhcpResponse):
-            currentLease = dhcpResponse
-            leaseObtainedAt = Date()
-            logger.info("Lease renewed", metadata: [
-                "ip": "\(dhcpResponse.assignedIP)",
-                "lease": "\(dhcpResponse.leaseSeconds)s"
-            ])
-            return dhcpResponse
+        return DHCPPacket.buildRenewRequest(
+            machineId: machineId,
+            xid: currentXid,
+            clientIP: ip,
+            serverIP: server,
+            hostname: hostname
+        )
+    }
 
-        case .nak(let reason):
-            logger.warning("Lease renewal rejected", metadata: ["reason": "\(reason)"])
-            currentLease = nil
-            leaseObtainedAt = nil
-            throw DHCPError.leaseExpired
+    /// Build a DHCP REQUEST for T2 rebinding (broadcast).
+    /// Transitions state to .rebinding.
+    /// - Returns: Raw IPv4/UDP/DHCP REQUEST packet, or nil if not renewing
+    public func buildRebind() -> Data? {
+        lock.lock()
+        guard _state.clientState == .renewing,
+              _state.assignedIP != 0 else {
+            lock.unlock()
+            return nil
+        }
+        _state.clientState = .rebinding
+        _state.xid = UInt32.random(in: 1...UInt32.max)
+        let currentXid = _state.xid
+        let ip = _state.assignedIP
+        lock.unlock()
 
+        logger.debug("Building REBIND request", metadata: [
+            "xid": "\(currentXid)",
+            "ip": "\(DHCPPacket.formatIP(ip))"
+        ])
+
+        return DHCPPacket.buildRebindRequest(
+            machineId: machineId,
+            xid: currentXid,
+            clientIP: ip,
+            hostname: hostname
+        )
+    }
+
+    // MARK: - Packet Handler
+
+    /// Process an inbound DHCP packet (raw IPv4/UDP/DHCP on port 68).
+    /// Returns an action for the caller to execute, or nil if the packet is ignored.
+    public func handlePacket(_ packet: Data) -> DHCPClientAction? {
+        // Parse the packet
+        guard let (dhcp, _, _) = try? DHCPPacket.fromIPv4UDP(packet) else {
+            return nil
+        }
+
+        // Must be a BOOTREPLY
+        guard dhcp.op == DHCPPacket.bootReply else {
+            return nil
+        }
+
+        // Must match our xid
+        lock.lock()
+        let currentXid = _state.xid
+        let currentState = _state.clientState
+        lock.unlock()
+
+        guard dhcp.xid == currentXid else {
+            return nil
+        }
+
+        // Must match our chaddr
+        guard Array(dhcp.chaddr.prefix(6)) == Array(chaddr.prefix(6)) else {
+            return nil
+        }
+
+        guard let msgType = dhcp.messageType else {
+            return nil
+        }
+
+        switch (currentState, msgType) {
+        case (.discovering, .offer):
+            return handleOffer(dhcp)
+        case (.requesting, .ack):
+            return handleACK(dhcp)
+        case (.requesting, .nak):
+            return handleNAK()
+        case (.renewing, .ack), (.rebinding, .ack):
+            return handleRenewalACK(dhcp)
+        case (.renewing, .nak), (.rebinding, .nak):
+            return handleNAK()
         default:
-            throw DHCPError.invalidRequest("Unexpected response type")
+            logger.debug("Ignoring \(msgType) in state \(currentState)")
+            return nil
         }
     }
 
-    /// Release the current lease
-    public func releaseLease() async throws {
-        guard let lease = currentLease else {
-            return // Nothing to release
+    /// Reset the client to initial state (e.g., after lease expires)
+    public func reset() {
+        lock.lock()
+        _state = State()
+        lock.unlock()
+    }
+
+    // MARK: - Private Handlers
+
+    /// Handle DHCPOFFER: transition to requesting, build REQUEST
+    private func handleOffer(_ offer: DHCPPacket) -> DHCPClientAction? {
+        guard offer.yiaddr != 0 else {
+            logger.warning("OFFER with no yiaddr")
+            return nil
         }
 
-        renewalTask?.cancel()
-        renewalTask = nil
+        guard let offerServerIP = offer.serverIdentifier else {
+            logger.warning("OFFER with no server identifier")
+            return nil
+        }
 
-        let release = DHCPRelease(
+        logger.debug("Received OFFER", metadata: [
+            "ip": "\(DHCPPacket.formatIP(offer.yiaddr))",
+            "server": "\(DHCPPacket.formatIP(offerServerIP))"
+        ])
+
+        // Transition to requesting
+        lock.lock()
+        _state.clientState = .requesting
+        _state.xid = UInt32.random(in: 1...UInt32.max)
+        let newXid = _state.xid
+        lock.unlock()
+
+        // Build REQUEST for the offered IP
+        let request = DHCPPacket.buildRequest(
             machineId: machineId,
-            ip: lease.assignedIP
+            xid: newXid,
+            requestedIP: offer.yiaddr,
+            serverIP: offerServerIP,
+            hostname: hostname
         )
 
-        guard let data = try? JSONEncoder().encode(DHCPMessage.release(release)) else {
-            throw DHCPError.encodingFailed
-        }
-
-        try await provider.sendOnChannel(data, toMachine: config.gatewayMachineId, channel: DHCPService.channelName)
-
-        logger.info("Lease released", metadata: ["ip": "\(lease.assignedIP)"])
-
-        currentLease = nil
-        leaseObtainedAt = nil
+        return .sendPacket(request)
     }
 
-    /// Get the current lease (if any)
-    public func getCurrentLease() -> DHCPResponse? {
-        currentLease
+    /// Handle DHCPACK after initial REQUEST: transition to bound
+    private func handleACK(_ ack: DHCPPacket) -> DHCPClientAction? {
+        guard ack.yiaddr != 0 else {
+            logger.warning("ACK with no yiaddr")
+            return nil
+        }
+
+        let assignedIP = ack.yiaddr
+        let serverIdent = ack.serverIdentifier ?? 0
+        let leaseTime = ack.leaseTime ?? 3600
+        let netmask = ack.subnetMask ?? 0
+        let gateway = ack.router ?? 0
+        let dns = ack.dnsServers
+
+        lock.lock()
+        _state.clientState = .bound
+        _state.assignedIP = assignedIP
+        _state.serverIP = serverIdent
+        _state.leaseTime = leaseTime
+        _state.leaseStart = Date()
+        lock.unlock()
+
+        logger.info("Lease acquired", metadata: [
+            "ip": "\(DHCPPacket.formatIP(assignedIP))",
+            "lease": "\(leaseTime)s"
+        ])
+
+        return .configured(
+            ip: DHCPPacket.formatIP(assignedIP),
+            netmask: DHCPPacket.formatIP(netmask),
+            gateway: DHCPPacket.formatIP(gateway),
+            dns: dns.map { DHCPPacket.formatIP($0) },
+            leaseTime: leaseTime
+        )
     }
 
-    /// Check if the current lease is still valid
-    public func isLeaseValid() -> Bool {
-        guard let lease = currentLease, let obtainedAt = leaseObtainedAt else {
-            return false
-        }
+    /// Handle DHCPACK for renewal/rebinding: stay bound
+    private func handleRenewalACK(_ ack: DHCPPacket) -> DHCPClientAction? {
+        let leaseTime = ack.leaseTime ?? 3600
+        let netmask = ack.subnetMask ?? 0
+        let gateway = ack.router ?? 0
+        let dns = ack.dnsServers
 
-        let expiresAt = obtainedAt.addingTimeInterval(Double(lease.leaseSeconds))
-        return Date() < expiresAt
+        lock.lock()
+        let ip = _state.assignedIP
+        _state.clientState = .bound
+        _state.leaseTime = leaseTime
+        _state.leaseStart = Date()
+        lock.unlock()
+
+        logger.info("Lease renewed", metadata: [
+            "ip": "\(DHCPPacket.formatIP(ip))",
+            "lease": "\(leaseTime)s"
+        ])
+
+        return .configured(
+            ip: DHCPPacket.formatIP(ip),
+            netmask: DHCPPacket.formatIP(netmask),
+            gateway: DHCPPacket.formatIP(gateway),
+            dns: dns.map { DHCPPacket.formatIP($0) },
+            leaseTime: leaseTime
+        )
     }
 
-    /// Get remaining time on the current lease
-    public func leaseTimeRemaining() -> TimeInterval {
-        guard let lease = currentLease, let obtainedAt = leaseObtainedAt else {
-            return 0
-        }
+    /// Handle DHCPNAK: transition back to initial
+    private func handleNAK() -> DHCPClientAction {
+        logger.warning("Received NAK, restarting")
 
-        let expiresAt = obtainedAt.addingTimeInterval(Double(lease.leaseSeconds))
-        return max(0, expiresAt.timeIntervalSinceNow)
-    }
+        lock.lock()
+        _state = State()
+        lock.unlock()
 
-    // MARK: - Private
-
-    private func handleMessage(data: Data) async {
-        guard let message = try? JSONDecoder().decode(DHCPMessage.self, from: data) else {
-            logger.warning("Invalid DHCP message received")
-            return
-        }
-
-        // Resume the pending continuation
-        if let continuation = pendingResponse {
-            pendingResponse = nil
-            continuation.resume(returning: message)
-        }
-    }
-
-    private func sendRequestAndWait(_ message: DHCPMessage) async throws -> DHCPMessage {
-        guard let data = try? JSONEncoder().encode(message) else {
-            throw DHCPError.encodingFailed
-        }
-
-        // Send the request first
-        try await provider.sendOnChannel(data, toMachine: config.gatewayMachineId, channel: DHCPService.channelName)
-
-        // Wait for response with timeout.
-        // withCheckedContinuation's closure runs synchronously on the actor
-        // before suspending, so queued handleMessage calls will see pendingResponse.
-        let timeoutSeconds = config.timeout
-
-        // Set up timeout that will resume the continuation if it hasn't been resumed
-        let result: DHCPMessage = await withCheckedContinuation { continuation in
-            self.pendingResponse = continuation
-
-            // Schedule timeout
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeoutSeconds))
-                // If still pending, resume with a timeout indicator
-                await self?.timeoutPendingResponse()
-            }
-        }
-
-        // Check if result is a timeout sentinel (nak with timeout message)
-        if case .nak(let reason) = result, reason == "__timeout__" {
-            throw DHCPError.timeout
-        }
-
-        return result
-    }
-
-    private func timeoutPendingResponse() {
-        if let continuation = pendingResponse {
-            pendingResponse = nil
-            continuation.resume(returning: .nak("__timeout__"))
-        }
-    }
-
-    private func startRenewalTask() {
-        renewalTask?.cancel()
-
-        renewalTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self = self else { return }
-
-                // Wait until 50% of lease time has passed before renewing
-                let remaining = await self.leaseTimeRemaining()
-                let renewTime = remaining * 0.5
-
-                if renewTime > 0 {
-                    try? await Task.sleep(for: .seconds(renewTime))
-                }
-
-                guard !Task.isCancelled else { return }
-
-                // Attempt renewal
-                do {
-                    _ = try await self.renewLease()
-                } catch {
-                    // If renewal fails, try again sooner
-                    try? await Task.sleep(for: .seconds(10))
-                }
-            }
-        }
+        return .restart
     }
 }
